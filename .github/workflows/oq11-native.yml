@@ -1,0 +1,30 @@
+name: OQ11 native regression
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  native:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    env:
+      OQ_DISTRIBUTE: 'no'
+      GITHUB_HEAD_REF: main
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.13'
+      - name: Install upstream development environment
+        run: python install.py devel
+      - name: Run native QA regression
+        shell: bash
+        run: |
+          set -eo pipefail
+          source ~/openquake/bin/activate
+          pip install -r requirements-aelo-py-linux64.txt
+          oq engine --upgrade-db
+          pytest -vs --tb=short openquake/calculators/tests/oq11_research_test.py
