@@ -1,0 +1,236 @@
+# -*- coding: utf-8 -*-
+# vim: tabstop=4 shiftwidth=4 softtabstop=4
+#
+# Copyright (C) 2024-2025, GEM Foundation
+#
+# OpenQuake is free software: you can redistribute it and/or modify it
+# under the terms of the GNU Affero General Public License as published
+# by the Free Software Foundation, either version 3 of the License, or
+# (at your option) any later version.
+#
+# OpenQuake is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU Affero General Public License for more details.
+#
+# You should have received a copy of the GNU Affero General Public License
+# along with OpenQuake.  If not, see <http://www.gnu.org/licenses/>.
+
+import os
+import pathlib
+import unittest
+from unittest.mock import patch
+import pytest
+import numpy
+import pandas
+from openquake.qa_tests_data.scenario_risk import case_shakemap
+from openquake.commonlib import datastore
+from openquake.calculators.base import run_calc, expose_outputs
+from openquake.calculators.views import text_table
+from openquake.calculators.checkers import check, assert_close
+from openquake.calculators.export import export
+from openquake.engine import impact
+
+cd = pathlib.Path(__file__).parent
+aac = numpy.testing.assert_allclose
+
+
+def strip(fname):
+    bname = os.path.basename(fname)
+    name, ext = bname.rsplit('_', 1)
+    return name + '.' + ext.rsplit('.')[1]
+
+
+def check_export_job_zip(dstore):
+    fnames = export(('job', 'zip'), dstore)
+    assert [strip(f) for f in fnames] == [
+        'job.ini',
+        'exposure.xml',
+        'rupture.csv',
+        'gsim_logic_tree.xml',
+        'affectedpop_vulnerability.xml',
+        'area_vulnerability.xml',
+        'contents_vulnerability.xml',
+        'embodied_carbon_vulnerability.xml',
+        'injured_vulnerability.xml',
+        'number_vulnerability.xml',
+        'occupants_vulnerability.xml',
+        'residents_vulnerability.xml',
+        'structural_vulnerability.xml',
+        'taxonomy_mapping.csv',
+        'sites.csv',
+        'assetcol.csv']
+
+    # there is no gmfs_file, since this is a test without shakemap
+    return fnames
+
+
+def compare(dstore1, dstore2):
+    """
+    Compare avg_losses and loss_by_event
+    """
+    ltypes = sorted(dstore1['avg_losses-stats'])
+    df1 = dstore1.read_df('loss_by_event')
+    df2 = dstore2.read_df('loss_by_event')
+    aac(df1.to_numpy(), df2.to_numpy(), rtol=2e-2)
+
+    for ltype in ltypes:
+        avg1 = dstore1[f'avg_losses-stats/{ltype}'][:]
+        avg2 = dstore2[f'avg_losses-stats/{ltype}'][:]
+        for i in range(len(avg1)):
+            aac(avg1[i], avg2[i], rtol=2e-2, atol=1e-3)
+
+
+# sample the assets to keep the test fast; the aggrisk_tags.org references of
+# impact1/2/3 were generated with this factor.  impact4 is not sampled since
+# its assetcol matches the taxonomy mapping only for a few taxonomies, which
+# the sampling would drop
+SAMPLE_ASSETS = '.05'
+
+
+# NB: the expected values are very much seed dependent: the ground motion
+# fields are drawn with ses_seed (not random_seed), and with few ground motion
+# fields the mean and the high quantiles of the losses are dominated by a few
+# realizations. For instance, for impact3 changing only ses_seed moves the mean
+# loss of ESP contents from 48k to 52k, 83k, 226k and 433k. Any change of the
+# grid or of the sampling (for instance a change of projection) changes the
+# random field, so the expected files must be regenerated with OQ_OVERWRITE=1
+@pytest.mark.parametrize('n', [1, 2, 3, 4])
+def test_impact(n):
+    # NB: expecting exposure in oq-engine and not in mosaic_dir!
+    factor = '1' if n == 4 else SAMPLE_ASSETS
+    if not os.path.exists(expo := cd.parent.parent.parent / 'exposure.hdf5'):
+        raise unittest.SkipTest(f'Missing {expo}')
+    with patch.dict(os.environ, {'OQ_SAMPLE_ASSETS': factor}):
+        calc, log = check(cd / f'impact{n}/job.ini', what='aggrisk_tags')
+        with log:  # ensures clean worker shutdown for all n
+            if n == 1:
+                # test export_aggexp
+                fnames = export(('aggexp_tags', 'csv'), calc.datastore)
+                assert [strip(f) for f in fnames] == [
+                    'aggexp_tags-ID_0.csv',
+                    'aggexp_tags-ID_2.csv']
+
+                # test export aggrisk-stats
+                fnames = export(('aggrisk-stats', 'csv'), calc.datastore)
+                assert [strip(f) for f in fnames] == [
+                    'aggrisk-stats-ID_0.csv',
+                    'aggrisk-stats-ID_2.csv']
+
+                # [job.ini, exposure.xml, rupture.csv, ...]
+                fnames = check_export_job_zip(calc.datastore)
+
+                # repeat the calculation starting from job.zip unzipped;
+                # the exported assets are already sampled, so OQ_SAMPLE_ASSETS
+                # must not be applied again
+                with patch.dict(os.environ):
+                    os.environ.pop('OQ_SAMPLE_ASSETS', None)
+                    calc2, log2 = check(fnames[0])
+                with log2:
+                    expose_outputs(calc.datastore)
+                    expose_outputs(calc2.datastore)
+                    compare(calc.datastore, calc2.datastore)
+
+
+def test_impact5():
+    # this is a case where there are no assets inside the MMI multipolygons
+    if not os.path.exists(expo := cd.parent.parent.parent / 'exposure.hdf5'):
+        raise unittest.SkipTest(f'Missing {expo}')
+
+    # importing the exposure around Nepal and aggregating it
+    calc, _log = check(cd / 'impact5/job.ini')
+    calc.assetcol.array['lon'] = 64.22
+    calc.assetcol.array['lat'] = 32.82
+    inp = calc.oqparam.inputs
+    df = calc.assetcol.get_mmi_values(calc.oqparam.aggregate_by,
+                                      inp['mmi'], inp['exposure'][0])
+    tt = text_table(df, ext='org')
+    assert_close(tt, cd / 'impact5/exposure_by_mmi.org')
+
+
+def test_impact_shakemap():
+    # GMFs from a ShakeMap on a region grid: the stored sitecol must be
+    # the reduced one, consistent with the gmf and asset site IDs; before
+    # the fix the region grid was stored as complete sitecol and the
+    # exported GMFs were associated to the first sites of the grid
+    if not os.path.exists(expo := cd.parent.parent.parent / 'exposure.hdf5'):
+        raise unittest.SkipTest(f'Missing {expo}')
+    with patch.dict(os.environ, {'OQ_SAMPLE_ASSETS': SAMPLE_ASSETS}):
+        calc = run_calc(cd / 'impact6/job.ini')
+    dstore = calc.datastore
+    sitecol = dstore['sitecol']
+    assert 'complete' not in dstore.hdf5
+    aac(sitecol.sids, numpy.arange(len(sitecol)))
+    aac(numpy.unique(dstore['gmf_data/sid'][:]), sitecol.sids)
+    aac(numpy.unique(dstore['assetcol/array']['site_id']), sitecol.sids)
+
+    # the exported GMFs are on the sites of the exported sitemesh
+    fnames = export(('gmf_data', 'csv'), dstore)
+    try:
+        [gmf_csv] = [f for f in fnames if 'gmf-data' in f]
+        [mesh_csv] = [f for f in fnames if 'sitemesh' in f]
+        gmf = pandas.read_csv(gmf_csv, comment='#')
+        mesh = pandas.read_csv(mesh_csv, comment='#')
+        assert len(mesh) == len(sitecol)
+        col = 'custom_site_id' if 'custom_site_id' in mesh else 'site_id'
+        assert set(gmf[col]) == set(mesh[col])
+    finally:
+        for fname in fnames:
+            os.remove(fname)
+
+    # emulate a datastore produced before the fix, with the sitecol
+    # referring to a larger grid: the GMF export must be refused
+    calc_id = dstore.calc_id
+    dstore.close()
+    with datastore.read(calc_id, mode='r+') as ds:
+        sitecol.array['sids'] += 1000
+        ds['sitecol'] = sitecol
+        with pytest.raises(ValueError, match='do not match the stored site'):
+            export(('gmf_data', 'csv'), ds)
+
+
+# NB: there is another test of export_job_zip in scenario_damage/case_22
+def test_shakemap():
+    cdir = os.path.dirname(case_shakemap.__file__)
+    precalc = run_calc(os.path.join(cdir, 'pre-job.ini'))
+    precalc.datastore.close()
+    calc = run_calc(os.path.join(cdir, 'job.ini'),
+                    hazard_calculation_id=precalc.datastore.calc_id)
+    fnames = export(('job', 'zip'), calc.datastore)
+    assert [strip(f) for f in fnames] == [
+        'gmf-data.csv', 'job.ini', 'exposure.xml',
+        'structural_vulnerability.xml', 'taxonomy_mapping.csv',
+        'sites.csv', 'assetcol.csv']
+    try:
+        with open(fnames[1], encoding='utf8') as inp:
+            job_ini = inp.read()
+        assert 'shakemap_uri' not in job_ini
+        assert 'mmi_file' not in job_ini
+        assert 'rupture_file' not in job_ini
+        run_calc(fnames[1])
+    finally:
+        # with open(fnames[1]) as f:
+        #     print(f.read())
+        for fname in fnames:
+            os.remove(fname)
+
+
+@pytest.mark.parametrize('kw, level, expected', [
+    ({}, 1, (None, None)),  # the ShakeMap is used
+    ({'nodal_plane': 'NP1'}, 2, (None, None)),  # the rupture is built
+    ({'within_event_correlation_model': 'DuNing2021Interpolated',
+      'between_event_correlation_model': 'NoCrossCorrelation',
+      'nodal_plane': 'NP1'}, 2,
+     ('DuNing2021Interpolated', 'NoCrossCorrelation'))])
+def test_cli_correlation_models(kw, level, expected):
+    # oq impact passes the chosen models, if any, to impact_validate, which
+    # sets the defaults as for the web form
+    err = {'status': 'failed', 'error_msg': 'stop'}
+    with patch.object(impact, 'impact_validate',
+                      return_value=(None, {}, {}, err)) as validate:
+        impact.main_cmd('us6000t7zp', exposure_hdf5='exposure.hdf5',
+                        callback=lambda *args, **kw: None, **kw)
+    post, user = validate.call_args.args[:2]
+    assert user.level == level
+    assert (post['within_event_correlation_model'],
+            post['between_event_correlation_model']) == expected

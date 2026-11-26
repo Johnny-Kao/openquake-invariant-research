@@ -1,0 +1,323 @@
+# -*- coding: utf-8 -*-
+# vim: tabstop=4 shiftwidth=4 softtabstop=4
+#
+# Copyright (C) 2023, GEM Foundation
+#
+# OpenQuake is free software: you can redistribute it and/or modify it
+# under the terms of the GNU Affero General Public License as published
+# by the Free Software Foundation, either version 3 of the License, or
+# (at your option) any later version.
+#
+# OpenQuake is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU Affero General Public License for more details.
+#
+# You should have received a copy of the GNU Affero General Public License
+# along with OpenQuake.  If not, see <http://www.gnu.org/licenses/>.
+
+import json
+import unittest
+from unittest import mock
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+try:
+    import rtgmpy
+except ImportError:
+    rtgmpy = None
+from openquake.baselib.performance import Monitor
+from openquake.baselib import writers
+from openquake.hazardlib.calc.mrd import (
+    update_mrd, get_uneven_bins_edges, calc_mean_rate_dist)
+from openquake.hazardlib.rmap_maker import read_cmakers, read_ctx_by_grp
+from openquake.hazardlib.cross_correlation import BakerJayaram2008
+from openquake.hazardlib import source_reader
+from openquake.calculators.tests import CalculatorTestCase, strip_calc_id
+from openquake.calculators.export import export
+from openquake.calculators.views import view
+from openquake.calculators.postproc.compute_rtgm import get_seismicity_class
+from openquake.calculators.postproc.compute_mrd import get_gid_weights
+from openquake.qa_tests_data.postproc import (
+    case_mrd, case_rtgm, case_median_spectrum)
+
+PLOT = False
+aae = np.testing.assert_almost_equal
+ae = np.testing.assert_equal
+
+
+def _test_indirect(ctx, cmaker, imts, crosscorr, mrd, c1, c2, afo1, afo2):
+    # Bin edges
+    lefts = [-3, -2, 1, 2]
+    numb = [80, 80, 10]
+    be_mea = get_uneven_bins_edges(lefts, numb)
+    be_sig = np.arange(0.50, 0.90, 0.01)
+
+    # Compute the MRD
+    mon = Monitor('multivariate')
+    mrdi = calc_mean_rate_dist(ctx, 1, cmaker, crosscorr,
+                               imts[0], imts[1], be_mea, be_sig, mon)
+
+    # Compute marginal
+    marg1 = mrdi.sum(axis=0)
+    marg2 = mrdi.sum(axis=1)
+
+    marg1 = np.average(marg1, axis=2, weights=[0.5, 0.5])[:, 0]
+    marg2 = np.average(marg2, axis=2, weights=[0.5, 0.5])[:, 0]
+    mrdi = np.average(mrdi, axis=3, weights=[0.5, 0.5])[:, :, 0]
+
+    c1_mask = (c1 > 1e-5) & (c1 < 1e-2)
+    c2_mask = (c2 > 1e-5) & (c2 < 1e-2)
+
+    # Test - Note that in this case we restain the test to the part of
+    # the hazard curve which has better coverage since the marginals
+    # computed using the indirect methos show a slight underestimation of
+    # the rate of occurrence
+    np.testing.assert_almost_equal(marg1[c1_mask], afo1[c1_mask], decimal=3)
+    np.testing.assert_almost_equal(marg2[c2_mask], afo2[c2_mask], decimal=3)
+
+    if PLOT:
+        min_afo = np.min(afo1[afo1 > 1e-10])
+        min_afo = np.min([np.min(afo2[afo2 > 1e-10]), min_afo])
+        max_afo = np.max(afo1)
+        max_afo = np.max([np.max(afo2), max_afo])
+
+        plt.title('Indirect method test')
+        plt.plot(c1, afo1, label=f'HC {imts[0]}')
+        plt.plot(c1, marg1, 'o', mfc='None')
+        plt.plot(c2, afo2, label=f'HC {imts[1]}')
+        plt.plot(c2, marg2, 'o', mfc='None', )
+        plt.xlabel('Spectral Acceleration, S$_a$ [g]')
+        plt.ylabel('Annual Rate of Occurrence')
+        plt.legend()
+        plt.grid(which='minor', ls=':', color='lightgrey')
+        plt.grid(which='major', ls='--', color='grey')
+        plt.ylim([min_afo, max_afo])
+        plt.xscale('log')
+        plt.yscale('log')
+        plt.show()
+
+    # test_compare
+    be_mea = get_uneven_bins_edges([-3, -2, 1, 2], [80, 80, 10])
+    be_sig = np.arange(0.50, 0.70, 0.01)
+    if PLOT:
+        fig, axs = plt.subplots(1, 1)
+        fig.set_size_inches(9, 6)
+        plt1 = plt.contourf(np.log(c1), np.log(c2), mrd[:, :])
+        _ = plt.contour(np.log(c1), np.log(c2), mrdi[:, :],
+                        colors='orange', linestyles='dashed')
+        _ = plt.colorbar(mappable=plt1)
+        _ = plt.title('MRD')
+        axs.set_xlabel(f'{imts[0]}')
+        axs.set_ylabel(f'{imts[1]}')
+        plt.show()
+
+
+class PostProcTestCase(CalculatorTestCase):
+
+    def test_get_gid_weights(self):
+        # the weights must be indexed by the global gid and not by the
+        # position of the gsim inside the cmaker
+        class FakeCMaker:
+            def __init__(self, gsim_idx, wei):
+                self.gsim_idx = np.array(gsim_idx)
+                self.wei = np.array(wei)
+
+        # two cmakers with the gids in the "wrong" order
+        cmakers = [FakeCMaker([2, 3], [.2, .3]), FakeCMaker([0, 1], [.4, .1])]
+        gweights = get_gid_weights(cmakers)
+        aae(gweights, [.4, .1, .2, .3])
+        # the concatenation of the weights would be wrong
+        aae(np.concatenate([cm.wei for cm in cmakers]), [.2, .3, .4, .1])
+
+    def test_mrd(self):
+        # Computes the mean rate density using a simple PSHA input model
+        self.run_calc(case_mrd.__file__, 'job.ini', postproc_func='dummy.main')
+        fnames = export(('hcurves', 'csv'), self.calc.datastore)
+        for fname in fnames:
+            self.assertEqualFiles('expected/%s' % strip_calc_id(fname), fname)
+
+        hc_id = str(self.calc.datastore.calc_id)
+        self.run_calc(case_mrd.__file__, 'job.ini',
+                      hazard_calculation_id=hc_id)
+        mrd = self.calc.datastore['mrd'][:]
+        # assert abs(mrd.mean() - 2.334333e-07) < 1e-12, mrd.mean()
+
+        imts = ['SA(0.2)', 'SA(1.0)']  # subset of the parent IMTs
+        dstore = self.calc.datastore
+        oqp = dstore['oqparam']
+        cmaker = read_cmakers(dstore)[0].restrict(imts)
+        ctx = read_ctx_by_grp(dstore)[0]
+        self.crosscorr = BakerJayaram2008()
+
+        # Compute the MRD
+        imls1 = oqp.imtls[imts[0]]
+        imls2 = oqp.imtls[imts[1]]
+        len1 = len(imls1) - 1
+        len2 = len(imls2) - 1
+        mrd = np.zeros((len1, len2, len(cmaker.gsims)))
+        update_mrd(ctx, cmaker, self.crosscorr, mrd)
+        mrd = np.average(mrd, axis=2, weights=[0.5, 0.5])
+
+        # Loading the poes array |sites| x |stats| x |IMTs| x |IMLs|
+        poes = dstore['hcurves-stats'][:]
+        afe = -np.log(1-poes)
+        afo = afe[:, :, :, :-1] - afe[:, :, :, 1:]
+
+        _imts = list(oqp.imtls)
+        idx1 = _imts.index(imts[0])
+        idx2 = _imts.index(imts[1])
+
+        afo1 = afo[0, 0, idx1, :]
+        afo2 = afo[0, 0, idx2, :]
+
+        c1 = imls1[:-1] + np.diff(imls1) / 2
+        c2 = imls2[:-1] + np.diff(imls2) / 2
+
+        # Compute marginal
+        marg1 = mrd.sum(axis=0)
+        marg2 = mrd.sum(axis=1)
+
+        # Test
+        np.testing.assert_almost_equal(marg1, afo1, decimal=4)
+        np.testing.assert_almost_equal(marg2, afo2, decimal=4)
+
+        if PLOT:
+            min_afo = np.min(afo1[afo1 > 1e-10])
+            min_afo = np.min([np.min(afo2[afo2 > 1e-10]), min_afo])
+            max_afo = np.max(afo1)
+            max_afo = np.max([np.max(afo2), max_afo])
+            plt.title('Direct method test')
+            plt.plot(c1, afo1, label=f'HC {imts[0]}')
+            plt.plot(c1, marg1, 'o', mfc='None', label='Marg 1')
+            plt.plot(c2, afo2, label=f'HC {imts[1]}')
+            plt.plot(c2, marg2, 'o', mfc='None', label='Marg 2')
+            plt.xlabel('Spectral Acceleration, S$_a$ [g]')
+            plt.ylabel('Annual Rate of Occurrence')
+            plt.legend()
+            plt.grid(which='minor', ls=':', color='lightgrey')
+            plt.grid(which='major', ls='--', color='grey')
+            plt.ylim([min_afo, max_afo])
+            plt.xscale('log')
+            plt.yscale('log')
+            plt.show()
+
+        _test_indirect(ctx, cmaker, imts, self.crosscorr,
+                       mrd, c1, c2, afo1, afo2)
+
+    def test_rtgm(self):
+        self.run_calc(case_rtgm.__file__, 'job_vs30.ini')
+        if rtgmpy is None:
+            return
+        
+        df = self.calc.datastore.read_df("mce_governing")
+        df = df[df.period != 0]
+        writer = writers.CsvWriter(fmt=writers.FIVEDIGITS)
+        fname = self.calc.datastore.export_path('mce_governing.csv')
+        comment = self.calc.datastore.metadata.copy()
+        writer.save(df, fname, comment=comment)
+        self.assertEqualFiles('expected/mce_governing.csv', fname)
+        
+        asce07 = self.calc.datastore['asce07'][0].decode('ascii')
+        dic07 = json.loads(asce07)
+
+        # check float results
+        lk = list(dic07)
+        lk.remove('Ss_seismicity')
+        lk.remove('S1_seismicity')
+        dic07_float = [dic07[k] for k in lk]
+        dic07_float_ref = [0.5, 1.49, 1.3409, 0.8939, 0.4244, 0.4244, 0.2829]
+        aae(dic07_float, dic07_float_ref, decimal=4)
+
+        # check string results
+        dic07_str = [dic07[k] for k in ['Ss_seismicity', 'S1_seismicity']]
+        assert dic07_str == ['High', 'High']
+
+        asce41 = self.calc.datastore['asce41'][0].decode('ascii')
+        dic41 = json.loads(asce41)
+        aae(dic41['BSE2N_Sxs'], 1.34098)
+        aae(dic41['BSE2E_Sxs'], 1.08299)
+        aae(dic41['BSE1N_Sxs'], 0.89399)
+        aae(dic41['BSE1E_Sxs'], 0.64134)
+        aae(dic41['BSE2N_Sx1'], 0.42445)
+        aae(dic41['BSE2E_Sx1'], 0.34184)
+        aae(dic41['BSE1N_Sx1'], 0.28297)
+        aae(dic41['BSE1E_Sx1'], 0.18407)
+        ae(dic41['custom_site_id'], 'CRETE')
+
+    def test_median_spectrum1(self):
+        # test with a single site and many ruptures
+        self.run_calc(case_median_spectrum.__file__, 'job1.ini')
+        [fname] = export(('median_spectra', 'csv'), self.calc.datastore)
+        self.assertEqualFiles('expected/median_spectrum1.csv', fname)
+
+        fnames = export(('median_spectrum_disagg', 'csv'), self.calc.datastore)
+        for fname in fnames:
+            self.assertEqualFiles('expected/' + strip_calc_id(fname), fname)
+
+    def test_median_spectrum_shape_descr(self):
+        # the shape description must be consistent with the data, i.e.
+        # the number of "kinds" must be the size of the kind axis
+        self.run_calc(case_median_spectrum.__file__, 'job1.ini')
+        dset = self.calc.datastore['median_spectra']
+        dic = json.loads(dset.attrs['json'])
+        self.assertEqual(len(dic['kind']), dset.shape[2])
+        # the third kind is the total weight, not the (discarded) tau
+        self.assertEqual(dic['kind'], ['mea', 'sig', 'wei'])
+
+    def test_log_median_spectrum(self):
+        # the view must return one value per period
+        self.run_calc(case_median_spectrum.__file__, 'job1.ini')
+        ds = self.calc.datastore
+        periods = [imt.period for imt in ds['oqparam'].imt_periods()]
+        res = view('log_median_spectrum', ds)
+        self.assertEqual(len(res), len(periods))
+        aae(res['period'], periods)
+        # the median spectrum is the 'mea' row, in log space
+        aae(res['value'], ds['median_spectra'][:, 0, 0, :, 0].sum(axis=0),
+            decimal=5)
+
+    def test_median_spectrum2(self):
+        # test with two sites and two ruptures
+        self.run_calc(case_median_spectrum.__file__, 'job2.ini')
+        fnames = export(('median_spectra', 'csv'), self.calc.datastore)
+        for fname in fnames:
+            self.assertEqualFiles('expected/%s' % strip_calc_id(fname), fname)
+
+    def test_median_spectrum2_strided(self):
+        # the median spectrum depends on the order of the source groups,
+        # which must not change when reading the source models with strides
+        with mock.patch.object(source_reader, 'BIG_FILE', 0):
+            self.test_median_spectrum2()
+
+
+class SeismicityClassTestCase(unittest.TestCase):
+
+    def setUp(self):
+        self.periods = [0, 0.2, 1.0]
+        self.csid = ['7','7','7']
+
+    def test_get_seismicity_class_case1(self):
+        # testing that both periods are very high
+        SaM = [0.71853975, 1.68876704, 0.6]
+        mce_site = pd.DataFrame({'period': self.periods, 'SaM': SaM,
+                                 'custom_site_id': self.csid})
+        Ss_seismicity, S1_seismicity = get_seismicity_class(mce_site, 760)
+        assert Ss_seismicity == S1_seismicity == 'Very High'
+
+    def test_get_seismicity_class_case2(self):
+        # testing that S1 is high and Ss is very high
+        SaM = [0.7986, 1.902, 0.5637]
+        mce_site = pd.DataFrame({'period': self.periods, 'SaM': SaM,
+                                 'custom_site_id': self.csid})
+        Ss_seismicity, S1_seismicity = get_seismicity_class(mce_site, 760)
+        assert Ss_seismicity == 'Very High'
+        assert S1_seismicity == 'High'
+
+    def test_get_seismicity_class_case3(self):
+        # testing that other vs30 gives nan
+        SaM = [0.7986, 1.902, 0.5637]
+        mce_site = pd.DataFrame({'period': self.periods, 'SaM': SaM,
+                                 'custom_site_id': self.csid})
+        Ss_seismicity, S1_seismicity = get_seismicity_class(mce_site, 530)
+        assert Ss_seismicity == S1_seismicity =='n.a.'

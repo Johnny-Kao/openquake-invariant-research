@@ -1,0 +1,779 @@
+# The Hazard Library
+# Copyright (C) 2012-2026 GEM Foundation
+#
+# This program is free software: you can redistribute it and/or modify
+# it under the terms of the GNU Affero General Public License as
+# published by the Free Software Foundation, either version 3 of the
+# License, or (at your option) any later version.
+#
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU Affero General Public License for more details.
+#
+# You should have received a copy of the GNU Affero General Public License
+# along with this program.  If not, see <http://www.gnu.org/licenses/>.
+"""
+Module :mod:`openquake.hazardlib.source.base` defines a base class for
+seismic sources.
+"""
+import abc
+import math
+import zlib
+from dataclasses import dataclass
+import numpy
+from openquake.baselib import general
+from openquake.hazardlib import mfd
+from openquake.hazardlib.aspect_ratio import MagDepAspectRatio
+from openquake.hazardlib.pmf import PMF
+from openquake.hazardlib.tom import PoissonTOM
+from openquake.hazardlib.calc.filters import magstr, split_source
+from openquake.hazardlib.geo import Point
+from openquake.hazardlib.geo.surface.planar import build_planar, PlanarSurface
+from openquake.hazardlib.geo.surface.multi import MultiSurface
+from openquake.hazardlib.source.rupture import (
+    ParametricProbabilisticRupture, NonParametricProbabilisticRupture,
+    EBRupture)
+
+U32 = numpy.uint32
+# ts is the set of realizations with the same uncertainties (see get_ts_sets)
+ts_samples_dt = numpy.dtype([('trt_smr', U32), ('samples', U32), ('ts', U32)])
+F64 = numpy.float64
+I64 = numpy.int64
+TWO30 = I64(2**30)
+
+
+@dataclass
+class SourceParam:
+    """Shared parameters accepted by ``from_param`` on these source classes:
+
+    * PointSource
+    * AreaSource
+    * MultiPointSource
+    * SimpleFaultSource
+    * ComplexFaultSource
+    * KiteFaultSource
+    * CharacteristicFaultSource
+    """
+    source_id: str
+    name: str
+    trt: str
+    mfd: object
+    rms: float
+    msr: object
+    rar: float
+    tom: object
+
+
+def get_code2cls():
+    """
+    :returns: a dictionary source code -> source class
+    """
+    dic = {}
+    for cls in general.gen_subclasses(BaseSeismicSource):
+        if hasattr(cls, 'code'):
+            dic[cls.code] = cls
+    return dic
+
+
+def is_poissonian(src):
+    """
+    :returns: True if the underlying source is poissonian, false otherwise
+    """
+    if src.code == b'F':  # multiFault
+        return src.infer_occur_rates
+    elif src.code == b'N':  # nonParametric
+        return False
+    return True
+
+
+def poisson_sample(src, eff_num_ses, seed):
+    """
+    :param src: a poissonian source
+    :param eff_num_ses: number of stochastic event sets * number of samples
+    :param seed: stochastic seed
+    :yields: triples (rupture, rup_id, num_occurrences)
+    """
+    rng = numpy.random.default_rng(seed)
+    if hasattr(src, 'temporal_occurrence_model'):
+        tom = src.temporal_occurrence_model
+    else:  # multifault
+        tom = PoissonTOM(src.investigation_time)
+    rupids = src.offset + numpy.arange(src.num_ruptures)
+    if not hasattr(src, 'nodal_plane_distribution'):
+        if src.code == b'F':  # multifault
+            s = src.get_sections()
+            for i, rate in enumerate(src.occur_rates):
+                # NB: rng.poisson called inside to save memory
+                num_occ = rng.poisson(rate * tom.time_span * eff_num_ses)
+                if num_occ == 0:  # skip
+                    continue
+                idxs = src.rupture_idxs[i]
+                if len(idxs) == 1:
+                    sfc = s[idxs[0]]
+                else:
+                    sfc = MultiSurface([s[idx] for idx in idxs])
+                hypo = s[idxs[0]].get_middle_point()
+                rup = ParametricProbabilisticRupture(
+                    src.mags[i], src.rakes[i], src.tectonic_region_type,
+                    hypo, sfc, src.occur_rates[i], tom)
+                yield rup, rupids[i], num_occ
+        else:  # simple or complex fault
+            iruptures = src.iter_ruptures()  # not kept in memory
+            rates = numpy.concatenate(list(src.iter_ruptures(rates=True)))
+            occurs = rng.poisson(rates * tom.time_span * eff_num_ses)
+            # NB: the algorithm could be smarter, since we are looping
+            # over all ruptures just to discard most of them, but it is
+            # efficient enough, since only the rates are kept in memory
+            for rup, rupid, num_occ in zip(iruptures, rupids, occurs):
+                if num_occ:
+                    yield rup, rupid, num_occ
+        return
+
+    # else (multi)point sources and area sources
+    usd = src.upper_seismogenic_depth
+    lsd = src.lower_seismogenic_depth
+    rup_args, rates = _rup_args_rates(src)
+    num_occurs = rng.poisson(rates * tom.time_span * eff_num_ses)
+    for num_occ, args, rupid, rate in zip(num_occurs, rup_args, rupids, rates):
+        if num_occ:
+            (_, np_prob, hc_prob, mag, np, lon, lat, hc_depth,
+             dip_frac, ps) = args
+            hc = Point(lon, lat, hc_depth)
+            hdd = numpy.array([(1., hc.depth)])
+            dip_fracs = numpy.array([dip_frac])
+            [[[planar]]] = build_planar(
+                ps.get_planin([(1., mag)], [(1., np)]), hdd, lon, lat,
+                usd, lsd, ps.get_aspect_ratio(mag), dip_fracs=dip_fracs)
+            rup = ParametricProbabilisticRupture(
+                mag, np.rake, ps.tectonic_region_type, hc,
+                PlanarSurface.from_(planar), rate, tom)
+            yield rup, rupid, num_occ
+
+
+def _rup_args_rates(src):
+    # keep in memory potentially millions of rupture arguments and rates
+    rup_args = []
+    rates = []
+    for ps in split_source(src):
+        if not hasattr(ps, 'location'):  # unsplit containing a single source
+            [ps] = src
+        lon, lat = ps.location.x, ps.location.y
+        for mag, mag_occ_rate in ps.get_annual_occurrence_rates():
+            hdfs = ps.hypo_dip_fracs
+            for np_prob, np in ps.nodal_plane_distribution.data:
+                for d, (hc_prob, hc_depth) in enumerate(
+                        ps.hypocenter_distribution.data):
+                    dip_frac = (0.5 if hdfs is None or hdfs[d] is None
+                                else hdfs[d])
+                    args = (mag_occ_rate, np_prob, hc_prob,
+                            mag, np, lon, lat, hc_depth, dip_frac, ps)
+                    rup_args.append(args)
+                    rates.append(mag_occ_rate * np_prob * hc_prob)
+    return rup_args, numpy.array(rates)
+
+
+def timedep_sample(src, eff_num_ses, seed):
+    """
+    :param src: a time-dependent source
+    :param eff_num_ses: number of stochastic event sets * number of samples
+    :param seed: stochastic seed
+    :yields: triples (rupture, rup_id, num_occurrences)
+    """
+    rng = numpy.random.default_rng(seed)
+    rupids = src.offset + numpy.arange(src.num_ruptures)
+    if src.code == b'F':  # time-dependent multifault
+        s = src.get_sections()
+        for i, probs in enumerate(src.probs_occur):
+            cdf = numpy.cumsum(probs)
+            num_occ = numpy.digitize(rng.random(eff_num_ses), cdf).sum()
+            if num_occ == 0:  # ignore non-occurring ruptures
+                continue
+            idxs = src.rupture_idxs[i]
+            if len(idxs) == 1:
+                sfc = s[idxs[0]]
+            else:
+                sfc = MultiSurface([s[idx] for idx in idxs])
+            hypo = sfc.get_middle_point()
+            pmf = PMF([(p, o) for o, p in enumerate(probs)])
+            yield (NonParametricProbabilisticRupture(
+                src.mags[i], src.rakes[i], src.tectonic_region_type,
+                hypo, sfc, pmf), rupids[i], num_occ)
+
+    else:  # time-dependent nonparametric
+        mutex_weight = getattr(src, 'mutex_weight', 1)
+        for rup, rupid in zip(src.iter_ruptures(), rupids):
+            occurs = rup.sample_number_of_occurrences(eff_num_ses, rng)
+            if mutex_weight < 1:
+                # consider only the occurrencies below the mutex_weight
+                occurs *= (rng.random(eff_num_ses) < mutex_weight)
+            num_occ = occurs.sum()
+            if num_occ:
+                yield rup, rupid, num_occ
+
+
+class BaseSeismicSource(metaclass=abc.ABCMeta):
+    """
+    Base class representing a seismic source, that is a structure generating
+    earthquake ruptures.
+
+    :param source_id:
+        Some (numeric or literal) source identifier. Supposed to be unique
+        within the source model.
+    :param name:
+        String, a human-readable name of the source.
+    :param tectonic_region_type:
+        Source's tectonic regime. See :class:`openquake.hazardlib.const.TRT`.
+    """
+    id = -1  # to be set
+    ts_samples = None  # set by the engine
+    nsites = 1  # set when filtering the source
+    splittable = True
+    checksum = 0  # set in source_reader
+    weight = 0.001  # set in contexts
+    nctxs = 1  # updated in estimate_weight
+    offset = 0  # set in fix_src_offset
+    _num_ruptures = 0  # set by the engine
+    # uncertainties which modify the source without mutating shared data,
+    # so that a copy can share it with the original (see lt.shallow_unc)
+    shallow_uncertainties = frozenset()
+    seed = None  # set by the engine
+    samples = 1  # set by the engine
+    smweight = 1.  # set by the engine
+    dt = 0  # set by the engine
+    # set in build_groups for the sources modified by the uncertainties
+    bysrc_unc = False
+
+    @abc.abstractproperty
+    def MODIFICATIONS(self):
+        pass
+
+    @property
+    def num_ruptures(self):
+        """
+        Call count_ruptures() once and cache the result
+        """
+        if self._num_ruptures == 0:
+            self._num_ruptures = self.count_ruptures()
+        return self._num_ruptures
+
+    @property
+    def trt_smrs(self):
+        """
+        :returns: a tuple of integers (usually of 1 element)
+        """
+        if self.ts_samples is None:  # in hazardlib
+            return (0,)
+        return tuple(self.ts_samples['trt_smr'])
+
+    def get_ts_samples(self):
+        """
+        :returns: the ts_samples of the source as a structured array
+        """
+        ts_samples = self.ts_samples
+        if isinstance(ts_samples, list):
+            ts_samples = numpy.concatenate(ts_samples, dtype=ts_samples_dt)
+        return ts_samples
+
+    def get_ts_sets(self):
+        """
+        :returns: a tuple of tuples of trt_smr, the sets of realizations with
+            the same uncertainties applied to the source; there is a single
+            set if the uncertainties are the same in all the realizations
+
+        NB: the sets are stored in the field ts of the ts_samples by
+            build_groups, i.e. for the sources modified by the uncertainties;
+            the sources without uncertainties have ts=0 everywhere and a
+            single set.
+        """
+        if self.ts_samples is None:  # in hazardlib
+            return ((0,),)
+        ts_samples = self.get_ts_samples()
+        return tuple(tuple(ts_samples['trt_smr'][ts_samples['ts'] == ts])
+                     for ts in numpy.unique(ts_samples['ts']))
+
+    def serial(self, ses_seed):
+        """
+        :returns: a random seed derived from source_id and ses_seed
+        """
+        return zlib.crc32(self.source_id.encode('ascii'), ses_seed)
+
+    def is_gridded(self):
+        """
+        :returns: True if the source contains only gridded ruptures
+        """
+        return False
+
+    @abc.abstractmethod
+    def iter_ruptures(self, **kwargs):
+        """
+        Get a generator object that yields probabilistic ruptures the source
+        consists of.
+
+        :returns:
+            Generator of instances of sublclass of :class:
+            `~openquake.hazardlib.source.rupture.BaseProbabilisticRupture`.
+        """
+
+    def iter_meshes(self):
+        """
+        Yields the meshes underlying the ruptures
+        """
+        for rup in self.iter_ruptures():
+            if isinstance(rup.surface, MultiSurface):
+                for surf in rup.surface.surfaces:
+                    yield surf.mesh
+            else:
+                yield rup.surface.mesh
+
+    @property
+    def multiplicity(self):
+        """
+        How many source model realizations the source belongs to
+        """
+        if self.ts_samples is None:
+            return 1
+        return len(self.ts_samples)
+
+    def sample_ruptures(self, num_ses, ses_seed):
+        """
+        :param num_ses: ses_per_logic_tree_path
+        :param ses_seed: ses_seed coming from the job.ini
+        :returns: list of EBRuptures
+        """
+        seed = self.serial(ses_seed)
+        rng = numpy.random.default_rng(seed)
+        sample = poisson_sample if is_poissonian(self) else timedep_sample
+        samples = self.ts_samples['samples'].sum()
+        probs = self.ts_samples['samples'] / samples
+        ebrs = []
+        for rup, rid, tot_occ in sample(self, num_ses * samples, seed):
+            if tot_occ:
+                occs = rng.multinomial(tot_occ, probs)
+                # rng.multinomial(1000, [.1, .2, .3, .4]) = [104, 201, 270, 425]
+                for i, (trt_smr, occ) in enumerate(
+                        zip(self.ts_samples['trt_smr'], occs)):
+                    if occ:
+                        rupid = rid + i * self.num_ruptures
+                        ebr = EBRupture(rup, self.id, trt_smr, occ, rupid,
+                                        seed=rupid + TWO30 * self.id + ses_seed)
+                        ebrs.append(ebr)
+        return ebrs
+
+    def get_mags(self):
+        """
+        :returns: the magnitudes of the ruptures contained in the source
+        """
+        if hasattr(self, 'get_annual_occurrence_rates'):
+            return F64([m for m, r in self.get_annual_occurrence_rates()])
+        mags = set()
+        if hasattr(self, 'mags'):  # MultiFaultSource
+            mags.update(self.mags)
+        else:  # nonparametric
+            for rup, pmf in self.data:
+                mags.add(rup.mag)
+        return sorted(mags)
+
+    def get_raw_mags(self):
+        """
+        :returns: the magnitudes of the ruptures contained, with repetitions
+        """
+        if hasattr(self, 'mags'):  # MultiFaultSource
+            return self.mags
+        elif hasattr(self, 'data'):  # nonparametric
+            return [item[0].mag for item in self.data]
+        return [item[0] for item in self.get_annual_occurrence_rates()]
+
+    def get_magstrs(self):
+        """
+        :returns: the magnitudes of the ruptures contained as strings
+        """
+        return sorted({magstr(mag) for mag in self.get_raw_mags()})
+
+    def is_splittable(self):
+        """Return whether this source can be split into independent parts."""
+        return (self.__class__.__iter__ is not BaseSeismicSource.__iter__
+                and getattr(self, 'mutex_weight', 1) == 1 and self.splittable)
+
+    def __iter__(self):
+        """
+        Override to implement source splitting
+        """
+        yield self
+
+    @abc.abstractmethod
+    def count_ruptures(self):
+        """
+        Return the number of ruptures that will be generated by the source.
+        """
+
+    @abc.abstractmethod
+    def get_min_max_mag(self):
+        """
+        Return minimum and maximum magnitudes of the ruptures generated
+        by the source.
+        """
+
+    def modify(self, modification, parameters):
+        """
+        Apply a single modificaton to the source parameters
+        Reflects the modification method and calls it passing ``parameters``
+        as keyword arguments.
+
+        Modifications can be applied one on top of another. The logic
+        of stacking modifications is up to a specific source implementation.
+
+        :param modification:
+            String name representing the type of modification.
+        :param parameters:
+            Dictionary of parameters needed for modification.
+        :raises ValueError:
+            If ``modification`` is missing from the attribute `MODIFICATIONS`.
+        """
+        if modification not in self.MODIFICATIONS:
+            raise ValueError('Modification %s is not supported by %s' %
+                             (modification, type(self).__name__))
+        meth = getattr(self, 'modify_%s' % modification)
+        meth(**parameters)
+
+    def __repr__(self):
+        """
+        String representation of a source, displaying the source class name
+        and the source id.
+        """
+        return '<%s %s, rups=%d>' % (
+            self.__class__.__name__, self.source_id, self.num_ruptures)
+
+
+class ParametricSeismicSource(BaseSeismicSource, metaclass=abc.ABCMeta):
+    """
+    Parametric Seismic Source generates earthquake ruptures from source
+    parameters, and associated probabilities of occurrence are defined through
+    a magnitude frequency distribution and a temporal occurrence model.
+
+    :param mfd:
+        Magnitude-Frequency distribution for the source.
+        See :mod:`openquake.hazardlib.mfd`.
+    :param rupture_mesh_spacing:
+        The desired distance between two adjacent points in source's
+        ruptures' mesh, in km. Mainly this parameter allows to balance
+        the trade-off between time needed to compute the :meth:`distance
+        <openquake.hazardlib.geo.surface.base.BaseSurface.get_min_distance>`
+        between the rupture surface and a site and the precision of that
+        computation.
+    :param magnitude_scaling_relationship:
+        Instance of subclass of
+        :class:`openquake.hazardlib.scalerel.base.BaseMSR` to
+        describe how does the area of the rupture depend on magnitude and rake.
+    :param rupture_aspect_ratio:
+        Float number representing how much source's ruptures are more wide
+        than tall. Aspect ratio of 1 means ruptures have square shape,
+        value below 1 means ruptures stretch vertically more than horizontally
+        and vice versa.
+    :param temporal_occurrence_model:
+        Instance of
+        :class:`openquake.hazardlib.tom.PoissonTOM` defining temporal
+        occurrence model for calculating rupture occurrence probabilities
+
+    :raises ValueError:
+        If either rupture aspect ratio or rupture mesh spacing is not positive
+        (if not None).
+    """
+
+    @classmethod
+    def from_param(cls, param, *args):
+        """Build a source from shared parameters and source-specific args.
+
+        The concrete source constructor must use the common parametric
+        arguments first, followed by its source-specific arguments.
+        """
+        return cls(param.source_id, param.name, param.trt, param.mfd,
+                   param.rms, param.msr, param.rar, param.tom, *args)
+
+    def __init__(self, source_id, name, tectonic_region_type, mfd,
+                 rupture_mesh_spacing, magnitude_scaling_relationship,
+                 rupture_aspect_ratio, temporal_occurrence_model):
+        self.source_id = source_id
+        self.name = name
+        self.tectonic_region_type = tectonic_region_type
+
+        if rupture_mesh_spacing is not None and not rupture_mesh_spacing > 0:
+            raise ValueError('rupture mesh spacing must be positive')
+
+        if (rupture_aspect_ratio is not None
+                and isinstance(rupture_aspect_ratio, (int, float))
+                and not rupture_aspect_ratio > 0):
+            raise ValueError('rupture aspect ratio must be positive')
+
+        self.mfd = mfd
+        self.rupture_mesh_spacing = rupture_mesh_spacing
+        self.magnitude_scaling_relationship = magnitude_scaling_relationship
+        self.rupture_aspect_ratio = rupture_aspect_ratio
+        self.temporal_occurrence_model = temporal_occurrence_model
+
+    def get_annual_occurrence_rates(self, min_rate=0):
+        """
+        Get a list of pairs "magnitude -- annual occurrence rate".
+
+        The list is taken from assigned MFD object (see :meth:
+        `openquake.hazardlib.mfd.base.BaseMFD.get_annual_occurrence_rates`)
+        with simple filtering by rate applied.
+
+        :param min_rate:
+            A non-negative value to filter magnitudes by minimum annual
+            occurrence rate. Only magnitudes with rates greater than that
+            are included in the result list.
+        :returns:
+            A list of two-item tuples -- magnitudes and occurrence rates.
+        """
+        scaling_rate = getattr(self, 'scaling_rate', 1)
+        return [(mag, occ_rate * scaling_rate)
+                for mag, occ_rate in self.mfd.get_annual_occurrence_rates()
+                if min_rate is None or occ_rate > min_rate]
+
+    def get_min_max_mag(self):
+        """
+        Get the minimum and maximum magnitudes of the ruptures generated
+        by the source from the underlying MFD.
+        """
+        return self.mfd.get_min_max_mag()
+
+    def modify_set_recurrow(self, recurrow):
+        """
+        Modify the recurrence parameters by values given in a dict.
+
+        Params are read from the recurrow dict, preferring bg-prefixed keys
+        e.g., bg_b_value, bg_ref_mag, bg_rate) so a single alt3-style
+        recurRow branch can carry different but correlated bg and fault
+        parameters; otherwise the unprefixed alt1/alt2 keys are used.
+
+        How it works is determined by if rate_split_bg_frac is present:
+
+        - Alt1/Alt3 (no rate_split_bg_frac): Build the TE or AC MFD from
+          the row params and use it as it is.
+
+        - Alt2 (rate_split_bg_frac present): Build the same MFD, then
+          piecewise-scale bins at or above Mmax-1 by rate_split_bg_frac (bg
+          side of the alt2 partition between the area source and its faults
+          and make an EvenlyDiscretizedMFD.
+
+        NOTE: This is currently only intended for support of the BC Hydro
+        NVA SSC logic tree. We may expand it to become a more general
+        capability.
+
+        :param recurrow:
+            Dict of values to use in given type of MFD e.g.b_value, ref_mag,
+            rate). Alt3-style rows use prefixes of "bg" for the same keys.
+        """
+        # Constants for BC Hydro NVA model
+        b_ac = 0.3
+        delta_mac = 1.0
+        # Corrected gamma_eff from eq 1.2 of BCHydro AC memo
+        gamma_eff = 0.9185
+        # the job parameter width_of_mfd_bin, 0.1 if not set
+        bin_width = getattr(self, 'width_of_mfd_bin', 0.1)
+
+        # Get params from recurRow, preferring bg-prefixed keys (alt3)
+        mmax = self.mmax
+        recur_model = self.recur_model
+        bval = float(recurrow.get("bg_b_value", recurrow.get("b_value")))
+        ref_mag = float(recurrow.get("bg_ref_mag", recurrow.get("ref_mag")))
+        rate = float(recurrow.get("bg_rate", recurrow.get("rate")))
+
+        # Build the MFD
+        if recur_model == "TE":
+            a_val = math.log10(rate) + bval * ref_mag
+            self.mfd = mfd.TruncatedGRMFD(
+                min_mag=ref_mag, max_mag=mmax,
+                bin_width=bin_width, a_val=a_val, b_val=bval)
+        else:
+            assert recur_model == "AC"
+            self.mfd = mfd.AlternativeCharacteristicMFD(
+                min_mag=ref_mag, max_mag=mmax, b_GR=bval, b_AC=b_ac,
+                bin_width=bin_width, gamma=gamma_eff, delta_m_AC=delta_mac,
+                total_rate=rate)
+
+        # Piecewise partition above Mmax-1 if a rate_split_bg_frac is active
+        bg_frac = getattr(self, 'rate_split_bg_frac', None)
+        if bg_frac is not None:
+            bins = self.mfd.get_annual_occurrence_rates()
+            threshold = mmax - 1.0
+            occ = [(r * bg_frac if m >= threshold - bin_width / 4 else r)
+                   for m, r in bins]
+            self.mfd = mfd.EvenlyDiscretizedMFD(
+                min_mag=bins[0][0], bin_width=bin_width, occurrence_rates=occ)
+
+    def modify_set_msr(self, new_msr):
+        """
+        Updates the MSR originally assigned to the source
+
+        :param new_msr:
+            An instance of the :class:`openquake.hazardlib.scalerel.BaseMSR`
+        """
+        self.magnitude_scaling_relationship = new_msr
+
+    def get_aspect_ratio(self, mag):
+        """
+        Return the rupture aspect ratio
+        """
+        rar = self.rupture_aspect_ratio
+        if not isinstance(rar, MagDepAspectRatio):
+            return rar
+        # Must be MagDepAspectRatio so get the expression to be eval
+        return rar.get(mag)
+
+    def _check_scalar_aspect_ratio(self, modification):
+        if isinstance(self.rupture_aspect_ratio, MagDepAspectRatio):
+            # Prevent use of aratio epistemic uncertainties when also
+            # using a non-scalar value for aspect ratio in the src XML
+            raise ValueError(
+                'Cannot apply %s to source %r: epistemic uncertainties on '
+                'aspect ratio are not compatible with aspectRatioFunction'
+                % (modification, self.source_id))
+
+    def modify_set_aspect_ratio(self, aspect_ratio):
+        """
+        Replaces the rupture aspect ratio with the given value
+
+        :param float aspect_ratio:
+            New value of the rupture aspect ratio (must be positive)
+        """
+        self._check_scalar_aspect_ratio('set_aspect_ratio')
+        if not aspect_ratio > 0:
+            raise ValueError('rupture aspect ratio must be positive, got %s'
+                             % aspect_ratio)
+        self.rupture_aspect_ratio = aspect_ratio
+
+    def modify_adjust_aspect_ratio(self, increment):
+        """
+        Adjusts the rupture aspect ratio by an incremental value
+
+        :param float increment:
+            Value by which to increase or decrease the rupture aspect ratio
+        """
+        self._check_scalar_aspect_ratio('adjust_aspect_ratio')
+        new_ratio = self.rupture_aspect_ratio + increment
+        if not new_ratio > 0:
+            raise ValueError(
+                'increment %s would result in a non-positive rupture aspect '
+                'ratio (%s)' % (increment, new_ratio))
+        self.rupture_aspect_ratio = new_ratio
+
+    def modify_set_slip_rate(self, slip_rate: float):
+        """
+        Updates the slip rate assigned to the source
+
+        :param slip_rate:
+            The value of slip rate [mm/yr]
+        """
+        self.slip_rate = slip_rate
+
+    def modify_set_hypo_depth_dist(self, hdd: list):
+        """
+        Updates the hypoDepthDist assigned to the source.
+
+        :param hdd:
+            List of dictionaries where each dictionary contains
+            the keys of probability and depth, and also potentially
+            of down-dip fraction to place the hypocentre.
+        """
+        # Get fixedDipFrac values if any
+        fracs = tuple(
+            float(dic['fixedDipFrac']) if 'fixedDipFrac' in dic else None
+            for dic in hdd)
+        
+        if hasattr(self, 'hypocenter_distribution'):
+            # Distributed typologies (MPS, PS, area) - rebuild the PMF
+            pmf = PMF([(dic['probability'], dic['depth']) for dic in hdd])
+            if any(f is not None for f in fracs):
+                pmf.hypo_dip_fracs = fracs
+                self.hypo_dip_fracs = fracs
+            else:
+                self.hypo_dip_fracs = None
+            self.hypocenter_distribution = pmf
+        else:
+            # Simple Faults - rebuild the hypo_depth_list
+            self.hypo_depth_list = [
+                (dic['probability'], dic['depth'], frac)
+                for dic, frac in zip(hdd, fracs)]
+
+    def _shrink_hypo_depths_to_lsd(self, lsd: float):
+        """
+        Drop depths deeper than lsd from a hypocenter_distribution,
+        renormalise the surviving probabilities, and trim any matching
+        entries in hypo_dip_fracs.
+
+        Called by modify_set_lower_seismogenic_depth on the
+        distributed source typologies (point/area/multi-point) so
+        that a shrunk LSD does not leave orphan hypo depths that would
+        later fail within the PointSource instantiation.
+        """
+        hdd = self.hypocenter_distribution
+        fracs = getattr(hdd, 'hypo_dip_fracs', None)
+        keep = [(i, prob, depth) for i, (prob, depth) in enumerate(hdd.data)
+                if depth <= lsd]
+        if not keep:
+            raise ValueError(
+                f'No hypocenter depths remain at or above the new '
+                f'lower_seismogenic_depth={lsd}')
+        total = sum(prob for _, prob, _ in keep)
+        new_hdd = PMF([(prob / total, depth) for _, prob, depth in keep])
+        if fracs is not None:
+            new_fracs = tuple(fracs[i] for i, _, _ in keep)
+            new_hdd.hypo_dip_fracs = new_fracs
+            self.hypo_dip_fracs = new_fracs
+        self.hypocenter_distribution = new_hdd
+
+    def modify_set_mmax_truncatedGR(self, mmax: float):
+        """
+        Updates the mmax assigned. This works on for parametric MFDs.
+
+        :param mmax:
+            The value of the new maximum magnitude
+        """
+        # Check that the current src has a TruncatedGRMFD MFD
+        msg = 'This modification works only when the source MFD is a '
+        msg += 'TruncatedGRMFD'
+        assert self.mfd.__class__.__name__ == 'TruncatedGRMFD', msg
+        self.mfd.max_mag
+
+    def modify_recompute_mmax(self, epsilon: float = 0):
+        """
+        Updates the value of mmax using the msr and the area of the fault
+
+        :param epsilon:
+            Number of standard deviations to be added or substracted
+        """
+        msr = self.magnitude_scaling_relationship
+        area = self.get_fault_surface_area()  # area in km^2
+        mag = msr.get_median_mag(area=area, rake=self.rake)
+        std = msr.get_std_dev_mag(area=area, rake=self.rake)
+        self.mfd.max_mag = mag + epsilon * std
+
+    def modify_adjust_mfd_from_slip(self, slip_rate: float, rigidity: float,
+                                    constant_term: float = 9.1,
+                                    recompute_mmax: float = None):
+        """
+        :param slip_rate:
+            A float defining slip rate [in mm]
+        :param rigidity:
+            A float defining material rigidity [in GPa]
+        :param constant_term:
+            Constant term of the equation used to compute log M0 from magnitude
+        """
+        # Check that the current src has a TruncatedGRMFD MFD
+        msg = 'This modification works only when the source MFD is a '
+        msg += 'TruncatedGRMFD'
+        assert self.mfd.__class__.__name__ == 'TruncatedGRMFD', msg
+        # Compute moment
+        area = self.get_fault_surface_area() * 1e6  # area in m^2
+        rigidity *= 1e9  # rigidity in Pa
+        slip_rate *= 1e-3  # slip rate in m
+        mo = rigidity * area * slip_rate
+        # Update the MFD
+        min_mag = self.mfd.min_mag
+        max_mag = self.mfd.max_mag
+        bin_w = self.mfd.bin_width
+        b_val = self.mfd.b_val
+        self.mfd = mfd.TruncatedGRMFD.from_moment(min_mag, max_mag, bin_w,
+                                                  b_val, mo, constant_term)

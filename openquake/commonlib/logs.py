@@ -1,0 +1,348 @@
+# -*- coding: utf-8 -*-
+# vim: tabstop=4 shiftwidth=4 softtabstop=4
+#
+# Copyright (C) 2010-2026 GEM Foundation
+#
+# OpenQuake is free software: you can redistribute it and/or modify it
+# under the terms of the GNU Affero General Public License as published
+# by the Free Software Foundation, either version 3 of the License, or
+# (at your option) any later version.
+#
+# OpenQuake is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU Affero General Public License for more details.
+#
+# You should have received a copy of the GNU Affero General Public License
+# along with OpenQuake. If not, see <http://www.gnu.org/licenses/>.
+"""
+Set up some system-wide loggers
+"""
+import os
+import re
+import time
+import getpass
+import logging
+import traceback
+import requests
+from pdb import post_mortem
+from datetime import datetime, timezone
+from openquake.baselib import config, parallel, use_server
+from openquake.commonlib.auth import API_KEY
+from openquake.commonlib import readinput, dbapi
+from openquake.commonlib import get_datadir
+
+UTC = timezone.utc
+LEVELS = {'debug': logging.DEBUG,
+          'info': logging.INFO,
+          'warn': logging.WARNING,
+          'error': logging.ERROR,
+          'critical': logging.CRITICAL}
+SIMPLE_TYPES = (str, int, float, bool, datetime, list, tuple, dict, type(None))
+CALC_REGEX = r'(calc|cache)_(\d+)\.hdf5'
+root = logging.root
+WORKER_ACTIONS = {
+    'workers_' + action
+    for action in 'start stop status restart wait kill debug'.split()
+}
+
+
+def _worker_api(action, *args):
+    """Call a worker-control endpoint on the WebUI API."""
+    server = os.environ.get('OQ_WEBAPI_SERVER', config.webapi.server)
+    endpoint = '%s/v0/worker_%s' % (server.rstrip('/'), action[8:])
+    try:
+        response = requests.post(
+            endpoint, json={'args': args},
+            headers={'X-API-Key': API_KEY}, timeout=600)
+        response.raise_for_status()
+    except requests.RequestException as exc:
+        raise RuntimeError(
+            'Unable to call worker endpoint %s: %s' % (endpoint, exc)) from exc
+    return response.json()
+
+
+def _db_api(action, *args):
+    """Call a database action through the internal API endpoint."""
+    server = os.environ.get('OQ_WEBAPI_SERVER', config.webapi.server)
+    endpoint = '%s/v0/db/%s' % (server.rstrip('/'), action)
+    try:
+        response = requests.post(
+            endpoint, json={'args': dbapi.to_json(args)},
+            headers={'X-API-Key': API_KEY}, timeout=600)
+    except requests.RequestException as exc:
+        raise RuntimeError(
+            'Unable to call database endpoint %s: %s' % (endpoint, exc)) from exc
+    if response.status_code == 404:
+        raise dbapi.NotFound
+    try:
+        response.raise_for_status()
+    except requests.RequestException as exc:
+        raise RuntimeError(
+            'Database action %s failed: %s' % (action, response.text)) from exc
+    return dbapi.from_json(response.json())
+
+
+def dbcmd(action, *args):
+    """
+    A dispatcher to the database server.
+
+    :param string action: database action to perform
+    :param tuple args: arguments
+    """
+    # make sure the passed arguments are simple (i.e. not Django
+    # QueryDict that cannot be deserialized without settings.py)
+    for arg in args:
+        if type(arg) not in SIMPLE_TYPES:
+            raise TypeError(f'{arg} is not a simple type')
+    if action in WORKER_ACTIONS:
+        if not use_server():
+            # keep local: needed only when not using the server
+            from openquake.baselib.workerpool import WorkerMaster
+            return getattr(WorkerMaster(-1), action[8:])()
+        return _worker_api(action, *args)
+    if not use_server():
+        # keep local: importing server DB actions at module load breaks
+        # the dependency boundary between the engine and the server.
+        from openquake.server.db import actions as db_actions
+        return getattr(db_actions, action)(dbapi.db, *args)
+    return _db_api(action, *args)
+
+
+def get_job_info(job_id):
+    """
+    :returns: dictionary field -> value extracted from job record
+    """
+    job = dbcmd('get_job', int(job_id))
+    job_info = {key: val for key, val in zip(job.__dict__['_fields'],
+                                             job.__dict__['_values'])}
+    # NOTE: returning more than before, but keeping job_id instead of id
+    # for backwards compatibility
+    job_info['job_id'] = job_info['id']
+    del job_info['id']
+    # make datetime fields serializable
+    if job_info['start_time']:
+        job_info["start_time"] = job_info["start_time"].isoformat()
+    if job_info['stop_time']:
+        job_info["stop_time"] = job_info["stop_time"].isoformat()
+    return job_info
+
+
+def dblog(level: str, job_id: int, task_no: int, msg: str):
+    """
+    Log on the database
+    """
+    task = 'task #%d' % task_no
+    return dbcmd('log', job_id, datetime.now(UTC), level, task, msg)
+
+
+def get_calc_ids(datadir=None):
+    """
+    Extract the available calculation IDs from the datadir, in order.
+    """
+    datadir = datadir or get_datadir()
+    if not os.path.exists(datadir):
+        return []
+    calc_ids = set()
+    for f in os.listdir(datadir):
+        mo = re.match(CALC_REGEX, f)
+        if mo:
+            calc_ids.add(int(mo.group(2)))
+    return sorted(calc_ids)
+
+
+def get_last_calc_id(datadir=None):
+    """
+    Extract the latest calculation ID from the given directory.
+    If none is found, return 0.
+    """
+    datadir = datadir or get_datadir()
+    calcs = get_calc_ids(datadir)
+    if not calcs:
+        return 0
+    return calcs[-1]
+
+
+def _update_log_record(self, record):
+    """
+    Massage a log record before emitting it. Intended to be used by the
+    custom log handlers defined in this module.
+    """
+    if not hasattr(record, 'hostname'):
+        record.hostname = '-'
+    if not hasattr(record, 'job_id'):
+        record.job_id = self.job_id
+
+
+class LogStreamHandler(logging.StreamHandler):
+    """
+    Log stream handler
+    """
+    def __init__(self, job_id):
+        super().__init__()
+        self.job_id = job_id
+
+    def emit(self, record):
+        if record.levelname != 'CRITICAL':
+            _update_log_record(self, record)
+            super().emit(record)
+
+
+class LogFileHandler(logging.FileHandler):
+    """
+    Log file handler
+    """
+    def __init__(self, job_id, log_file):
+        super().__init__(log_file)
+        self.job_id = job_id
+        self.log_file = log_file
+
+    def emit(self, record):
+        _update_log_record(self, record)
+        super().emit(record)
+
+
+class LogDatabaseHandler(logging.Handler):
+    """
+    Log stream handler
+    """
+    def __init__(self, job_id):
+        super().__init__()
+        self.job_id = job_id
+
+    def emit(self, record):
+        dbcmd('log', self.job_id, datetime.now(UTC), record.levelname,
+              '%s/%s' % (record.processName, record.process),
+              record.getMessage())
+
+
+class LogContext:
+    """
+    Context manager managing the logging functionality
+    """
+    oqparam = None
+
+    def __init__(self, params, log_level='info', log_file=None,
+                 user_name=None, hc_id=None, host=None, pdb=None):
+        if not dbcmd('has_job_table'):
+            raise RuntimeError('You forgot to run oq engine --upgrade-db')
+        self.log_level = log_level
+        self.log_file = log_file
+        self.user_name = user_name or getpass.getuser()
+        self.params = params
+        if hc_id:
+            self.params['hazard_calculation_id'] = hc_id
+        self.pdb = pdb
+        calc_id = int(params.get('job_id', 0))
+        if calc_id == 0:
+            # create a new record
+            self.new = True
+            datadir = get_datadir()
+            self.calc_id = dbcmd(
+                'create_job', datadir,
+                self.params['calculation_mode'],
+                self.params.get('description', 'test'),
+                user_name, None if isinstance(hc_id, str) else hc_id,
+                host)
+            path = os.path.join(datadir, 'calc_%d.hdf5' % self.calc_id)
+            if os.path.exists(path):
+                if use_server():
+                    raise RuntimeError('There is a pre-existing file %s' % path)
+                else:
+                    # single user installation with pre-existing calculation
+                    logging.warning(f'Overwriting {path}')
+                    os.remove(path)                    
+        else:
+            # assume the calc_id was alreay created in the db
+            self.new = False
+            assert calc_id > 0, calc_id
+            self.calc_id = calc_id
+
+    def get_oqparam(self, validate=True):
+        """
+        :returns: an OqParam instance
+        """
+        if self.oqparam:  # set by submit_job
+            return self.oqparam
+        return readinput.get_oqparam(self.params, validate=validate)
+
+    def get_job(self):
+        """
+        :returns: the associated job record
+        """
+        return dbcmd("get_job", self.calc_id)
+
+    def __enter__(self):
+        self.t0 = time.time()
+        self.orig_handlers = root.handlers.copy()
+        if not self.orig_handlers:  # first time
+            level = LEVELS.get(self.log_level, self.log_level)
+            logging.basicConfig(level=level, handlers=[])
+        tag = self.params['mosaic_model']
+        f = '[%(asctime)s #{} {}%(levelname)s] %(message)s'.format(
+            self.calc_id, tag + ' ' if tag else '')
+        root.handlers = [LogDatabaseHandler(self.calc_id)]
+        if self.log_file is None:
+            root.addHandler(LogStreamHandler(self.calc_id))
+        else:
+            root.addHandler(LogFileHandler(self.calc_id, self.log_file))
+        for handler in root.handlers:
+            handler.setFormatter(
+                logging.Formatter(f, datefmt='%Y-%m-%d %H:%M:%S'))
+        if os.environ.get('NUMBA_DISABLE_JIT'):
+            logging.warning('NUMBA_DISABLE_JIT is set')
+        return self
+
+    def __exit__(self, etype, exc, tb):
+        self.dt = time.time() - self.t0
+        if etype is SystemExit:
+            dbcmd('finish', self.calc_id, 'aborted')
+        elif tb:
+            tb_str = ''.join(traceback.format_tb(tb))  # newlines are included
+            # remove non-db handlers to avoid logging twice
+            for h in root.handlers:
+                if not isinstance(h, LogDatabaseHandler):
+                    root.removeHandler(h)
+            # store the traceback
+            logging.error(f'{tb_str}{etype.__name__}: {exc}')
+            dbcmd('finish', self.calc_id, 'failed')
+            if self.pdb:
+                post_mortem(tb)
+        else:
+            dbcmd('finish', self.calc_id, 'complete')
+        parallel.Starmap.shutdown()
+        for handler in root.handlers:
+            root.removeHandler(handler)
+        root.handlers = self.orig_handlers
+
+    def __repr__(self):
+        hc_id = self.params.get('hazard_calculation_id')
+        return '<%s#%d, hc_id=%s>' % (self.__class__.__name__,
+                                      self.calc_id, hc_id)
+
+
+def init(job_ini, dummy=None, log_level='info', log_file=None,
+         user_name=None, hc_id=None, host=None, pdb=None):
+    """
+    :param job_ini: path to the job.ini file or dictionary of parameters
+    :param dummy: ignored parameter, exists for backward compatibility
+    :param log_level: the log level as a string or number
+    :param log_file: path to the log file (if any)
+    :param user_name: user running the job (None means current user)
+    :param hc_id: parent calculation ID (default None)
+    :param host: machine where the calculation is running (default None)
+    :returns: a LogContext instance
+
+    1. initialize the root logger (if not already initialized)
+    2. set the format of the root log handlers (if any)
+    3. create a job in the database if job_or_calc == "job"
+    4. return a LogContext instance associated to a calculation ID
+    """
+    if job_ini in ('job', 'calc'):  # backward compatibility
+        job_ini = dummy
+    if isinstance(job_ini, dict):
+        job_ini = readinput.oqdict(job_ini)
+    else:
+        job_ini = readinput.get_params(job_ini)
+    return LogContext(job_ini, log_level, log_file, user_name, hc_id,
+                      host, pdb)

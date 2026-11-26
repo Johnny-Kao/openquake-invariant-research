@@ -1,0 +1,767 @@
+# The Hazard Library
+# Copyright (C) 2012-2026 GEM Foundation
+#
+# This program is free software: you can redistribute it and/or modify
+# it under the terms of the GNU Affero General Public License as
+# published by the Free Software Foundation, either version 3 of the
+# License, or (at your option) any later version.
+#
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU Affero General Public License for more details.
+#
+# You should have received a copy of the GNU Affero General Public License
+# along with this program.  If not, see <http://www.gnu.org/licenses/>.
+"""
+Module :mod:`openquake.hazardlib.source.point` defines :class:`PointSource`.
+"""
+import math
+import copy
+import numpy
+from openquake.baselib.general import AccumDict, Deduplicate
+from openquake.hazardlib.geo import Point, geodetic
+from openquake.hazardlib.codes import POINT, COLLAPSED_POINT
+from openquake.hazardlib.geo.nodalplane import NodalPlane
+from openquake.hazardlib.geo.surface.planar import (
+    build_planar, PlanarSurface, planin_dt, get_rupdims)
+from openquake.hazardlib.pmf import PMF
+from openquake.hazardlib.scalerel.point import PointMSR
+from openquake.hazardlib.aspect_ratio import MagDepAspectRatio
+from openquake.hazardlib.source.base import ParametricSeismicSource, SourceParam
+from openquake.hazardlib.source.rupture import (
+    ParametricProbabilisticRupture)
+from openquake.hazardlib.geo.utils import (
+    get_bounding_box, angular_mean, KM_TO_DEGREES, DEGREES_TO_RAD)
+from openquake.hazardlib.mfd.evenly_discretized import EvenlyDiscretizedMFD
+
+
+def msr_name(src):
+    """
+    :returns: string representation of the MSR or "Undefined" if not applicable
+    """
+    # NB: the MSR is None for characteristicFault sources
+    try:
+        return str(src.magnitude_scaling_relationship)
+    except AttributeError:   # no MSR for nonparametric sources
+        return 'Undefined'
+
+
+def calc_average(pointsources):
+    """
+    :returns:
+        a dict with average strike, dip, rake, lon, lat, dep,
+        upper_seismogenic_depth, lower_seismogenic_depth
+    """
+    node_w, dep_w, rate_w = [], [], []
+    acc = dict(lon=[], lat=[], strike=[], dip=[], rake=[], dep=[],
+               upper_seismogenic_depth=[], lower_seismogenic_depth=[],
+               rupture_aspect_ratio=[], hypo_dip_frac=[])
+    trt = pointsources[0].tectonic_region_type
+    multiple = len(pointsources) > 1
+    for src in pointsources:
+        assert src.tectonic_region_type == trt
+        rate = sum(r for m, r in src.get_annual_occurrence_rates())
+        factor = rate if multiple else 1.
+        ws, ds = zip(*src.nodal_plane_distribution.data)
+        acc['strike'].extend([np.strike for np in ds])
+        acc['dip'].extend([np.dip for np in ds])
+        acc['rake'].extend([np.rake for np in ds])
+        node_w.extend(factor * prob for prob in ws)
+        ws, deps = zip(*src.hypocenter_distribution.data)
+        acc['dep'].extend(deps)
+        dep_w.extend(factor * prob for prob in ws)
+        if src.hypo_dip_fracs is None:
+            # Default OQ behaviour of using rup centroid
+            acc['hypo_dip_frac'].extend([0.5] * len(deps))
+        else:
+            # Use the down-dip fraction from the hypoDepthDist
+            acc['hypo_dip_frac'].extend(
+                0.5 if f is None else f for f in src.hypo_dip_fracs)
+        acc['lon'].append(src.location.x)
+        acc['lat'].append(src.location.y)
+        acc['upper_seismogenic_depth'].append(src.upper_seismogenic_depth)
+        acc['lower_seismogenic_depth'].append(src.lower_seismogenic_depth)
+        acc['rupture_aspect_ratio'].append(src.rupture_aspect_ratio)
+        rate_w.append(rate)
+    for key in acc:
+        if key in ('strike', 'rake'):
+            values = numpy.asarray(acc[key], dtype=float)
+            weights = numpy.asarray(node_w, dtype=float)
+            total = weights.sum()
+            radians = numpy.radians(values)
+            sin = numpy.sum(numpy.sin(radians) * weights)
+            cos = numpy.sum(numpy.cos(radians) * weights)
+            if numpy.hypot(sin, cos) <= 1e-8 * total:
+                # The circular mean is undefined for opposite angles.
+                mean = numpy.average(values, weights=weights)
+            else:
+                angle = angular_mean(values, weights / total)
+                mean = numpy.asarray(angle).item()
+            if key == 'strike':
+                mean %= 360
+                acc[key] = 0. if mean >= 360 else mean
+            else:
+                acc[key] = mean
+                # rake must be in (-180, 180]: arctan2 may give -180
+                acc[key] = mean + 360 if mean <= -180 else mean
+        elif key == 'dip':
+            acc[key] = numpy.average(acc[key], weights=node_w)
+        elif key in ('dep', 'hypo_dip_frac'):
+            # Same entry in hypoDepthDist so share weight
+            acc[key] = numpy.average(acc[key], weights=dep_w)
+        elif key == 'rupture_aspect_ratio' and isinstance(
+            acc[key][0], MagDepAspectRatio):
+            # Mag-dep aratio
+            acc[key] = acc[key][0]
+        else:
+            acc[key] = numpy.average(acc[key], weights=rate_w)
+    # the average of points on the antimeridian can exceed 180 in
+    # absolute value by a few ulps, see test_antimeridian
+    acc['lon'] = numpy.clip(acc['lon'], -180., 180.)
+    return acc
+
+
+class PointSource(ParametricSeismicSource):
+    """
+    Point source typology represents seismicity on a single geographical
+    location.
+
+    :param upper_seismogenic_depth:
+        Minimum depth an earthquake rupture can reach, in km.
+    :param lower_seismogenic_depth:
+        Maximum depth an earthquake rupture can reach, in km.
+    :param location:
+        :class:`~openquake.hazardlib.geo.point.Point` object
+        representing the location of the seismic source.
+    :param nodal_plane_distribution:
+        :class:`~openquake.hazardlib.pmf.PMF` object with values
+        that are instances
+        of :class:`openquake.hazardlib.geo.nodalplane.NodalPlane`.
+        Shows the distribution
+        of probability for rupture to have the certain nodal plane.
+    :param hypocenter_distribution:
+        :class:`~openquake.hazardlib.pmf.PMF` with values being float
+        numbers in km representing the depth of the hypocenter. Latitude
+        and longitude of the hypocenter is always set to ones of ``location``.
+        An optional hypo_dip_fracs attribute on the PMF (tuple, one entry
+        per depth) gives the fractional position of the hypocentre within the
+        seismogenic zone [USD, LSD] (0=top, 1=bottom); the rupture is shifted
+        so the hypocentre lands at that fraction. Absent or None entries
+        default to 0.5 (rupture centroid, default OQ behaviour).
+
+    See also :class:`openquake.hazardlib.source.base.ParametricSeismicSource`
+    for description of other parameters.
+
+    :raises ValueError:
+        If upper seismogenic depth is below lower seismogenic
+        depth,  if one or more of hypocenter depth values is shallower
+        than upper seismogenic depth or deeper than lower seismogenic depth.
+    """
+    code = POINT
+    MODIFICATIONS = {
+        'adjust_aspect_ratio',
+        'set_aspect_ratio',
+        'set_lower_seismogenic_depth',
+        'set_upper_seismogenic_depth',
+        'adjust_lower_seismogenic_depth',
+        'adjust_upper_seismogenic_depth',
+        'set_msr',
+        'set_hypo_depth_dist',
+    }
+    ps_grid_spacing = 0  # updated in CollapsedPointSource
+
+    def __init__(self, source_id, name, tectonic_region_type,
+                 mfd, rupture_mesh_spacing,
+                 magnitude_scaling_relationship, rupture_aspect_ratio,
+                 temporal_occurrence_model,
+                 # point-specific parameters
+                 upper_seismogenic_depth, lower_seismogenic_depth,
+                 location, nodal_plane_distribution, hypocenter_distribution):
+        super().__init__(
+            source_id, name, tectonic_region_type, mfd, rupture_mesh_spacing,
+            magnitude_scaling_relationship, rupture_aspect_ratio,
+            temporal_occurrence_model)
+
+        if not lower_seismogenic_depth > upper_seismogenic_depth:
+            raise ValueError('lower seismogenic depth must be below '
+                             'upper seismogenic depth')
+
+        for _prob, depth in hypocenter_distribution.data:
+            if depth > lower_seismogenic_depth:
+                raise ValueError(
+                    f'{source_id=} {depth=} is below {lower_seismogenic_depth=}')
+            elif depth < upper_seismogenic_depth:
+                raise ValueError(
+                    f'{source_id=} {depth=} is over {upper_seismogenic_depth=}')
+
+        if not upper_seismogenic_depth > geodetic.EARTH_ELEVATION:
+            raise ValueError(
+                "Upper seismogenic depth must be greater than the "
+                "maximum elevation on Earth's surface (-8.848 km)")
+
+        self.location = location
+        self.nodal_plane_distribution = nodal_plane_distribution
+        self.hypocenter_distribution = hypocenter_distribution
+        self.hypo_dip_fracs = getattr(
+            hypocenter_distribution, 'hypo_dip_fracs', None)
+        self.upper_seismogenic_depth = upper_seismogenic_depth
+        self.lower_seismogenic_depth = lower_seismogenic_depth
+
+    def restrict(self, nodalplane, depth, dip_frac=None):
+        """
+        :returns: source restricted to a single nodal plane and depth
+        """
+        new = copy.copy(self)
+        new.nodal_plane_distribution = PMF([(1., nodalplane)])
+        new.hypocenter_distribution = PMF([(1., depth)])
+        new.hypo_dip_fracs = None if dip_frac is None else (dip_frac,)
+        new.hypocenter_distribution.hypo_dip_fracs = new.hypo_dip_fracs
+        return new
+
+    def get_planin(self, magd=None, npd=None):
+        """
+        :return: array of dtype planin_dt of shape (#mags, #planes)
+        """
+        if magd is None:
+            magd = [(r, mag) for mag, r in self.get_annual_occurrence_rates()]
+        if npd is None:
+            npd = self.nodal_plane_distribution.data
+        msr = self.magnitude_scaling_relationship
+        planin = numpy.zeros((len(magd), len(npd)), planin_dt).view(
+            numpy.recarray)
+        mrate, mags = numpy.array(magd).T  # shape (2, num_mags)
+        nrate = numpy.array([nrate for nrate, np in npd])
+
+        planin['rate'] = nrate
+        for n, (nrate, np) in enumerate(npd):
+            arr = planin[:, n]
+            arr['area'] = msr.get_median_area(mags, np.rake)
+            arr['mag'] = mags
+            arr['strike'] = np.strike
+            arr['dip'] = np.dip
+            arr['rake'] = np.rake
+        return planin
+
+    # used in the source filtering
+    def max_radius(self, maxdist, radii=None):
+        """
+        :returns: max radius, without the ps_grid_spacing half diagonal
+        """
+        if radii is None:  # compute the radius of the maximum magnitude
+            mag, rate = self.get_annual_occurrence_rates()[-1]
+            radii = self._get_rupture_projection_radii([(rate, mag)])
+        return min(radii[-1], maxdist / 2)
+
+    def get_psdist(self, m, mag, psdist, magdist, radii=None):
+        """
+        :returns: the effective pointsource distance for the given magnitude
+        """
+        if radii is None:
+            radii = self._get_rupture_projection_radii()
+        return psdist + min(radii[m], magdist[mag] / 2)
+
+    def _get_rupture_projection_radii(self, magd=None):
+        """
+        Return half the maximum rupture's diagonal surface projection for
+        each magnitude.
+        """
+        if magd is None:
+            magd = [(r, mag) for mag, r in self.get_annual_occurrence_rates()]
+        if isinstance(self.magnitude_scaling_relationship, PointMSR):
+            return numpy.zeros(len(magd))
+        radii = numpy.zeros(len(magd))
+        usd = self.upper_seismogenic_depth
+        lsd = self.lower_seismogenic_depth
+        for m, planin in enumerate(self.get_planin(magd)):
+            rup_length, rup_width, _ = get_rupdims(
+                usd, lsd, self.get_aspect_ratio(magd[m][1]),
+                planin.area[-1], planin.dip[-1])
+            radii[m] = math.sqrt(rup_length ** 2 + rup_width ** 2) / 2.0
+        return radii
+
+    def get_planar(self, shift_hypo=False, iruptures=False):
+        """
+        :returns: a dictionary mag -> list of arrays of shape (U, 3)
+        """
+        magd = [(r, mag) for mag, r in self.get_annual_occurrence_rates()]
+        if isinstance(self, CollapsedPointSource) and not iruptures:
+            out = AccumDict(accum=[])
+            total_rates = dict(self.get_annual_occurrence_rates())
+            for src in self.pointsources:
+                src_rates = dict(src.get_annual_occurrence_rates())
+                for mag, [pla] in src.get_planar(shift_hypo).items():
+                    # The context builder applies the aggregate magnitude
+                    # rate. Normalize each source block by its own rate.
+                    pla.wlr[:, 2] *= src_rates[mag] / total_rates[mag]
+                    out += {mag: [pla]}
+            return out
+
+        hdd = numpy.array(self.hypocenter_distribution.data)
+        clon, clat = self.location.x, self.location.y
+        usd = self.upper_seismogenic_depth
+        lsd = self.lower_seismogenic_depth
+        planin = self.get_planin()
+        if isinstance(self.rupture_aspect_ratio, MagDepAspectRatio):
+            # Get the mag-dependent aratio for each rup
+            rar = numpy.array([[self.get_aspect_ratio(planin.mag[m, n])
+                                for n in range(planin.shape[1])]
+                                for m in range(planin.shape[0])])
+        else:
+            # Regular aratio
+            rar = self.rupture_aspect_ratio
+        dip_fracs = (None if self.hypo_dip_fracs is None else
+                     numpy.array([0.5 if f is None else f
+                                  for f in self.hypo_dip_fracs]))
+        planar = build_planar(
+            planin, hdd, clon, clat, usd, lsd, rar, shift_hypo, dip_fracs)
+        dic = {mag: [pla.reshape(-1, 3)]   # MND3
+               for (_rate, mag), pla in zip(magd, planar)}
+        return dic
+
+    def _gen_ruptures(self, shift_hypo=False, iruptures=False):
+        magrate = dict(self.get_annual_occurrence_rates())
+        planardict = self.get_planar(shift_hypo, iruptures)
+        for mag, [planar] in planardict.items():
+            for pla in planar.reshape(-1, 3):
+                surface = PlanarSurface.from_(pla)
+                _strike, _dip, rake = pla.sdr
+                rate = magrate[mag] * pla.wlr[2]
+                yield ParametricProbabilisticRupture(
+                    mag, rake, self.tectonic_region_type,
+                    Point(*pla.hypo), surface, rate,
+                    self.temporal_occurrence_model)
+
+    def iter_ruptures(self, **kwargs):
+        """
+        Generate one rupture for each combination of magnitude, nodal plane
+        and hypocenter depth.
+        """
+        return self._gen_ruptures(shift_hypo=kwargs.get('shift_hypo'))
+
+    # PointSource
+    def iruptures(self):
+        """
+        Generate one rupture for each magnitude, called only if nphc > 1
+        """
+        avg = calc_average([self])  # over nodal planes and hypocenters
+        np = NodalPlane(avg['strike'], avg['dip'], avg['rake'])
+        yield from self.restrict(
+            np, avg['dep'], avg['hypo_dip_frac'])._gen_ruptures(iruptures=True)
+
+    def count_nphc(self):
+        """
+        :returns: the number of nodal planes times the number of hypocenters
+        """
+        return len(self.nodal_plane_distribution.data) * len(
+            self.hypocenter_distribution.data)
+
+    def count_ruptures(self):
+        """
+        See :meth:
+        `openquake.hazardlib.source.base.BaseSeismicSource.count_ruptures`.
+        """
+        return len(self.get_annual_occurrence_rates()) * self.count_nphc()
+
+    def modify_set_lower_seismogenic_depth(self, lsd):
+        """
+        Modifies the current source geometry by replacing the original
+        lower seismogenic depth with the passed depth.
+
+        Hypocenter depths deeper than the new LSD are dropped and the
+        remaining probabilities are renormalised (see
+        ParamatricSeismicSource._shrink_hypo_depths_to_lsd).
+        """
+        self.lower_seismogenic_depth = lsd
+        self._shrink_hypo_depths_to_lsd(lsd)
+
+    def modify_adjust_lower_seismogenic_depth(self, increment):
+        """
+        Modifies the lower seismogenic depth by adding an increment
+
+        :param float increment:
+            Value (in km) by which to increase or decrease the lower
+            seismogenic depth
+        """
+        self.lower_seismogenic_depth += increment
+        self._shrink_hypo_depths_to_lsd(self.lower_seismogenic_depth)
+
+    def modify_set_upper_seismogenic_depth(self, usd):
+        """
+        Modifies the current source geometry by replacing the original
+        upper seismogenic depth with the passed depth
+        """
+        self.upper_seismogenic_depth = usd
+
+    def modify_adjust_upper_seismogenic_depth(self, increment):
+        """
+        Modifies the upper seismogenic depth by adding an increment
+
+        :param float increment:
+            Value (in km) by which to increase or decrease the upper
+            seismogenic depth
+        """
+        self.upper_seismogenic_depth += increment
+
+    @property
+    def polygon(self):
+        """
+        Polygon corresponding to the max_rupture_projection_radius
+        """
+        radius = self._get_rupture_projection_radii()[-1]
+        return self.location.to_polygon(radius)
+
+    def get_bounding_box(self, maxdist):
+        """
+        Bounding box of the point, enlarged by the maximum distance
+        """
+        radius = self.max_radius(maxdist)
+        return get_bounding_box([self.location], maxdist + radius)
+
+    def wkt(self):
+        """
+        :returns: the geometry as a WKT string
+        """
+        loc = self.location
+        return 'POINT(%s %s)' % (loc.x, loc.y)
+
+
+def psources_to_pdata(pointsources, name):
+    """
+    Build a pdata dictionary from a list of homogeneous point sources
+    with the same tom, trt, msr.
+    """
+    ps = pointsources[0]
+    dt = [(f, numpy.float32) for f in 'lon lat usd lsd'.split()]
+    array = numpy.empty(len(pointsources), dt)
+    for i, ps in enumerate(pointsources):
+        rec = array[i]
+        loc = ps.location
+        rec['lon'] = loc.x
+        rec['lat'] = loc.y
+        rec['usd'] = ps.upper_seismogenic_depth
+        rec['lsd'] = ps.lower_seismogenic_depth
+    pdata = dict(name=name,
+                 array=array,
+                 tom=ps.temporal_occurrence_model,
+                 trt=ps.tectonic_region_type,
+                 rms=ps.rupture_mesh_spacing,
+                 rar=Deduplicate([ps.rupture_aspect_ratio
+                                  for ps in pointsources]),
+                 npd=Deduplicate([ps.nodal_plane_distribution
+                                  for ps in pointsources]),
+                 hcd=Deduplicate([ps.hypocenter_distribution
+                                  for ps in pointsources]),
+                 hdf=Deduplicate([ps.hypo_dip_fracs
+                                  for ps in pointsources]),
+                 mfd=Deduplicate([ps.mfd for ps in pointsources]),
+                 msr=Deduplicate([ps.magnitude_scaling_relationship
+                                  for ps in pointsources]),
+                 scaling_rate=numpy.array([
+                     getattr(ps, 'scaling_rate', 1.)
+                     for ps in pointsources]))
+    return pdata
+
+
+def pdata_to_psources(pdata):
+    """
+    Generate point sources from a pdata dictionary
+    """
+    name = pdata['name']
+    tom = pdata['tom']
+    trt = pdata['trt']
+    rar = pdata['rar']
+    npd = pdata['npd']
+    hcd = pdata['hcd']
+    hdf = pdata['hdf']
+    rms = pdata['rms']
+    mfd = pdata['mfd']
+    msr = pdata['msr']
+    scaling_rate = pdata.get('scaling_rate')
+    out = []
+    for i, rec in enumerate(pdata['array']):
+        hcd[i].hypo_dip_fracs = hdf[i]
+        param = SourceParam(f'{name}:{i}', name, trt, mfd[i], rms, msr[i],
+                            rar[i], tom)
+        ps = PointSource.from_param(
+            param, rec['usd'], rec['lsd'],
+            Point(rec['lon'], rec['lat']), npd[i], hcd[i])
+        ps.scaling_rate = (1. if scaling_rate is None
+                           else float(scaling_rate[i]))
+        out.append(ps)
+    return out
+
+
+class CollapsedPointSource(PointSource):
+    """
+    Source typology representing a cluster of point sources around a
+    specific location. The underlying sources must all have the same
+    tectonic region type, magnitude_scaling_relationship and
+    temporal_occurrence_model.
+    """
+    code = COLLAPSED_POINT
+    MODIFICATIONS = PointSource.MODIFICATIONS | {'set_recurrow'}
+
+    def __init__(self, source_id, pointsources):
+        self.source_id = source_id
+        self.pdata = psources_to_pdata(pointsources, source_id)
+        if hasattr(pointsources[0], 'mmax_offset'):
+            self.mmax_offset = pointsources[0].mmax_offset
+        if hasattr(pointsources[0], 'width_of_mfd_bin'):
+            self.width_of_mfd_bin = pointsources[0].width_of_mfd_bin
+        self.tectonic_region_type = pointsources[0].tectonic_region_type
+        self.magnitude_scaling_relationship = (
+            pointsources[0].magnitude_scaling_relationship)
+        self.temporal_occurrence_model = (
+            pointsources[0].temporal_occurrence_model)
+        vars(self).update(calc_average(pointsources))
+        self.location = Point(self.lon, self.lat, self.dep)
+        self.nodal_plane_distribution = PMF(
+            [(1., NodalPlane(self.strike, self.dip, self.rake))])
+        self.hypocenter_distribution = PMF([(1., self.dep)])
+        self.hypo_dip_fracs = (self.hypo_dip_frac,)
+        self.extent = self.get_extent(pointsources)
+
+    def get_extent(self, pointsources):
+        """
+        :param pointsources: the underlying point sources
+        :returns: the max distance in km between the centroid and the
+                  underlying point sources
+        """
+        lons = numpy.array([src.location.x for src in pointsources])
+        lats = numpy.array([src.location.y for src in pointsources])
+        return geodetic.geodetic_distance(
+            self.lon, self.lat, lons, lats).max()
+
+    @property
+    def pointsources(self):
+        """
+        :returns: the underlying point sources
+        """
+        return pdata_to_psources(self.pdata)
+
+    def get_annual_occurrence_rates(self):
+        """
+        :returns: a list of pairs [(mag, mag_occur_rate), ...]
+        """
+        # NB: the rates are cached since they are needed several times per
+        # source in preclassical and classical and computing them requires
+        # building all the underlying point sources; the cache is reset
+        # in _update_pointsources, the only place where pdata changes.
+        # The cache uses little memory, ~3 KB per source (260 MB in the
+        # master for the 90,000 gridded sources of AUS), and it is pickled
+        # together with the source, so that classical does not recompute it
+        rates = self.__dict__.get('_rates')
+        if rates is None:
+            acc = AccumDict(accum=0)
+            for psource in self.pointsources:
+                acc += dict(psource.get_annual_occurrence_rates())
+            rates = self._rates = sorted(acc.items())
+        return list(rates)
+
+    def count_nphc(self):
+        """
+        :returns: the total number of nodal planes and hypocenters
+        """
+        return sum(src.count_nphc() for src in self.pointsources)
+
+    def iter_ruptures(self, **kwargs):
+        """
+        :returns: an iterator over the underlying ruptures
+        """
+        for src in self.pointsources:
+            yield from src.iter_ruptures(**kwargs)
+
+    # CollapsedPointSource
+    def iruptures(self):
+        """
+        :yields: the underlying ruptures with mean nodal plane and hypocenter
+        """
+        np = NodalPlane(self.strike, self.dip, self.rake)
+        yield from self.restrict(
+            np, self.location.z, self.hypo_dip_frac)._gen_ruptures(
+            iruptures=True)
+
+    def modify(self, modification, parameters):
+        if modification == 'set_recurrow':
+            self.modify_set_recurrow(**parameters)
+            return
+        super().modify(modification, parameters)
+        pointsources = self.pointsources
+        for src in pointsources:
+            src.modify(modification, parameters)
+        self._update_pointsources(pointsources)
+
+    def apply_mfd_modification(self, name, parameters):
+        """
+        Apply an MFD modification (such as 'increment_max_mag') to each
+        underlying point source; the MFDs are copied first, since they
+        can be shared between the point sources (see Deduplicate)
+        """
+        pointsources = self.pointsources
+        for src in pointsources:
+            src.mfd = copy.deepcopy(src.mfd)
+            src.mfd.modify(name, parameters)
+        self._update_pointsources(pointsources)
+
+    def modify_set_recurrow(self, recurrow):
+        """Apply an area-source recurrence row to the underlying points."""
+        row = dict(recurrow)
+        rate_key = 'bg_rate' if 'bg_rate' in row else 'rate'
+        fraction = getattr(self, 'source_fraction', 1.)
+        row[rate_key] = float(row[rate_key]) * fraction
+        super().modify_set_recurrow(row)
+        rates = self.mfd.get_annual_occurrence_rates()
+        share = 1. / len(self.pdata['array'])
+        pointsources = self.pointsources
+        for src in pointsources:
+            src.mfd = EvenlyDiscretizedMFD(
+                rates[0][0], .1, [rate * share for _mag, rate in rates])
+        self._update_pointsources(pointsources)
+
+    def _update_pointsources(self, pointsources):
+        self.pdata = psources_to_pdata(pointsources, self.source_id)
+        self.__dict__.pop('_rates', None)  # see get_annual_occurrence_rates
+        vars(self).update(calc_average(pointsources))
+        self.location = Point(self.lon, self.lat, self.dep)
+        self.nodal_plane_distribution = PMF(
+            [(1., NodalPlane(self.strike, self.dip, self.rake))])
+        self.hypocenter_distribution = PMF([(1., self.dep)])
+        self.hypo_dip_fracs = (self.hypo_dip_frac,)
+        self.extent = self.get_extent(pointsources)
+
+    def get_psdist(self, m, mag, psdist, magdist, radii=None):
+        """
+        :returns:
+            the effective pointsource distance for the given magnitude,
+            measured from the centroid, i.e. including the extent of
+            the cell, so that a site close to an underlying point source
+            is never considered far
+        """
+        return self.extent + super().get_psdist(
+            m, mag, psdist, magdist, radii)
+
+    def count_ruptures(self):
+        """
+        :returns: the total number of underlying ruptures
+        """
+        return sum(src.num_ruptures
+                   for src in pdata_to_psources(self.pdata))
+
+
+def _cps_key(src):
+    msr = src.magnitude_scaling_relationship
+    aratio = src.rupture_aspect_ratio
+    if isinstance(aratio, MagDepAspectRatio):
+        aratio = ('magdep', aratio.func_type,
+                  tuple((float(mag), float(value))
+                        for mag, value in aratio.mag_points))
+    else:
+        aratio = 'scalar'
+    # TOMs are already grouped by source_reader; keep incompatible MSRs
+    # and aspect-ratio representations in separate collapsed blocks.
+    return type(msr), msr_name(src), aratio
+
+
+# the grid is plotted in https://github.com/gem/oq-engine/pull/11832
+def _cell_indices(lons, lats, spacing):
+    """
+    :param lons: an array of longitudes in degrees
+    :param lats: an array of latitudes in degrees
+    :param spacing: the grid spacing in km
+    :returns: a list of P pairs of cell indices
+
+    The cells are the squares of a global grid of the given spacing in km
+    anchored at the (0, 0) point; therefore the cell of a point depends
+    only on the position of the point.
+    """
+    kmperdeg = 1. / KM_TO_DEGREES  # ~111 km per degree of latitude
+    xkm = lons * kmperdeg * numpy.cos(lats * DEGREES_TO_RAD)
+    ykm = lats * kmperdeg
+    return list(zip(numpy.floor(xkm / spacing).astype(int),
+                    numpy.floor(ykm / spacing).astype(int)))
+
+
+def _grid_points(points, ps_grid_spacing, grp_id, cnt):
+    if len(points) < 2:  # nothing to collapse
+        return list(points), cnt
+    coords = numpy.array([(p.location.x, p.location.y, p.location.z)
+                          for p in points])
+    if (len(numpy.unique(coords[:, 0])) == 1 or
+            len(numpy.unique(coords[:, 1])) == 1):
+        # degenerated rectangle, there is no grid, do not collapse
+        return list(points), cnt
+    # NB: the grid is global, i.e. it is not anchored in the bounding box
+    # of the points: otherwise the collapsing of a region would change
+    # when adding or removing sources far away (i.e. padding sources)
+    grid = AccumDict(accum=[])
+    for k, ij in enumerate(_cell_indices(coords[:, 0], coords[:, 1],
+                                         ps_grid_spacing)):
+        grid[ij].append(k)
+    out = []
+    unique_ids = set(src.source_id.rsplit('.', 1)[0] for src in points)
+    same_source = len(unique_ids) == 1
+    src_id = next(iter(unique_ids)) if same_source else ''
+    for idxs in grid.values():
+        bysrc = same_source and getattr(points[0], 'bysrc_unc', False)
+        if len(idxs) > 1 or bysrc:
+            cnt += 1
+            cps = CollapsedPointSource(  # slow part
+                src_id or 'cps-%03d-%04d' % (grp_id, cnt), points[idxs])
+            cps.grp_id = points[0].grp_id
+            cps.ts_samples = points[0].ts_samples
+            cps.ps_grid_spacing = ps_grid_spacing
+            if same_source:
+                cps.source_fraction = len(idxs) / len(points)
+            out.append(cps)
+        else:  # there is a single source
+            out.append(points[idxs[0]])
+    return out, cnt
+
+
+def grid_point_sources(sources, ps_grid_spacing):
+    """
+    :param sources:
+        a list of sources with the same grp_id (point sources and not)
+    :param ps_grid_spacing:
+        value of the point source grid spacing in km; if None, do nothing
+    :returns:
+        a list of non-point sources and collapsed point sources
+    """
+    grp_id = sources[0].grp_id
+    for src in sources[1:]:
+        assert src.grp_id == grp_id, (src.grp_id, grp_id)
+    if not ps_grid_spacing:
+        return sources
+    out = [src for src in sources if not hasattr(src, 'location')]
+    ps = numpy.array([src for src in sources if hasattr(src, 'location')])
+    if len(ps) < 2:  # nothing to collapse
+        return out + list(ps)
+    groups = {}
+    for index, src in enumerate(ps):
+        groups.setdefault(_cps_key(src), []).append(index)
+    cnt = 0
+    for indices in groups.values():
+        block, cnt = _grid_points(ps[indices], ps_grid_spacing, grp_id, cnt)
+        out.extend(block)
+    return out
+
+
+# used only in view('long_ruptures')
+def get_rup_maxlen(src):
+    """
+    :returns: the maximum rupture length for point sources and area sources
+    """
+    if hasattr(src, 'nodal_plane_distribution'):
+        maxmag, _rate = src.get_annual_occurrence_rates()[-1]
+        lsd = src.lower_seismogenic_depth
+        usd = src.upper_seismogenic_depth
+        msr = src.magnitude_scaling_relationship
+        lens = []
+        for _, np in src.nodal_plane_distribution.data:
+            area = msr.get_median_area(maxmag, np.rake)
+            dims = get_rupdims(usd, lsd, src.get_aspect_ratio(maxmag),
+                               area, np.dip)
+            lens.append(dims[0])
+        return max(lens)
+    return 0.

@@ -1,0 +1,2583 @@
+# -*- coding: utf-8 -*-
+# vim: tabstop=4 shiftwidth=4 softtabstop=4
+#
+# Copyright (C) 2015-2026 GEM Foundation
+#
+# OpenQuake is free software: you can redistribute it and/or modify it
+# under the terms of the GNU Affero General Public License as published
+# by the Free Software Foundation, either version 3 of the License, or
+# (at your option) any later version.
+#
+# OpenQuake is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU Affero General Public License for more details.
+#
+# You should have received a copy of the GNU Affero General Public License
+# along with OpenQuake. If not, see <http://www.gnu.org/licenses/>.
+
+import csv
+import shutil
+import json
+import pickle
+import logging
+import os
+import tempfile
+import subprocess
+import traceback
+import zlib
+import re
+import psutil
+
+from threading import Event
+from collections import defaultdict
+from datetime import datetime, timezone
+from urllib.parse import unquote_plus, urlencode, urlparse, urlunparse
+from xml.parsers.expat import ExpatError
+from django.http import (
+    HttpResponse, HttpResponseNotFound, HttpResponseBadRequest,
+    HttpResponseForbidden, JsonResponse)
+from django.views.decorators.csrf import csrf_exempt
+from django.views.decorators.http import require_http_methods
+from django.shortcuts import render
+from django.utils.html import urlize
+import numpy
+
+from openquake.baselib import hdf5, config
+from openquake.baselib.general import groupby, gettemp, mp, decode
+from openquake.hazardlib import nrml, gsim, valid
+from openquake.hazardlib.scalerel import get_available_magnitude_scalerel
+from openquake.hazardlib.shakemap.validate import (
+    impact_validate, IMPACT_FORM_LABELS, IMPACT_FORM_PLACEHOLDERS,
+    IMPACT_FORM_DEFAULTS, IMPACT_APPROACHES, MAX_DISTANCE_LEVEL1,
+    IMPACT_CORRELATION_MODELS)
+from openquake.hazardlib.shakemap.parsers import (
+    get_stations_from_usgs, get_shakemap_versions, get_nodal_planes_and_info,
+    format_event_time)
+from openquake.commonlib import readinput, oqvalidation, logs, datastore, dbapi
+from openquake.commonlib.outputs import DISPLAY_NAME
+from openquake.calculators import base, views
+from openquake.calculators.export import (
+    export, AGGRISK_FIELD_DESCRIPTION, AGGRISK_FIELD_EXPLANATION,
+    EXPOSED_VALUE_EXPLANATION, REPORTED_VALUE_EXPLANATION,
+    EXPOSURE_FIELD_DESCRIPTION)
+from openquake.calculators.export.risk import export_job_archive
+from openquake.calculators.extract import extract as _extract
+from openquake.risklib.scientific import TIME_EVENTS, TIME_LOSSES
+from openquake.calculators.postproc.compute_rtgm import notification_dtype
+from openquake.calculators.postproc.plots import plot_shakemap, plot_rupture
+from openquake.engine import __version__ as oqversion
+from openquake.engine import engine
+from openquake.engine.aelo import (
+    PRELIMINARY_MODELS, PRELIMINARY_MODEL_WARNING_MSG)
+from openquake.server import internal_api, services, utils
+from openquake.server.services import DEFAULT_EXPORT_TYPE, store
+
+from django.conf import settings
+from django.http import FileResponse
+from django.urls import reverse
+from wsgiref.util import FileWrapper
+
+if settings.LOCKDOWN:
+    from django.contrib.auth import authenticate, login, logout
+
+UTC = timezone.utc
+METHOD_NOT_ALLOWED = 405
+NOT_IMPLEMENTED = 501
+
+XML = 'application/xml'
+JSON = 'application/json'
+HDF5 = 'application/x-hdf'
+ZIP = 'application/x-zip'
+
+
+LOGGER = logging.getLogger('openquake.server')
+
+ACCESS_HEADERS = {'Access-Control-Allow-Origin': '*',
+                  'Access-Control-Allow-Methods': 'GET, POST, OPTIONS',
+                  'Access-Control-Max-Age': 1000,
+                  'Access-Control-Allow-Headers': '*'}
+
+ENGINE = "python -m openquake.engine.engine".split()
+
+# impact metrics sharing the same meaning of the exposed value
+EXPOSED_VALUE_LABELS = [
+    ('Affected population and Rendered homeless', 'residents'),
+    ('Floor area lost (m²)', 'area'),
+    ('Number of injured people and fatalities', 'occupants'),
+    ('Buildings destroyed', 'number'),
+    ('Economic loss (USD)', 'economic')]
+
+# loss types not displayed in the impact tables: embodied carbon and the
+# averages over the times of the day (shown for day, night and transit)
+IMPACT_HIDDEN = ['embodied_carbon', 'occupants_avg', 'injured_avg']
+
+
+AELO_FORM_PLACEHOLDERS = {
+    'lon': 'max. 5 decimals',
+    'lat': 'max. 5 decimals',
+    'vs30': f'float {services.AELO_VALID_VS30_RANGE}',
+    'site_name': f'max. {settings.MAX_AELO_SITE_NAME_LEN} characters',
+    'asce_version': 'ASCE standards',
+}
+
+HIDDEN_OUTPUTS = ['exposure', 'job']
+EXTRACTABLE_RESOURCES = [
+    'agg_curves',
+    'agg_damages',
+    'agg_losses',
+    'agg_risk',
+    'aggrisk_tags',
+    'asset_risk',
+    'asset_tags',
+    'composite_risk_model',
+    'damages-rlzs',
+    'damages-stats',
+    'disagg_layer',
+    'events',
+    'exposure_metadata',
+    'exposure_by_location',
+    'exposure_by_lse?secondary_peril=liquefaction',
+    'exposure_by_lse?secondary_peril=landslide',
+    'gmf_data',
+    'hcurves',
+    'hmaps',
+    'losses_by_asset',
+    'losses_by_location',
+    'losses_by_site',
+    'mmi_tags',
+    'oqparam',
+    'realizations',
+    'risk_by_event',
+    'rupture_info',
+    'sitecol',
+    'uhs',
+]
+# NOTE: the 'exposure' output internally corresponds to the 'assetcol' in the
+# datastore, and the can_view_exposure permission gives access both to the
+# 'exposure' output and to the 'assetcol' item in the datastore
+MAP_RESOURCE_OUTPUT = {'assetcol': 'exposure'}
+
+# disable check on the export_dir, since the WebUI exports in a tmpdir
+oqvalidation.OqParam.is_valid_export_dir = lambda self: True
+
+
+# Credit for this decorator to https://gist.github.com/aschem/1308865.
+def cross_domain_ajax(func):
+    def wrap(request, *args, **kwargs):
+        # Firefox sends 'OPTIONS' request for cross-domain javascript call.
+        if not request.method == "OPTIONS":
+            response = func(request, *args, **kwargs)
+        else:
+            response = HttpResponse()
+        for k, v in list(ACCESS_HEADERS.items()):
+            response[k] = v
+        return response
+    return wrap
+
+
+def _get_base_url(request):
+    """
+    Construct a base URL, given a request object.
+
+    This comprises the protocol prefix (http:// or https://) and the host,
+    which can include the port number. For example:
+    http://www.openquake.org or https://www.openquake.org:8000.
+    """
+    if request.is_secure():
+        base_url = 'https://%s'
+    else:
+        base_url = 'http://%s'
+    base_url %= request.META['HTTP_HOST']
+    return base_url
+
+
+def _impact_base_url(request):
+    # Base URL of the links returned by the IMPACT runs and sent by email:
+    # services._impact_urls builds them without Django, so the path prefix
+    # of the WebUI, which reverse() would add, must be added here
+    return _get_base_url(request) + settings.WEBUI_PATHPREFIX
+
+
+def _get_bool_param(obj, name, default=False):
+    val = obj.get(name)
+    if val is None:
+        return default
+    return str(val).lower() in ('1', 'true', 'yes', '')
+
+
+def stream_response(fname, content_type, exportname=''):
+    """
+    Stream a file stored in a temporary directory via Django
+    """
+    ext = os.path.splitext(fname)[-1]
+    exportname = exportname or os.path.basename(fname)
+    tmpdir = os.path.dirname(fname)
+    stream = FileWrapper(open(fname, 'rb'))  # 'b' is needed on Windows
+    response = FileResponse(stream, content_type=content_type)
+    response['Content-Disposition'] = 'attachment; filename=%s' % exportname
+    response['Content-Length'] = str(os.path.getsize(fname))
+    stream.close = lambda: (
+        FileWrapper.close(stream),
+        os.remove(fname) if ext == '.npz' else shutil.rmtree(tmpdir))
+    return response
+
+
+def infer_site_class(asce_version, vs30):
+    # used for old jobs for which the site class was not saved
+    # into the datastore
+    site_class_matches = [k for k, v in oqvalidation.SITE_CLASSES[
+        asce_version].items() if v['vs30'] == vs30]
+    if site_class_matches:
+        site_class = site_class_matches[0]
+    else:
+        site_class = 'custom'
+    return site_class
+
+
+def get_site_class_display_name(ds):
+    vs30_in = ds['oqparam'].override_vs30  # e.g. 760.0
+    site_class = ds['oqparam'].site_class
+    asce_version = ds['oqparam'].asce_version
+    if site_class is not None:
+        if site_class == 'custom':
+            vs30 = vs30_in[0]
+            site_class_display_name = f'Vs30 = {vs30} m/s'
+        else:
+            site_class_display_name = oqvalidation.SITE_CLASSES[
+                asce_version][site_class]['display_name']
+    else:  # old calculations without site_class in the datastore
+        if hasattr(vs30_in, '__len__'):
+            if len(vs30_in) == 1:
+                [vs30_in] = vs30_in
+                site_class = infer_site_class(asce_version, vs30_in)
+            else:
+                site_class = 'default'
+        else:  # in old calculations, vs30_in was a float
+            site_class = infer_site_class(asce_version, vs30_in)
+        if site_class == 'custom':
+            site_class_display_name = f'Vs30 = {vs30_in} m/s'
+        else:
+            site_class_display_name = oqvalidation.SITE_CLASSES[
+                asce_version][site_class]['display_name']
+    return site_class_display_name
+
+
+@csrf_exempt
+@cross_domain_ajax
+@require_http_methods(['POST'])
+def ajax_login(request):
+    """
+    Accept a POST request to login.
+
+    :param request:
+        `django.http.HttpRequest` object, containing mandatory parameters
+        username and password required.
+    """
+    username = request.POST['username']
+    password = request.POST['password']
+    user = authenticate(request=request, username=username, password=password)
+    if user is not None:
+        if user.is_active:
+            login(request, user)
+            return HttpResponse(content='Successful login',
+                                content_type='text/plain', status=200)
+        else:
+            return HttpResponse(content='Disabled account',
+                                content_type='text/plain', status=403)
+    else:
+        return HttpResponse(content='Invalid login',
+                            content_type='text/plain', status=403)
+
+
+@csrf_exempt
+@cross_domain_ajax
+@require_http_methods(['POST'])
+def ajax_logout(request):
+    """
+    Accept a POST request to logout.
+    """
+    logout(request)
+    return HttpResponse(content='Successful logout',
+                        content_type='text/plain', status=200)
+
+
+@cross_domain_ajax
+@require_http_methods(['GET'])
+def get_engine_version(request):
+    """
+    Return a string with the openquake.engine version
+    """
+    return HttpResponse(oqversion)
+
+
+@cross_domain_ajax
+@require_http_methods(['GET'])
+def get_authentication_status(request):
+    """Return whether this engine requires client authentication.
+
+    This endpoint is intentionally public: clients need to distinguish a
+    public engine from an engine requiring credentials before attempting to
+    log in.
+    """
+    return JsonResponse({'authentication_required': settings.LOCKDOWN})
+
+
+@cross_domain_ajax
+@require_http_methods(['GET'])
+def get_engine_latest_version(request):
+    """
+    Return a string with if new versions have been released.
+    Return 'None' if the version is not available
+    """
+    return HttpResponse(engine.check_obsolete_version())
+
+
+@cross_domain_ajax
+@require_http_methods(['GET'])
+def get_available_gsims(request):
+    """
+    Return a list of strings with the available GSIMs
+    """
+    gsims = list(gsim.get_available_gsims())
+    return HttpResponse(content=json.dumps(gsims), content_type=JSON)
+
+
+@cross_domain_ajax
+@require_http_methods(['GET'])
+def get_ini_defaults(request):
+    """
+    Return a list of ini attributes with a default value
+    """
+    ini_defs = {}
+    all_names = dir(oqvalidation.OqParam) + list(oqvalidation.OqParam.ALIASES)
+    for name in all_names:
+        if name in oqvalidation.OqParam.ALIASES:  # old name
+            newname = oqvalidation.OqParam.ALIASES[name]
+        else:
+            newname = name
+        obj = getattr(oqvalidation.OqParam, newname)
+        if (isinstance(obj, valid.Param)
+                and obj.default is not valid.Param.NODEFAULT):
+            if isinstance(obj.default, float) and numpy.isnan(obj.default):
+                pass
+            else:
+                ini_defs[name] = obj.default
+    return JsonResponse(ini_defs)
+
+
+@cross_domain_ajax
+@require_http_methods(['GET'])
+def get_impact_form_defaults(request):
+    """
+    Return a json string with a dictionary of oq-impact form field names
+    and defaults
+    """
+    return JsonResponse(IMPACT_FORM_DEFAULTS)
+
+
+@cross_domain_ajax
+@require_http_methods(['GET'])
+def aelo_site_classes(request):
+    """
+    Return a json string with a dictionary of ASCE site classes, with
+    corresponding display names and Vs30 values
+    """
+    return JsonResponse(oqvalidation.SITE_CLASSES)
+
+
+def _make_response(error_msg, error_line, valid):
+    response_data = dict(error_msg=error_msg,
+                         error_line=error_line,
+                         valid=valid)
+    return JsonResponse(response_data)
+
+
+@csrf_exempt
+@cross_domain_ajax
+@require_http_methods(['POST'])
+def validate_nrml(request):
+    """
+    Leverage oq-risklib to check if a given XML text is a valid NRML
+
+    :param request:
+        a `django.http.HttpRequest` object containing the mandatory
+        parameter 'xml_text': the text of the XML to be validated as NRML
+
+    :returns: a JSON object, containing:
+        * 'valid': a boolean indicating if the provided text is a valid NRML
+        * 'error_msg': the error message, if any error was found
+                       (None otherwise)
+        * 'error_line': line of the given XML where the error was found
+                        (None if no error was found or if it was not a
+                        validation error)
+    """
+    xml_text = request.POST.get('xml_text')
+    if not xml_text:
+        return HttpResponseBadRequest(
+            'Please provide the "xml_text" parameter')
+    xml_file = gettemp(xml_text, suffix='.xml')
+    try:
+        nrml.to_python(xml_file)
+    except ExpatError as exc:
+        return _make_response(error_msg=str(exc),
+                              error_line=exc.lineno,
+                              valid=False)
+    except Exception as exc:
+        # get the exception message
+        exc_msg = exc.args[0]
+        if isinstance(exc_msg, bytes):
+            exc_msg = exc_msg.decode('utf-8')   # make it a unicode object
+        elif isinstance(exc_msg, str):
+            pass
+        else:
+            # if it is another kind of object, it is not obvious a priori how
+            # to extract the error line from it
+            return _make_response(
+                error_msg=str(exc_msg), error_line=None, valid=False)
+        # if the line is not mentioned, the whole message is taken
+        error_msg = exc_msg.split(', line')[0]
+        # check if the exc_msg contains a line number indication
+        search_match = re.search(r'line \d+', exc_msg)
+        if search_match:
+            error_line = int(search_match.group(0).split()[1])
+        else:
+            error_line = None
+        return _make_response(
+            error_msg=error_msg, error_line=error_line, valid=False)
+    else:
+        return _make_response(error_msg=None, error_line=None, valid=True)
+
+
+@csrf_exempt
+@cross_domain_ajax
+@require_http_methods(['POST'])
+def validate_ini(request):
+    """
+    Leverage the engine libraries to check if a given local file is a valid
+    calculation input
+
+    :param request:
+        a `django.http.HttpRequest` object containing a zip archive
+
+    :returns: a JSON object, containing:
+        * 'valid': a boolean indicating if the provided archive is valid
+        * 'error_msg': the error message, if any error was found
+                       (None otherwise)
+    """
+    return internal_api.run(
+        services.validate_upload,
+        internal_api.make_form(request.POST, request.FILES),
+        'job_ini', 'Missing job_ini file')
+
+
+@csrf_exempt
+@cross_domain_ajax
+@require_http_methods(['POST'])
+def validate_zip(request):
+    """
+    Leverage the engine libraries to check if a given zip archive is a valid
+    calculation input
+
+    :param request:
+        a `django.http.HttpRequest` object containing a zip archive
+
+    :returns: a JSON object, containing:
+        * 'valid': a boolean indicating if the provided archive is valid
+        * 'error_msg': the error message, if any error was found
+                       (None otherwise)
+    """
+    return internal_api.run(
+        services.validate_upload,
+        internal_api.make_form(request.POST, request.FILES),
+        'archive', 'Missing archive file')
+
+
+@require_http_methods(['GET'])
+@cross_domain_ajax
+def download_png(request, calc_id, what):
+    """
+    Get a PNG image with the relevant name, if available
+    """
+    job = logs.dbcmd('get_job', int(calc_id))
+    if job is None:
+        return HttpResponseNotFound()
+    if not utils.user_has_permission(request, job.user_name, job.status):
+        return HttpResponseForbidden()
+    try:
+        from PIL import Image
+        response = HttpResponse(content_type="image/png")
+        with datastore.read(job.ds_calc_dir + '.hdf5') as ds:
+            arr = ds['png/%s' % what][:]
+        Image.fromarray(arr).save(response, format='png')
+        return response
+    except Exception as exc:
+        tb = ''.join(traceback.format_tb(exc.__traceback__))
+        return HttpResponse(
+            content='%s: %s\n%s' % (exc.__class__.__name__, exc, tb),
+            content_type='text/plain', status=500)
+
+
+@require_http_methods(['GET'])
+@cross_domain_ajax
+def calc(request, calc_id):
+    """
+    Authenticate the request and return the calculation information.
+
+    Django remains responsible for the user and ACL checks.
+    """
+    try:
+        info = logs.dbcmd('calc_info', calc_id)
+        if not utils.user_has_permission(
+                request, info['user_name'], info['status']):
+            return HttpResponseForbidden()
+    except dbapi.NotFound:
+        return HttpResponseNotFound()
+    return internal_api.run(services.calc_info, int(calc_id))
+
+
+@require_http_methods(['GET'])
+@cross_domain_ajax
+def calc_list(request, id=None):
+    # view associated to the endpoints /v1/calc/list and /v1/calc/:id/status
+    """
+    Get a list of calculations and report their id, status, calculation_mode,
+    is_running, description, and a url where more detailed information
+    can be accessed. This is called several times by the Javascript.
+    If 'preferred_only' is specified in the GET parameters, only jobs set as
+    preferred for a tag are listed.
+    If 'filter_by_tag' is specified in the GET parameters, only jobs associated
+    to the given tag are listed.
+
+    Responses are in JSON.
+    """
+    # with pytest openquake/server/tests/test_public_mode.py -k classical
+    # request.GET is <QueryDict: {'is_running': ['true']}>
+    base_url = _get_base_url(request)
+    # always filter calculation list unless user is a superuser
+    calc_data = logs.dbcmd(
+        'get_calcs', dict(request.GET.items()),
+        utils.get_valid_users(request),
+        not utils.is_superuser(request), id)
+    response_data = []
+    username = utils.get_username(request)
+    superuser = utils.is_superuser(request)
+    can_share_own_jobs = (
+        get_user_level(request) >= 2 or
+        request.user.has_perm('auth.can_share_own_jobs'))
+    process_username = psutil.Process(os.getpid()).username()
+    for (hc_id, owner, status, calculation_mode, is_running, desc, pid,
+         parent_id, size_mb, host, start_time, relevant, tags) in calc_data:
+        can_manage_sharing = superuser or (
+            owner == username and can_share_own_jobs)
+        if settings.DISPLAY_USER_HOST and host:
+            owner += '@' + host.split('.')[0]
+        url = base_url + reverse('calc', args=[hc_id])
+        abortable = False
+        if is_running:
+            try:
+                if psutil.Process(pid).username() == process_username:
+                    abortable = True
+            except psutil.NoSuchProcess:
+                pass
+        start_time_str = (
+            start_time.strftime("%Y-%m-%d, %H:%M:%S") + " "
+            + settings.TIME_ZONE)
+        response_data.append(
+            dict(id=hc_id, owner=owner,
+                 calculation_mode=calculation_mode, status=status,
+                 is_running=bool(is_running), description=desc, url=url,
+                 can_manage_sharing=can_manage_sharing,
+                 parent_id=parent_id, abortable=abortable, size_mb=size_mb,
+                 start_time=start_time_str, relevant=relevant, tags=tags))
+
+    # if id is specified the related dictionary is returned instead the list
+    if id is not None:
+        response_data = [job for job in response_data if str(job['id']) == id]
+        if not response_data:
+            return HttpResponseNotFound()
+        [response_data] = response_data
+
+    return HttpResponse(content=json.dumps(response_data), content_type=JSON)
+
+
+@require_http_methods(['GET'])
+@cross_domain_ajax
+def calc_count(request):
+    """Return the number of calculations matching the requested filters."""
+    return internal_api.run(
+        services.calc_list_count, dict(request.GET.items()),
+        utils.get_valid_users(request),
+        str(not utils.is_superuser(request)))
+
+
+@csrf_exempt
+@cross_domain_ajax
+@require_http_methods(['POST'])
+def calc_abort(request, calc_id):
+    """Abort a running calculation after checking its ownership."""
+    job = logs.dbcmd('get_job', calc_id)
+    if job is None:
+        return JsonResponse({'error': 'Unknown job %s' % calc_id})
+    if job.status not in ('submitted', 'executing'):
+        return JsonResponse({'error': 'Job %s is not running' % job.id})
+    if (job.user_name not in utils.get_valid_users(request) and
+            not utils.is_superuser(request)):
+        message = {'error': ('User %s has no permission to abort job %s' %
+                             (request.user, job.id))}
+        return JsonResponse(message, status=403)
+    return internal_api.run(services.calc_abort, int(calc_id))
+
+
+@csrf_exempt
+@cross_domain_ajax
+@require_http_methods(['POST'])
+def calc_remove(request, calc_id):
+    """Remove a calculation for its owner."""
+    user = utils.get_username(request)
+    return internal_api.run(
+        services.calc_remove, int(calc_id), user)
+
+
+def share_job(request, calc_id, share):
+    user_level = get_user_level(request)
+    superuser = utils.is_superuser(request)
+    if (user_level < 2 and not superuser and
+            not request.user.has_perm('auth.can_share_own_jobs')):
+        return HttpResponseForbidden()
+    try:
+        job = logs.dbcmd('get_job', calc_id)
+    except dbapi.NotFound:
+        return HttpResponseNotFound()
+    if job is None:
+        return HttpResponseNotFound()
+    if not superuser and job.user_name != utils.get_username(request):
+        return HttpResponseForbidden()
+    try:
+        message = logs.dbcmd('share_job', calc_id, share)
+    except dbapi.NotFound:
+        return HttpResponseNotFound()
+
+    if 'success' in message:
+        return JsonResponse(message, status=200)
+    elif 'error' in message:
+        logging.error(message['error'])
+        return JsonResponse(message, status=403)
+    else:
+        raise AssertionError(
+            f"share_job must return 'success' or 'error'! Returned: {message}")
+
+
+def get_user_level(request):
+    if settings.LOCKDOWN:
+        try:
+            return request.user.level
+        except AttributeError:  # e.g. AnonymousUser (not authenticated)
+            return 0
+    else:
+        # NOTE: when authentication is not required, the user interface
+        # can assume the user to have the maximum level
+        return 2
+
+
+def check_db_response(resp):
+    if 'success' in resp:
+        return JsonResponse(resp, status=200)
+    elif 'error' in resp:
+        logging.error(resp['error'])
+        return JsonResponse(resp, status=403)
+    else:
+        return JsonResponse({'error': f'Unexpected response: {resp}'},
+                            status=500)
+
+
+def create_tag(user_level, tag_name):
+    if user_level < 2:
+        return HttpResponseForbidden()
+    try:
+        resp = logs.dbcmd('create_tag', tag_name)
+    except dbapi.NotFound:
+        return HttpResponseNotFound()
+    return check_db_response(resp)
+
+
+def delete_tag(user_level, tag_name):
+    if user_level < 2:
+        return HttpResponseForbidden()
+    try:
+        resp = logs.dbcmd('delete_tag', tag_name)
+    except dbapi.NotFound:
+        return HttpResponseNotFound()
+    return check_db_response(resp)
+
+
+def add_tag_to_job(user_level, calc_id, tag_name):
+    if user_level < 2:
+        return HttpResponseForbidden()
+    try:
+        resp = logs.dbcmd('add_tag_to_job', calc_id, tag_name)
+    except dbapi.NotFound:
+        return HttpResponseNotFound()
+    return check_db_response(resp)
+
+
+def remove_tag_from_job(user_level, calc_id, tag_name):
+    if user_level < 2:
+        return HttpResponseForbidden()
+    try:
+        resp = logs.dbcmd('remove_tag_from_job', calc_id, tag_name)
+    except dbapi.NotFound:
+        return HttpResponseNotFound()
+    return check_db_response(resp)
+
+
+def set_preferred_job_for_tag(user_level, calc_id, tag_name):
+    if user_level < 2:
+        return HttpResponseForbidden()
+    try:
+        resp = logs.dbcmd('set_preferred_job_for_tag', calc_id, tag_name)
+    except dbapi.NotFound:
+        return HttpResponseNotFound()
+    return check_db_response(resp)
+
+
+def unset_preferred_job_for_tag(user_level, tag_name):
+    if user_level < 2:
+        return HttpResponseForbidden()
+    try:
+        resp = logs.dbcmd('unset_preferred_job_for_tag', tag_name)
+    except dbapi.NotFound:
+        return HttpResponseNotFound()
+    return check_db_response(resp)
+
+
+def get_preferred_job_for_tag(tag_name):
+    try:
+        resp = logs.dbcmd('get_preferred_job_for_tag', tag_name)
+    except dbapi.NotFound:
+        return HttpResponseNotFound()
+    return check_db_response(resp)
+
+
+def list_tags():
+    try:
+        resp = logs.dbcmd('list_tags')
+    except dbapi.NotFound:
+        return HttpResponseNotFound()
+    return check_db_response(resp)
+
+
+@csrf_exempt
+@cross_domain_ajax
+@require_http_methods(['POST'])
+def calc_unshare(request, calc_id):
+    """
+    Unshare the calculation of the given id
+    """
+    return share_job(request, calc_id, share=False)
+
+
+@csrf_exempt
+@cross_domain_ajax
+@require_http_methods(['POST'])
+def calc_share(request, calc_id):
+    """
+    Share the calculation of the given id
+    """
+    return share_job(request, calc_id, share=True)
+
+
+def log_to_json(log):
+    """Convert a log record into a list of strings"""
+    return [log.timestamp.isoformat()[:22],
+            log.level, log.process, log.message]
+
+
+@require_http_methods(['GET'])
+@cross_domain_ajax
+def calc_log(request, calc_id, start, stop):
+    """
+    Get a slice of the calculation log as a JSON list of rows.
+    """
+    return internal_api.run(
+        services.calc_log, int(calc_id), int(start or 0),
+        int(stop or 0))
+
+
+@require_http_methods(['GET'])
+@cross_domain_ajax
+def calc_log_size(request, calc_id):
+    """
+    Get the current number of lines in the log.
+    """
+    return internal_api.run(services.calc_log_size, int(calc_id))
+
+
+job_complete_callback_state = {'event': Event(), 'data': {}}
+
+
+@csrf_exempt
+@cross_domain_ajax
+@require_http_methods(['POST'])
+def check_callback(request):
+    body = json.loads(request.body.decode('utf8'))
+    payload = dict(body=body, POST=request.POST, GET=request.GET)
+    job_complete_callback_state['data'].clear()
+    job_complete_callback_state['data'].update(payload)
+    job_complete_callback_state['event'].set()
+    return JsonResponse(payload)
+
+
+@csrf_exempt
+@cross_domain_ajax
+@require_http_methods(['POST'])
+def calc_run(request):
+    """
+    This endpoint accepts a POST request containing the configuration and input
+    files required to perform a calculation. It can also optionally reuse
+    results from a previous hazard calculation, assign a custom job owner,
+    and specify a callback URL for job completion notifications.
+
+    :param request:
+        a `django.http.HttpRequest` object.
+        If the request has the attribute `hazard_job_id`, the results of the
+        specified hazard calculations will be re-used as input by the risk
+        calculation.
+        The request also needs to contain the files needed to perform the
+        calculation. They can be uploaded as separate files, or zipped
+        together.
+        If the request has the attribute `notify_to`, and it starts with
+        'http[s]://', the engine will send a notification to the given url.
+        If the request has the attribute `job_owner`, the owner of the job will
+        be set to that string instead of the name of the user performing the
+        request.
+
+    :returns:
+        A `django.http.JsonResponse` object containing:
+        - On success (HTTP 200): information about the initialized job
+        - On failure (HTTP 500): traceback details and job ID (if available).
+    """
+    job_ini = request.POST.get('job_ini')
+    hazard_job_id = request.POST.get('hazard_job_id')
+    if hazard_job_id:  # "continue" button, tested in the QGIS plugin
+        ini = job_ini if job_ini else "risk.ini"
+    else:
+        ini = job_ini if job_ini else ".ini"
+    username = utils.get_username(request)
+    if utils.is_superuser(request):
+        username = request.POST.get('job_owner') or username
+    data = {
+        'ini': ini,
+        'username': username,
+        'hazard_job_id': hazard_job_id or '',
+        'notify_to': request.POST.get('notify_to') or '',
+    }
+    return internal_api.run(
+        services.calc_run, internal_api.make_form(data, request.FILES))
+
+
+@csrf_exempt
+@cross_domain_ajax
+@require_http_methods(['POST'])
+def calc_run_ini(request):
+    """
+    This endpoint accepts a POST request containing the configuration .ini
+    file that defines the parameters needed to perform a calculation. It can
+    optionally reuse results from a previous hazard job, assign a custom job
+    owner, and specify a callback URL for job completion notifications.
+
+    :param request:
+        a `django.http.HttpRequest` object.
+        The request must contain the full path to a job.ini file
+        If the request has the attribute `notify_to`, and it starts with
+        'http[s]://', the engine will send a notification to the given url.
+        If the request has the attribute `job_owner`, the owner of the job
+        will be set to that string instead of the name of the user performing
+        the request.
+
+    :returns:
+        A `django.http.JsonResponse` object containing:
+        - On success (HTTP 200): information about the initialized job
+        - On failure (HTTP 500): traceback details and job ID (if available).
+    """
+    ini = request.POST['job_ini']
+    hazard_job_id = request.POST.get('hazard_job_id')
+    username = utils.get_username(request)
+    if utils.is_superuser(request):
+        username = request.POST.get('job_owner') or username
+    data = {
+        'ini': ini,
+        'username': username,
+        'hazard_job_id': hazard_job_id or '',
+        'notify_to': request.POST.get('notify_to') or '',
+    }
+    return internal_api.run(
+        services.calc_run, internal_api.make_form(data, request.FILES))
+
+
+@csrf_exempt
+@cross_domain_ajax
+@require_http_methods(['POST'])
+# used in PAPERS
+def calc_run_scenario_from_ses(request, rup_id):
+    username = utils.get_username(request)
+    if utils.is_superuser(request):
+        username = request.POST.get('job_owner') or username
+    data = request.POST.dict()
+    data['username'] = username
+    return internal_api.run(
+        services.run_scenario_calc_from_ses_rupture, int(rup_id),
+        internal_api.make_form(data, request.FILES))
+
+
+def get_impact_rupture_data(post, user, rupture_path):
+    """Validate a rupture and build the data needed by the IMPACT UI."""
+    rup, rupdic, _oqparams, err = impact_validate(
+        post, user, rupture_path)
+    if err:
+        return err, 400 if 'invalid_inputs' in err else 500
+    if rupdic.get('shakemap_array', None) is not None:
+        shakemap_array = rupdic['shakemap_array']
+        figsize = (6.3, 6.3)
+        # fitting in a single row in the template without resizing
+        rupdic['pga_map_png'] = plot_shakemap(
+            shakemap_array, 'PGA', backend='Agg', figsize=figsize,
+            with_cities=False, return_base64=True, rupture=rup)
+        rupdic['mmi_map_png'] = plot_shakemap(
+            shakemap_array, 'MMI', backend='Agg', figsize=figsize,
+            with_cities=False, return_base64=True, rupture=rup)
+        del rupdic['shakemap_array']
+    elif rup is not None:
+        rupdic['rupture_png'] = plot_rupture(
+            rup, backend='Agg', figsize=(8, 8), with_region_labels=True,
+            return_base64=True)
+    if user.level < 2 and 'warning_msg' in rupdic:
+        # we don't want to show the warning to level 1 users
+        del rupdic['warning_msg']
+    return rupdic, 200
+
+
+@csrf_exempt
+@cross_domain_ajax
+@require_http_methods(['POST'])
+def impact_get_rupture_data(request):
+    """
+    Retrieve rupture parameters corresponding to a given usgs id
+
+    :param request:
+        a `django.http.HttpRequest` object containing usgs_id, approach,
+        rupture_file, use_shakemap
+    """
+    data = request.POST.dict()
+    data['user_level'] = str(request.user.level)
+    return internal_api.run(
+        services.impact_get_rupture_data,
+        internal_api.make_form(data, request.FILES))
+
+
+@csrf_exempt
+@cross_domain_ajax
+@require_http_methods(['POST'])
+def impact_get_stations_from_usgs(request):
+    """
+    Retrieve station data corresponding to a given usgs id
+
+    :param request:
+        a `django.http.HttpRequest` object containing usgs_id
+    """
+    usgs_id = request.POST.get('usgs_id')
+    shakemap_version = request.POST.get('shakemap_version')
+    station_data_file, n_stations, err = get_stations_from_usgs(
+        usgs_id, user=request.user, shakemap_version=shakemap_version)
+    station_data_issue = None
+    if err:
+        station_data_issue = err['error_msg']
+    response_data = dict(station_data_file=station_data_file,
+                         n_stations=n_stations,
+                         station_data_issue=station_data_issue)
+    return JsonResponse(response_data)
+
+
+@csrf_exempt
+@cross_domain_ajax
+@require_http_methods(['POST'])
+def impact_get_shakemap_versions(request):
+    """
+    Return a list of ShakeMap versions for the given usgs_id
+
+    :param request:
+        a `django.http.HttpRequest` object containing usgs_id
+    """
+    usgs_id = request.POST.get('usgs_id')
+    shakemap_versions, usgs_preferred_version, err = (
+        get_shakemap_versions(usgs_id))
+    if err:
+        shakemap_versions_issue = err['error_msg']
+    else:
+        shakemap_versions_issue = None
+    response_data = dict(shakemap_versions=shakemap_versions,
+                         usgs_preferred_version=usgs_preferred_version,
+                         shakemap_versions_issue=shakemap_versions_issue)
+    return JsonResponse(response_data)
+
+
+@csrf_exempt
+@cross_domain_ajax
+@require_http_methods(['POST'])
+def impact_get_nodal_planes_and_info(request):
+    """
+    Return a list of nodal planes and a dict with lon, lat, dep and mag,
+    for the given usgs_id
+
+    :param request:
+        a `django.http.HttpRequest` object containing usgs_id
+    """
+    usgs_id = request.POST.get('usgs_id')
+    nodal_planes, info, err = get_nodal_planes_and_info(usgs_id)
+    if err:
+        nodal_planes_issue = err['error_msg']
+    else:
+        nodal_planes_issue = None
+    response_data = dict(nodal_planes=nodal_planes,
+                         nodal_planes_issue=nodal_planes_issue, info=info)
+    return JsonResponse(response_data)
+
+
+def drop_email_file_path(data):
+    """
+    Remove ``email_file_path`` from the data sent by the client, unless
+    running the tests. The field makes the notification emails be written
+    into the given directory instead of being sent: the tests use it to
+    collect the emails of each job, since they cannot change the settings
+    of the WebUI process.
+    """
+    if not settings.TEST:
+        data.pop('email_file_path', None)
+    return data
+
+
+@csrf_exempt
+@cross_domain_ajax
+@require_http_methods(['POST'])
+def impact_run(request):
+    """
+    Run an impact calculation.
+
+    :param request:
+        a `django.http.HttpRequest` object containing
+        usgs_id, rupture_file,
+        lon, lat, dep, mag, aspect_ratio, rake, dip, strike,
+        local_timestamp, time_event,
+        maximum_distance, trt,
+        truncation_level, number_of_ground_motion_fields,
+        asset_hazard_distance, ses_seed,
+        maximum_distance_stations, station_data_file
+    """
+    if request.user.level == 0:
+        return HttpResponseForbidden()
+    data = drop_email_file_path(request.POST.dict())
+    data.update(
+        user_level=str(request.user.level),
+        username=utils.get_username(request),
+        email=getattr(request.user, 'email', ''),
+        base_url=_impact_base_url(request))
+    return internal_api.run(
+        services.impact_run, internal_api.make_form(data, request.FILES))
+
+
+@csrf_exempt
+@cross_domain_ajax
+@require_http_methods(['POST'])
+def impact_run_with_shakemap(request):
+    """
+    Run an impact calculation.
+
+    :param request:
+        a `django.http.HttpRequest` object containing a usgs_id and
+        optionally:
+        the time_event, i.e. the time of the day ('day', 'night' or 'transit')
+        the shakemap_version, the shakemap id in the format returned by
+        the impact_get_shakemap_versions API endpoint
+    """
+    if request.user.level == 0:
+        return HttpResponseForbidden()
+    post = dict(usgs_id=request.POST['usgs_id'],
+                use_shakemap='true', approach='use_shakemap_from_usgs')
+    if 'shakemap_version' in request.POST:
+        post['shakemap_version'] = request.POST['shakemap_version']
+    _rup, rupdic, _params, err = impact_validate(post, request.user)
+    if err:
+        return JsonResponse(
+            err, status=400 if 'invalid_inputs' in err else 500)
+    post.update({key: str(val) for key, val in rupdic.items()
+                 if key != 'shakemap_array'})
+    if 'time_event' in request.POST:
+        post['time_event'] = request.POST['time_event']
+    maxdist = request.POST.get('maximum_distance')
+    if maxdist:  # set in the _success test for speed
+        post['maximum_distance'] = maxdist
+    for field in ('make_impact_reports', 'notes', 'email_file_path'):
+        if field in request.POST:
+            post[field] = request.POST[field]
+    drop_email_file_path(post)
+    for field in IMPACT_FORM_DEFAULTS:
+        if field not in post and IMPACT_FORM_DEFAULTS[field]:
+            post[field] = IMPACT_FORM_DEFAULTS[field]
+    post.update(
+        user_level=str(request.user.level),
+        username=utils.get_username(request),
+        email=getattr(request.user, 'email', ''),
+        base_url=_impact_base_url(request))
+    return internal_api.run(
+        services.impact_run, internal_api.make_form(post, request.FILES))
+
+
+def extract_report_from_datastore(dstore, iso3, file_format, page=1):
+    impact_group = dstore['impact']
+    if iso3 not in impact_group:
+        raise ValueError(f"ISO3 '{iso3}' not found")
+    # the PNG of the first page is stored as report_png, the following
+    # ones as report_png_2, report_png_3, ...
+    name = f'report_{file_format}' + ('' if page == 1 else f'_{page}')
+    if name not in impact_group[iso3]:
+        raise ValueError(
+            f"Page {page} of the {file_format} report not found for '{iso3}'")
+    data = impact_group[iso3][name][()]
+    return bytes(data)
+
+
+# Resolve API routes by name so generated URLs respect any URL prefix.
+def _impact_output_url(request, route_name, calc_id, args=(), query=None):
+    url = request.build_absolute_uri(
+        reverse(route_name, args=[calc_id, *args]))
+    if query:
+        url += '?' + urlencode(query)
+    return url
+
+
+def build_impact_resources(request, calc_id, dstore):
+    """Describe impact resources and their presentation URLs."""
+    available = services.get_impact_resource_data(dstore)
+    outputs = {
+        'avg_gmf_plots': {
+            imt: _impact_output_url(
+                request, 'download_png', calc_id, [name])
+            for imt, name in available['avg_gmf_plots'].items()},
+        'assets': None,
+        'aggrisk': None,
+        'aggrisk_tags': None,
+        'exposure_by_mmi': None,
+        'exposure_by_lse': {},
+        'country_reports': {},
+    }
+    if available['assets']:
+        outputs['assets'] = dict(png=_impact_output_url(
+            request, 'download_png', calc_id, ['assets.png']))
+    if available['aggrisk']:
+        outputs['aggrisk'] = dict(csv=_impact_output_url(
+            request, 'download_aggrisk', calc_id))
+    if available['aggrisk_tags']:
+        outputs['aggrisk_tags'] = dict(
+            table=_impact_output_url(
+                request, 'extract_html_table', calc_id, ['aggrisk_tags']),
+            summary_table=_impact_output_url(
+                request, 'extract_html_table', calc_id, ['aggrisk_tags'],
+                dict(summarize=1)),
+            npz=_impact_output_url(
+                request, 'calc_extract', calc_id, ['aggrisk_tags']))
+    if available['exposure_by_mmi']:
+        outputs['exposure_by_mmi'] = dict(
+            json=_impact_output_url(
+                request, 'exposure_by_mmi', calc_id),
+            table=_impact_output_url(
+                request, 'extract_html_table', calc_id, ['mmi_tags']),
+            npz=_impact_output_url(
+                request, 'calc_extract', calc_id, ['mmi_tags']))
+    for peril, is_available in available['exposure_by_lse'].items():
+        outputs['exposure_by_lse'][peril] = None
+        if not is_available:
+            continue
+        query = dict(secondary_peril=peril)
+        outputs['exposure_by_lse'][peril] = dict(
+            json=_impact_output_url(
+                request, 'exposure_by_lse', calc_id, query=query),
+            table=_impact_output_url(
+                request, 'extract_html_table', calc_id,
+                ['exposure_by_lse'], query),
+            npz=_impact_output_url(
+                request, 'calc_extract', calc_id, ['exposure_by_lse'],
+                query))
+    report_url = reverse('impact_report', args=[calc_id])
+    report_url = request.build_absolute_uri(report_url)
+    for iso3 in available['country_reports']:
+        urls = {}
+        for file_format in ('pdf', 'png'):
+            query = urlencode(dict(iso3=iso3, format=file_format))
+            urls[file_format] = f'{report_url}?{query}'
+        # reports produced by older engine versions have a single page
+        if f'impact/{iso3}/report_png_2' in dstore:
+            query = urlencode(dict(iso3=iso3, format='png', page=2))
+            urls['png_page2'] = f'{report_url}?{query}'
+        outputs['country_reports'][iso3] = urls
+    return outputs
+
+
+@cross_domain_ajax
+@require_http_methods(['GET'])
+def calc_impact_resources(request, calc_id):
+    """Return impact-specific resources and their retrieval URLs."""
+    job = logs.dbcmd('get_job', int(calc_id))
+    if job is None:
+        return HttpResponseNotFound()
+    if not utils.user_has_permission(request, job.user_name, job.status):
+        return HttpResponseForbidden()
+    with datastore.read(job.ds_calc_dir + '.hdf5') as ds:
+        resources = build_impact_resources(request, calc_id, ds)
+    return JsonResponse(resources)
+
+
+@csrf_exempt
+@cross_domain_ajax
+@require_http_methods(['GET'])
+def impact_report(request, calc_id):
+    job = logs.dbcmd('get_job', int(calc_id))
+    if job is None:
+        return HttpResponseNotFound()
+    if not utils.user_has_permission(request, job.user_name, job.status):
+        return HttpResponseForbidden()
+    iso3 = request.GET.get("iso3")
+    if not iso3:
+        return HttpResponse("Missing iso3 parameter", status=400)
+    file_format = request.GET.get("format", "pdf").lower()
+    if file_format not in ["pdf", "png"]:
+        return HttpResponse(
+            f'Invalid format parameter "{file_format}".'
+            f' Choose "pdf" or "png".', status=400)
+    # the PDF contains all pages, while there is a PNG for each page
+    page = request.GET.get("page", "1") if file_format == "png" else "1"
+    if not page.isdigit() or int(page) < 1:
+        return HttpResponse(
+            f'Invalid page parameter "{page}".'
+            f' It must be a positive integer.', status=400)
+    page = int(page)
+    try:
+        with datastore.read(job.ds_calc_dir + '.hdf5') as ds:
+            report_bytes = extract_report_from_datastore(
+                ds, iso3, file_format, page)
+    except Exception as exc:
+        tb = ''.join(traceback.format_tb(exc.__traceback__))
+        return HttpResponse(
+            content=f'{exc.__class__.__name__}: {exc}\n{tb}',
+            content_type='text/plain',
+            status=400
+        )
+    if file_format == "png":
+        suffix = '' if page == 1 else f'_page{page}'
+        response = HttpResponse(report_bytes, content_type="image/png")
+        response["Content-Disposition"] = (
+            f"inline; filename=impact_report_{iso3}{suffix}.png")
+    else:
+        response = HttpResponse(report_bytes, content_type="application/pdf")
+        response["Content-Disposition"] = (
+            f"inline; filename=impact_report_{iso3}.pdf")
+    return response
+
+
+@csrf_exempt
+@cross_domain_ajax
+@require_http_methods(['POST'])
+def aelo_run(request):
+    """
+    Run an AELO calculation.
+
+    :param request:
+        a `django.http.HttpRequest` object containing lon, lat, site_name,
+        asce_version, site_class, vs30
+    """
+    data = drop_email_file_path(request.POST.dict())
+    data.update(
+        username=utils.get_username(request),
+        email=getattr(getattr(request, 'user', None), 'email', ''),
+        base_url=_get_base_url(request))
+    return internal_api.run(
+        services.aelo_run, internal_api.make_form(data, request.FILES))
+
+
+def submit_job(request_files, ini, username, hc_id, notify_to=None):
+    """
+    Create a job object from the given files and run it in a new process.
+
+    :returns: a job ID
+    """
+    # build a LogContext object associated to a database job
+    [job] = engine.create_jobs(
+        [dict(calculation_mode='custom',
+              description='Calculation waiting to start')],
+        config.distribution.log_level, None, username, hc_id)
+
+    # store the request files and perform some validation
+    try:
+        if request_files:
+            job_ini = store(request_files, ini, job.calc_id)
+        else:  # called by calc_run_ini
+            job_ini = ini
+        job.oqparam = oq = readinput.get_oqparam(
+            job_ini, kw={'hazard_calculation_id': hc_id,
+                         'export_dir': (config.directory.custom_tmp or
+                                        tempfile.gettempdir())})
+        dic = dict(calculation_mode=oq.calculation_mode,
+                   description=oq.description, hazard_calculation_id=hc_id)
+        logs.dbcmd('update_job', job.calc_id, dic)
+        jobs = [job]
+    except Exception as exc:
+        tb = traceback.format_exc()
+        logs.dbcmd('log', job.calc_id, datetime.now(UTC), 'CRITICAL',
+                   'before starting', tb)
+        logs.dbcmd('finish', job.calc_id, 'failed')
+        exc.job_id = job.calc_id
+        raise exc
+
+    custom_tmp = os.path.dirname(job_ini)
+    submit_cmd = config.distribution.submit_cmd.split()
+    if submit_cmd == ENGINE:  # used for debugging
+        for job in jobs:
+            subprocess.Popen(submit_cmd + [save_pik(job, custom_tmp)])
+    else:
+        kwargs = {}
+        if notify_to is not None:
+            kwargs['notify_to'] = notify_to
+        proc = mp.Process(target=engine.run_jobs, args=([job], 1),
+                          kwargs=kwargs)
+        proc.start()
+        if config.webapi.calc_timeout:
+            mp.Process(
+                target=engine.watchdog,
+                args=(job.calc_id, proc.pid, int(config.webapi.calc_timeout))
+            ).start()
+    return job.calc_id
+
+
+def save_pik(job, dirname):
+    """
+    Save a LogContext object in pickled format; returns the path to it
+    """
+    pathpik = os.path.join(dirname, 'calc%d.pik' % job.calc_id)
+    with open(pathpik, 'wb') as f:
+        pickle.dump([job], f)
+    return pathpik
+
+
+def get_allowed_outputs(oes, request):
+    if settings.LOCKDOWN:
+        # When authentication is enabled, HIDDEN_OUTPUTS are visible only to
+        # users with level ≥ 2 or who have the permission 'can_view_<OUTPUT>'
+        user = request.user
+        return [e for o, e in oes
+                if o not in HIDDEN_OUTPUTS
+                or user.has_perm(f'auth.can_view_{o}')
+                or user.level >= 2]
+    else:
+        # When authentication is disabled, all outputs are visible
+        return [e for o, e in oes]
+
+
+@require_http_methods(['GET'])
+@cross_domain_ajax
+def calc_results(request, calc_id):
+    """
+    Get a summarized list of calculation results for a given ``calc_id``.
+    Result is a JSON array of objects containing the following attributes:
+
+        * id
+        * name
+        * type (hazard_curve, hazard_map, etc.)
+        * url (the exact url where the full result can be accessed)
+    """
+    # If the specified calculation doesn't exist OR is not yet complete,
+    # throw back a 404.
+    try:
+        info = logs.dbcmd('calc_info', calc_id)
+        if not utils.user_has_permission(
+                request, info['user_name'], info['status']):
+            return HttpResponseForbidden()
+    except dbapi.NotFound:
+        return HttpResponseNotFound()
+    base_url = _get_base_url(request)
+
+    # NB: export_output has as keys the list (output_type, extension)
+    # so this returns an ordered map output_type -> extensions such as
+    # {'agg_loss_curve': ['xml', 'csv'], ...}
+    output_types = groupby(export, lambda oe: oe[0],
+                           lambda oes: get_allowed_outputs(oes, request))
+    results = logs.dbcmd('get_outputs', calc_id)
+    if not results:
+        return HttpResponseNotFound()
+
+    response_data = []
+    for result in results:
+        try:  # output from the datastore
+            rtype = result.ds_key
+            # Catalina asked to remove the .txt outputs (used for the GMFs)
+            outtypes = [ot for ot in output_types[rtype] if ot != 'txt']
+        except KeyError:
+            continue  # non-exportable outputs should not be shown
+        if not outtypes:  # happens for 'exposure', since it is hidden
+            continue
+        url = base_url + reverse('result', args=[result.id])
+        # NOTE: in case of multiple available export types, we provide only
+        # the url to download the data in the first of the types. We may want
+        # to expose multiple urls, one per export type, or a single url with
+        # the "preferred" type, that may depend from the kind of output
+        query_params = {'export_type': outtypes[0]}
+        parsed_url = urlparse(url)
+        url_with_query = urlunparse(parsed_url._replace(
+            query=urlencode(query_params)))
+        datum = dict(
+            id=result.id, name=result.display_name, type=rtype,
+            outtypes=outtypes, url=url_with_query, size_mb=result.size_mb)
+        response_data.append(datum)
+
+    return HttpResponse(content=json.dumps(response_data), content_type=JSON)
+
+
+@require_http_methods(['GET'])
+@cross_domain_ajax
+def calc_traceback(request, calc_id):
+    """
+    Get the traceback as a list of lines for a given ``calc_id``.
+    """
+    return internal_api.run(services.calc_traceback, int(calc_id))
+
+
+@cross_domain_ajax
+@require_http_methods(['GET', 'HEAD'])
+def calc_result(request, result_id):
+    """
+    Download a specific result, by ``result_id``.
+
+    The common abstracted functionality for getting hazard or risk results.
+
+    :param request:
+        `django.http.HttpRequest` object. Can contain a `export_type` GET
+        param (the default is 'xml' if no param is specified).
+    :param result_id:
+        The id of the requested artifact.
+    :returns:
+        If the requested ``result_id`` is not available in the format
+        designated by the `export_type`.
+
+        Otherwise, return a `django.http.HttpResponse` containing the content
+        of the requested artifact.
+
+    Parameters for the GET request can include an `export_type`, such as 'xml',
+    'geojson', 'csv', etc.
+    """
+    # If the result for the requested ID doesn't exist, OR
+    # the job which it is related too is not complete,
+    # throw back a 404. Django remains responsible for the user and ACL
+    # checks, while the export is performed by the internal API.
+    try:
+        _, job_status, job_user, _, ds_key = logs.dbcmd(
+            'get_result', result_id)
+        if not utils.user_has_permission(request, job_user, job_status):
+            return HttpResponseForbidden()
+        # When authentication is enabled, HIDDEN_OUTPUTS are visible only to
+        # users with level ≥ 2 or who have the permission 'can_view_<OUTPUT>'
+        if (settings.LOCKDOWN
+                and ds_key in HIDDEN_OUTPUTS
+                and not request.user.has_perm(f'auth.can_view_{ds_key}')
+                and not request.user.level >= 2):
+            return HttpResponseForbidden()
+    except dbapi.NotFound:
+        return HttpResponseNotFound()
+
+    export_type = request.GET.get('export_type') or DEFAULT_EXPORT_TYPE
+    return internal_api.run(
+        services.calc_result, int(result_id), export_type)
+
+
+@cross_domain_ajax
+@require_http_methods(['GET', 'HEAD'])
+def impact_results(request, calc_id):
+    """
+    Return impact results (aggrisk_tags), by ``calc_id``, as JSON.
+
+    :param request:
+        `django.http.HttpRequest` object.
+    :param calc_id:
+        The id of the requested calculation.
+    :returns:
+        a JSON object as documented in rest-api.rst
+    """
+    job = logs.dbcmd('get_job', int(calc_id))
+    if job is None:
+        return HttpResponseNotFound()
+    if not utils.user_has_permission(request, job.user_name, job.status):
+        return HttpResponseForbidden()
+    try:
+        with datastore.read(job.ds_calc_dir + '.hdf5') as ds:
+            df = _extract(ds, 'aggrisk_tags')
+    except Exception as exc:
+        tb = ''.join(traceback.format_tb(exc.__traceback__))
+        return HttpResponse(
+            content='%s: %s in %s\n%s' %
+            (exc.__class__.__name__, exc, 'aggrisk_tags', tb),
+            content_type='text/plain', status=400)
+    response_data = {'loss_type_descriptions': AGGRISK_FIELD_DESCRIPTION,
+                     'impact': df.to_dict()}
+    return JsonResponse(response_data)
+
+
+@cross_domain_ajax
+@require_http_methods(['GET', 'HEAD'])
+def exposure_by_mmi(request, calc_id):
+    """
+    Return exposure aggregated by MMI regions and tags (mmi_tags),
+    by ``calc_id``, as JSON.
+
+    :param request:
+        `django.http.HttpRequest` object.
+    :param calc_id:
+        The id of the requested calculation.
+    :returns:
+        a JSON object as documented in rest-api.rst
+    """
+    job = logs.dbcmd('get_job', int(calc_id))
+    if job is None:
+        return HttpResponseNotFound()
+    if not utils.user_has_permission(request, job.user_name, job.status):
+        return HttpResponseForbidden()
+    try:
+        with datastore.read(job.ds_calc_dir + '.hdf5') as ds:
+            df = _extract(ds, 'mmi_tags')
+    except Exception as exc:
+        tb = ''.join(traceback.format_tb(exc.__traceback__))
+        return HttpResponse(
+            content='%s: %s in %s\n%s' %
+            (exc.__class__.__name__, exc, 'mmi_tags', tb),
+            content_type='text/plain', status=400)
+    response_data = {'column_descriptions': EXPOSURE_FIELD_DESCRIPTION,
+                     'exposure_by_mmi': df.to_dict()}
+    return JsonResponse(response_data)
+
+
+@cross_domain_ajax
+@require_http_methods(['GET', 'HEAD'])
+def exposure_by_lse(request, calc_id):
+    """
+    Return exposure aggregated by secondary peril LSE tiers and tags,
+    by ``calc_id``, as JSON.
+
+    :param request:
+        `django.http.HttpRequest` object.
+    :param calc_id:
+        The id of the requested calculation.
+    :returns:
+        a JSON object as documented in rest-api.rst
+    """
+    job = logs.dbcmd('get_job', int(calc_id))
+    secondary_peril = request.GET.get('secondary_peril')
+    assert secondary_peril in ['liquefaction', 'landslide'], (
+        'Please specify secondary_peril: "landslide" or "liquefaction"')
+    discard_empty = request.GET.get('discard_empty', ['1'])[0] == '1'
+    if job is None:
+        return HttpResponseNotFound()
+    if not utils.user_has_permission(request, job.user_name, job.status):
+        return HttpResponseForbidden()
+    try:
+        with datastore.read(job.ds_calc_dir + '.hdf5') as ds:
+            df = _extract(
+                ds,
+                f'exposure_by_lse?secondary_peril={secondary_peril}'
+                f'&discard_empty={discard_empty}')
+    except Exception as exc:
+        tb = ''.join(traceback.format_tb(exc.__traceback__))
+        return HttpResponse(
+            content='%s: %s in %s\n%s' %
+            (exc.__class__.__name__, exc, 'exposure_by_lse', tb),
+            content_type='text/plain', status=400)
+    column_description = {
+        col: description
+        for col, description in EXPOSURE_FIELD_DESCRIPTION.items()
+        if col in df.columns}
+    response_data = {'column_descriptions': column_description,
+                     'exposure_by_lse': df.to_dict()}
+    return JsonResponse(response_data)
+
+
+@cross_domain_ajax
+@require_http_methods(['GET', 'HEAD'])
+def extract(request, calc_id, what):
+    """
+    Wrapper over the `oq extract` command. If `setting.LOCKDOWN` is true
+    only calculations owned by the current user can be retrieved.
+    """
+    job = logs.dbcmd('get_job', int(calc_id))
+    if job is None:
+        return HttpResponseNotFound()
+    if not utils.user_has_permission(request, job.user_name, job.status):
+        return HttpResponseForbidden()
+    path = request.get_full_path()
+    n = len(request.path_info)
+    query_string = unquote_plus(path[n:])
+    if not (can_extract(request, what)
+            or can_extract(request, what + query_string)):
+        return HttpResponseForbidden()
+    try:
+        # read the data and save them on a temporary .npz file
+        with datastore.read(job.ds_calc_dir + '.hdf5') as ds:
+            # NOTE: for some reason, in some cases the environment
+            # variable TMPDIR is ignored, so we need to use
+            # config.directory.custom_tmp if defined
+            temp_dir = config.directory.custom_tmp or tempfile.gettempdir()
+            fd, fname = tempfile.mkstemp(
+                prefix=what.replace('/', '-'), suffix='.npz', dir=temp_dir)
+            os.close(fd)
+            obj = _extract(ds, what + query_string)
+            hdf5.save_npz(obj, fname)
+    except Exception as exc:
+        tb = ''.join(traceback.format_tb(exc.__traceback__))
+        return HttpResponse(
+            content='%s: %s in %s\n%s' %
+            (exc.__class__.__name__, exc, path, tb),
+            content_type='text/plain', status=500)
+
+    # stream the data back
+    return stream_response(fname, ZIP)
+
+
+@cross_domain_ajax
+@require_http_methods(['GET', 'HEAD'])
+def model_provenance(request, calc_id):
+    """Authenticate and return the model provenance."""
+    if get_user_level(request) < 2:
+        return HttpResponseForbidden()
+    job = logs.dbcmd('get_job', int(calc_id))
+    if job is None:
+        return HttpResponseNotFound()
+    if not utils.user_has_permission(request, job.user_name, job.status):
+        return HttpResponseForbidden()
+    return internal_api.run(
+        services.model_provenance, int(calc_id))
+
+
+@cross_domain_ajax
+@require_http_methods(['GET'])
+def calc_datastore(request, job_id):
+    """
+    Download a full datastore file.
+
+    :param request:
+        `django.http.HttpRequest` object.
+    :param job_id:
+        The id of the requested datastore
+    :returns:
+        A `django.http.HttpResponse` containing the content
+        of the requested artifact, if present, else throws a 404
+    """
+    user_level = get_user_level(request)
+    if user_level < 2 and not settings.ALLOW_DATASTORE_DOWNLOAD:
+        err_msg = f'{user_level=}, {settings.ALLOW_DATASTORE_DOWNLOAD=}'
+        return HttpResponseForbidden(err_msg)
+    job = logs.dbcmd('get_job', int(job_id))
+    if job is None or not os.path.exists(job.ds_calc_dir + '.hdf5'):
+        return HttpResponseNotFound()
+    if not utils.user_has_permission(request, job.user_name, job.status):
+        return HttpResponseForbidden()
+
+    fname = job.ds_calc_dir + '.hdf5'
+    response = FileResponse(
+        FileWrapper(open(fname, 'rb')), content_type=HDF5)
+    response['Content-Disposition'] = (
+        'attachment; filename=%s' % os.path.basename(fname))
+    response['Content-Length'] = str(os.path.getsize(fname))
+    return response
+
+
+@cross_domain_ajax
+@require_http_methods(['GET'])
+def jobs_from_inis(request):
+    """
+    :returns:
+        list of job IDs; the ID is 0 if there is no job with the given checksum
+    """
+    dic = readinput.jobs_from_inis(request.GET.getlist('ini'))
+    if dic['error']:
+        logging.error(dic['error'])
+        return JsonResponse(dic, status=500)
+    return HttpResponse(content=json.dumps(dic), content_type=JSON)
+
+
+@cross_domain_ajax
+@require_http_methods(['GET'])
+def calc_zip(request, job_id):
+    """
+    Download job.zip file
+
+    :param request:
+        `django.http.HttpRequest` object.
+    :param job_id:
+        The id of the requested datastore
+    :returns:
+        A `django.http.HttpResponse` containing the content
+        of the requested artifact, if present, else throws a 404
+    """
+    if get_user_level(request) < 2:
+        return HttpResponseForbidden()
+    job = logs.dbcmd('get_job', int(job_id))
+    if job is None or not os.path.exists(job.ds_calc_dir + '.hdf5'):
+        return HttpResponseNotFound()
+    temp_dir = config.directory.custom_tmp or tempfile.gettempdir()
+    tmpdir = tempfile.mkdtemp(dir=temp_dir)
+    try:
+        with datastore.read(job.ds_calc_dir + '.hdf5') as ds:
+            archive = export_job_archive(ds, tmpdir)
+    except Exception as exc:
+        shutil.rmtree(tmpdir, ignore_errors=True)
+        tb = ''.join(traceback.format_tb(exc.__traceback__))
+        return HttpResponse(
+            content='%s: %s in %s\n%s' %
+            (exc.__class__.__name__, exc, 'job_zip', tb),
+            content_type='text/plain', status=400)
+    return stream_response(archive, ZIP, f'job_{job_id}.zip')
+
+
+def web_engine(request, **kwargs):
+    application_mode = settings.APPLICATION_MODE
+    # NOTE: application_mode is already added by the context processor
+    params = {'calc_list_page_size': settings.CALC_LIST_PAGE_SIZE}
+    if application_mode == 'AELO':
+        params['aelo_form_labels'] = services.AELO_FORM_LABELS
+        params['aelo_form_placeholders'] = AELO_FORM_PLACEHOLDERS
+        params['asce_versions'] = oqvalidation.ASCE_VERSIONS
+        params['site_classes'] = oqvalidation.SITE_CLASSES
+        params['default_asce_version'] = (
+            oqvalidation.OqParam.asce_version.default)
+    elif application_mode == 'IMPACT':
+        params['impact_form_labels'] = IMPACT_FORM_LABELS
+        params['impact_form_placeholders'] = IMPACT_FORM_PLACEHOLDERS
+        params['impact_form_defaults'] = IMPACT_FORM_DEFAULTS
+        params['impact_approaches'] = IMPACT_APPROACHES
+        # one dropdown per correlation field, as (field, label, options),
+        # each option being (model, scope) with scope shakemap or rupture
+        options = {}
+        for (field, scope), models in IMPACT_CORRELATION_MODELS.items():
+            options.setdefault(field, []).extend(
+                (model, scope) for model in models)
+        params['impact_correlation_options'] = [
+            (field, IMPACT_FORM_LABELS[field], opts)
+            for field, opts in options.items()]
+        params['impact_max_distance_level1'] = MAX_DISTANCE_LEVEL1
+
+        # this is usually ''; can be set in the local settings for debugging
+        params['impact_default_usgs_id'] = \
+            settings.IMPACT_DEFAULT_USGS_ID
+
+        params['msrs'] = [msr.__class__.__name__
+                          for msr in get_available_magnitude_scalerel()]
+    return render(
+        request, "engine/index.html", params)
+
+
+@cross_domain_ajax
+@require_http_methods(['GET'])
+def web_engine_get_outputs(request, calc_id, **kwargs):
+    application_mode = settings.APPLICATION_MODE
+    job = logs.dbcmd('get_job', calc_id)
+    if job is None:
+        return HttpResponseNotFound()
+    size_mb = '?' if job.size_mb is None else '%.2f' % job.size_mb
+    kwargs = dict(calc_id=calc_id, size_mb=size_mb)
+    pngs = dict(hmaps=False)
+    with datastore.read(job.ds_calc_dir + '.hdf5') as ds:
+        if 'png' in ds:
+            # NOTE: only one hmap can be visualized currently
+            pngs['hmaps'] = any([k.startswith('hmap') for k in ds['png']])
+            if application_mode == 'IMPACT':
+                pngs['avg_gmf'] = [
+                    k for k in ds['png'] if k.startswith('avg_gmf-')]
+                pngs['assets'] = 'assets.png' in ds['png']
+            if application_mode == 'AELO':
+                pngs['hcurves'] = 'hcurves.png' in ds['png']
+                # NOTE: remove "and 'All' in k" to show the individual plots
+                pngs['disagg_by_src'] = [
+                    k for k in ds['png']
+                    if k.startswith('disagg_by_src-') and 'All' in k]
+                pngs['mce'] = 'mce.png' in ds['png']
+                pngs['mce_spectra'] = 'mce_spectra.png' in ds['png']
+    kwargs['pngs'] = pngs
+    if application_mode == 'AELO':
+        # e.g. [[-61.071, 14.686, 0.0]]
+        kwargs['lon'], kwargs['lat'] = ds['oqparam'].sites[0][:2]
+        kwargs['site_class'] = get_site_class_display_name(ds)
+        # e.g. 'AELO for CCA'->'CCA'
+        kwargs['site_name'] = ds['oqparam'].description[9:]
+        try:
+            asce_version = ds['oqparam'].asce_version
+        except AttributeError:
+            # for backwards compatibility on old calculations
+            asce_version = oqvalidation.OqParam.asce_version.default
+        kwargs['asce_version'] = oqvalidation.ASCE_VERSIONS[asce_version]
+        try:
+            kwargs['calc_aelo_version'] = ds.get_attr('/', 'aelo_version')
+        except KeyError:
+            kwargs['calc_aelo_version'] = '1.0.0'
+        kwargs['asce_version'] = oqvalidation.ASCE_VERSIONS[asce_version]
+        kwargs['notes'], kwargs['warnings'] = get_aelo_notes_and_warnings(ds)
+    elif application_mode == 'IMPACT':
+        kwargs['warnings'] = get_impact_warnings(ds)
+    return render(request, "engine/get_outputs.html", kwargs)
+
+
+def is_model_preliminary(ds):
+    # NOTE: recently the mosaic_model has been added as an attribute of
+    # oqparam, but we are getting it from base_path for backwards compatibility
+    model = ds['oqparam'].base_path.split(os.path.sep)[-2]
+    if model in PRELIMINARY_MODELS:
+        return True
+    else:
+        return False
+
+
+def get_disp_val(val):
+    # gets the value displayed in the webui according to the rounding rules
+    if val >= 1.0:
+        return '{:.2f}'.format(numpy.round(val, 2))
+    elif val < 0.0001:
+        return f'{val:.1f}'
+    elif val < 0.01:
+        return '{:.4f}'.format(numpy.round(val, 4))
+    elif val < 0.1:
+        return '{:.3f}'.format(numpy.round(val, 3))
+    else:
+        return '{:.2f}'.format(numpy.round(val, 2))
+
+
+def group_keys_by_value(d):
+    """
+    Groups keys from the input dictionary by their shared values.
+    If a value is shared by multiple keys, those keys are grouped into a tuple.
+    Otherwise, the key is kept as-is.
+
+    :param d: a dictionary with hashable keys and values
+    :returns: a dictionary where keys are either individual keys or tuples
+              of keys that shared the same value, and values are the original
+              values
+
+    Example:
+        >>> group_keys_by_value({0: 'a', 1: 'b', 2: 'a'})
+        {(0, 2): 'a', 1: 'b'}
+    """
+    grouped = defaultdict(list)
+    for k, v in d.items():
+        grouped[v].append(k)
+    result = {}
+    for v, keys in grouped.items():
+        if len(keys) == 1:
+            result[keys[0]] = v
+        else:
+            result[tuple(keys)] = v
+    return result
+
+
+def get_aelo_notes_and_warnings(ds):
+    notifications = numpy.array([], dtype=notification_dtype)
+    sid_to_vs30 = {}
+    notes = {}
+    warnings = {}
+    if is_model_preliminary(ds):
+        # sid -1 means it is not associated to a specific site
+        preliminary_model_warning = numpy.array([
+            (-1, b'warning', b'preliminary_model',
+                PRELIMINARY_MODEL_WARNING_MSG.encode('utf8'))],
+            dtype=notification_dtype)
+        notifications = numpy.concatenate(
+            (notifications, preliminary_model_warning))
+        sid_to_vs30.update({-1: ''})  # warning about preliminary model
+    if 'notifications' in ds:
+        notifications = numpy.concatenate((notifications, ds['notifications']))
+        sitecol = ds['sitecol']
+        # NOTE: the variable name 'site' is already used
+        sid_to_vs30.update({site_item.id: site_item.vs30
+                            for site_item in sitecol})
+        for notification in notifications:
+            vs30 = sid_to_vs30[notification['sid']]
+            if notification['level'] == b'info':
+                notes[vs30] = notification['description'].decode('utf8')
+            elif notification['level'] == b'warning':
+                warnings[vs30] = notification['description'].decode('utf8')
+        notes = group_keys_by_value(notes)
+        warnings = group_keys_by_value(warnings)
+        # NOTE: we decided to avoid specifying which vs30 values are relevant
+        # with respect to the notifications (either for notes and warnings)
+    notes_str = '\n'.join([note for note in notes.values()])
+    warnings_str = '\n'.join([warning for warning in warnings.values()])
+    return notes_str, warnings_str
+
+
+# this is extracting only the first site and it is okay
+@cross_domain_ajax
+@require_http_methods(['GET'])
+def web_engine_get_outputs_aelo(request, calc_id, **kwargs):
+    job = logs.dbcmd('get_job', calc_id)
+    size_mb = '?' if job.size_mb is None else '%.2f' % job.size_mb
+    asce07 = asce41 = None
+    asce07_with_units = {}
+    asce41_with_units = {}
+    notes_str = warnings_str = ''
+    with datastore.read(job.ds_calc_dir + '.hdf5') as ds:
+        try:
+            asce_version = ds['oqparam'].asce_version
+        except AttributeError:
+            # for backwards compatibility on old calculations
+            asce_version = oqvalidation.OqParam.asce_version.default
+        try:
+            calc_aelo_version = ds.get_attr('/', 'aelo_version')
+        except KeyError:
+            calc_aelo_version = '1.0.0'
+        if 'asce07' in ds:
+            try:
+                asce07_js = ds['asce07'][0].decode('utf8')
+            except ValueError:
+                # NOTE: for backwards compatibility, read scalar
+                asce07_js = ds['asce07'][()].decode('utf8')
+            asce07 = json.loads(asce07_js)
+            asce07_key_mapping = {}
+            if asce_version != 'ASCE7-16':
+                asce07_key_mapping = {
+                    'PGA': 'PGAm',
+                }
+            asce07_m = {asce07_key_mapping.get(k, k): v
+                        for k, v in asce07.items()}
+            for key, value in asce07_m.items():
+                if key not in ('PGAm', 'PGA', 'Ss', 'S1', 'Sms', 'Sm1'):
+                    continue
+                if not isinstance(value, float):
+                    asce07_with_units[key] = value
+                elif key in ('CRs', 'CR1'):
+                    # NOTE: (-) stands for adimensional
+                    asce07_with_units[key + ' (-)'] = get_disp_val(value)
+                else:
+                    asce07_with_units[key + ' (g)'] = get_disp_val(value)
+        if 'asce41' in ds:
+            try:
+                asce41_js = ds['asce41'][0].decode('utf8')
+            except ValueError:
+                # NOTE: for backwards compatibility, read scalar
+                asce41_js = ds['asce41'][()].decode('utf8')
+            asce41 = json.loads(asce41_js)
+            asce41_key_mapping = {}
+            if asce_version != 'ASCE7-16':
+                asce41_key_mapping = {
+                    'BSE2N_Ss': 'BSE2N_Sxs',
+                    'BSE2E_Ss': 'BSE2E_Sxs',
+                    'BSE1N_Ss': 'BSE1N_Sxs',
+                    'BSE1E_Ss': 'BSE1E_Sxs',
+                    'BSE2N_S1': 'BSE2N_Sx1',
+                    'BSE2E_S1': 'BSE2E_Sx1',
+                    'BSE1N_S1': 'BSE1N_Sx1',
+                    'BSE1E_S1': 'BSE1E_Sx1',
+                }
+            asce41_m = {asce41_key_mapping.get(k, k): v
+                        for k, v in asce41.items()}
+            for key, value in asce41_m.items():
+                if not key.startswith('BSE'):
+                    continue
+                if not isinstance(value, float):
+                    asce41_with_units[key] = value
+                else:
+                    asce41_with_units[key + ' (g)'] = get_disp_val(value)
+        pngs = {}
+        if 'png' in ds:
+            pngs['site'] = 'site.png' in ds['png']
+            pngs['governing_mce'] = 'governing_mce.png' in ds['png']
+        lon, lat = ds['oqparam'].sites[0][:2]  # e.g. [[-61.071, 14.686, 0.0]]
+        site_class_str = get_site_class_display_name(ds)
+        site_name = ds['oqparam'].description[9:]  # e.g. 'AELO for CCA'->'CCA'
+        notes_str, warnings_str = get_aelo_notes_and_warnings(ds)
+    return render(request, "engine/get_outputs_aelo.html",
+                  dict(calc_id=calc_id, size_mb=size_mb,
+                       asce07=asce07_with_units, asce41=asce41_with_units,
+                       lon=lon, lat=lat, site_class=site_class_str,
+                       site_name=site_name, pngs=pngs,
+                       calc_aelo_version=calc_aelo_version,
+                       asce_version=oqvalidation.ASCE_VERSIONS[asce_version],
+                       warnings=warnings_str, notes=notes_str))
+
+
+def format_time_delta(td):
+    days = td.days
+    seconds = td.seconds
+    hours = seconds // 3600
+    minutes = (seconds % 3600) // 60
+    seconds = seconds % 60
+    # Format without microseconds
+    formatted_time = f'{days} days, {hours:02}:{minutes:02}:{seconds:02}'
+    return formatted_time
+
+
+def determine_precision(weights):
+    """
+    Determine the minimum decimal places needed to represent the
+    weights accurately
+    """
+    max_decimal_places = 0
+    for weight in weights:
+        str_weight = f"{weight:.10f}".rstrip("0")  # Remove trailing zeros
+        decimal_places = str_weight[::-1].find('.')  # Count decimal places
+        max_decimal_places = max(max_decimal_places, decimal_places)
+    return max_decimal_places
+
+
+def get_impact_warnings(ds):
+    warnings = None
+    if 'warnings' in ds:
+        warnings = '\n'.join(s.decode('utf8') for s in ds['warnings'])
+    return warnings
+
+
+def format_oqparam(oqparam, model_used=None):
+    ret_dict = {}
+    rupdic = oqparam.rupture_dict
+    approach = rupdic['approach']
+    ret_dict['Approach'] = IMPACT_APPROACHES[approach]
+    if 'from_usgs' in approach:
+        ret_dict[IMPACT_FORM_LABELS['usgs_id']] = rupdic['usgs_id']
+        ret_dict[IMPACT_FORM_LABELS['shakemap_desc']] = rupdic['shakemap_desc']
+        # the time of the event selected by the user, used in the reports
+        ret_dict[IMPACT_FORM_LABELS['time_event']] = (
+            oqparam.report_time_event or oqparam.time_event)
+
+    # e.g. from {'default': [[2.5, 150.0], [10.2, 150.0]]} to 150
+    ret_dict[IMPACT_FORM_LABELS['maximum_distance']] = \
+        oqparam.maximum_distance['default'][0][1]
+
+    # e.g. from 0.000000001 to 0
+    ret_dict[IMPACT_FORM_LABELS['truncation_level']] = \
+        oqparam.truncation_level if oqparam.truncation_level > 1e-6 else 0
+
+    ret_dict[IMPACT_FORM_LABELS['number_of_ground_motion_fields']] = \
+        oqparam.number_of_ground_motion_fields
+
+    # NOTE: e.g. from {'default': 14.0} to 14.0
+    ret_dict[IMPACT_FORM_LABELS['asset_hazard_distance']] = \
+        oqparam.asset_hazard_distance['default']
+
+    ret_dict[IMPACT_FORM_LABELS['ses_seed']] = oqparam.ses_seed
+
+    # the correlation models really used by the calculation, if any
+    within = oqparam.within_event_correlation_model
+    within_params = oqparam.within_event_correlation_params
+    if model_used:  # stored by the ShakeMap jobs
+        within = model_used
+    elif within and within_params:
+        within += f' {within_params}'
+    ret_dict[IMPACT_FORM_LABELS['within_event_correlation_model']] = (
+        within or 'None')
+    ret_dict[IMPACT_FORM_LABELS['between_event_correlation_model']] = (
+        oqparam.between_event_correlation_model or 'None')
+
+    if approach != 'use_shakemap_from_usgs':
+        ret_dict[IMPACT_FORM_LABELS['mosaic_model']] = oqparam.mosaic_model
+        ret_dict[IMPACT_FORM_LABELS['trt']] = oqparam.tectonic_region_type
+        ret_dict['Station data'] = (
+            'yes' if 'station_data' in oqparam.inputs else 'no')
+    if approach in ['build_rup_from_usgs',
+                    'provide_rup_params']:
+        ret_dict[IMPACT_FORM_LABELS['lon']] = rupdic['lon']
+        ret_dict[IMPACT_FORM_LABELS['lat']] = rupdic['lat']
+        ret_dict[IMPACT_FORM_LABELS['dep']] = rupdic['dep']
+        ret_dict[IMPACT_FORM_LABELS['mag']] = rupdic['mag']
+        if 'nodal_plane' in rupdic:
+            ret_dict[IMPACT_FORM_LABELS['nodal_plane']] = \
+                rupdic['nodal_plane']
+        ret_dict[IMPACT_FORM_LABELS['msr']] = rupdic['msr']
+        ret_dict[IMPACT_FORM_LABELS['aspect_ratio']] = rupdic['aspect_ratio']
+        ret_dict[IMPACT_FORM_LABELS['rake']] = rupdic['rake']
+        ret_dict[IMPACT_FORM_LABELS['dip']] = rupdic['dip']
+        ret_dict[IMPACT_FORM_LABELS['strike']] = rupdic['strike']
+
+    # NOTE: when the rupture file is uploaded by the user, it is copied
+    # into a temporary file that might be unavailable when the job outputs
+    # page is requested. Furthermore, the name of the file is random (not
+    # the same name as the original uploaded file). So, with the current
+    # implementation, it does not make sense to show to the user the
+    # internal name of the volatile rupture file. If we need to offer that
+    # possibility, we must store the rupture file persistently into the
+    # datastore.
+    # if approach == 'provide_rup':
+    #     ret_dict[IMPACT_FORM_LABELS['rupture_file']] = rupdic['rupture_file']
+
+    return ret_dict
+
+
+def _get_impact_losses(ds):
+    # returns (losses, losses_header, weights_precision) for the table in
+    # the impact outputs page, or a message and None, None if the hazard
+    # is too low to compute the risk
+    try:
+        losses = views.view('aggrisk', ds)
+    except KeyError:
+        max_avg_gmf = ds['avg_gmf'][0].max()
+        msg = (f'The risk can not be computed since the hazard is too low:'
+               f' the maximum value of the average GMF is {max_avg_gmf:.5f}')
+        return msg, None, None
+    losses = losses[[n for n in losses.dtype.names
+                     if n not in IMPACT_HIDDEN]]
+    # display only the descriptions, not the internal names of the fields
+    losses_header = [
+        AGGRISK_FIELD_DESCRIPTION.get(field, field.capitalize())
+        for field in losses.dtype.names]
+    return losses, losses_header, determine_precision(losses['weight'])
+
+
+@cross_domain_ajax
+@require_http_methods(['GET'])
+def web_engine_get_outputs_impact(request, calc_id):
+    job = logs.dbcmd('get_job', calc_id)
+    if job is None:
+        return HttpResponseNotFound()
+    description = job.description
+    job_start_time = job.start_time
+    job_start_time_str = job.start_time.strftime('%Y-%m-%d %H:%M:%S') + ' UTC'
+    local_timestamp_str = None
+    event_time_str = None
+    time_job_after_event = None
+    time_job_after_event_str = None
+    with datastore.read(job.ds_calc_dir + '.hdf5') as ds:
+        losses, losses_header, weights_precision = _get_impact_losses(ds)
+        oqparam = ds['oqparam']
+        model_used = None  # stored by the ShakeMap jobs with a correlation
+        if 'correlation_model_used' in ds:
+            model_used = ds['correlation_model_used'][0].decode()
+        input_params = format_oqparam(oqparam, model_used)
+        usgs_id = None
+        if hasattr(oqparam.rupture_dict, 'usgs_id'):
+            usgs_id = oqparam.rupture_dict['usgs_id']
+        if hasattr(oqparam, 'local_timestamp'):
+            local_timestamp_str = (
+                oqparam.local_timestamp if oqparam.local_timestamp != 'None'
+                else None)
+        impact_resources = build_impact_resources(request, calc_id, ds)
+    size_mb = '?' if job.size_mb is None else '%.2f' % job.size_mb
+    warnings = get_impact_warnings(ds)
+    if local_timestamp_str is not None:
+        local_timestamp = datetime.strptime(
+            local_timestamp_str, '%Y-%m-%d %H:%M:%S%z')
+        time_job_after_event = (
+            job_start_time.replace(tzinfo=timezone.utc) - local_timestamp)
+        time_job_after_event_str = format_time_delta(time_job_after_event)
+        event_time_str = format_event_time(local_timestamp_str)
+    return render(request, "engine/get_outputs_impact.html",
+                  dict(calc_id=calc_id, description=description,
+                       local_timestamp=event_time_str,
+                       job_start_time=job_start_time_str,
+                       time_job_after_event=time_job_after_event_str,
+                       size_mb=size_mb, losses=losses,
+                       losses_header=losses_header,
+                       weights_precision=weights_precision,
+                       warnings=warnings, impact_resources=impact_resources,
+                       usgs_id=usgs_id, input_params=input_params)
+                  )
+
+
+@cross_domain_ajax
+@require_http_methods(['GET'])
+def download_aggrisk(request, calc_id):
+    job = logs.dbcmd('get_job', int(calc_id))
+    if job is None:
+        return HttpResponseNotFound()
+    if not utils.user_has_permission(request, job.user_name, job.status):
+        return HttpResponseForbidden()
+    with datastore.read(job.ds_calc_dir + '.hdf5') as ds:
+        losses = views.view('aggrisk', ds)
+    # Create the HttpResponse object with the appropriate CSV header.
+    response = HttpResponse(
+        content_type="text/csv",
+        headers={
+            "Content-Disposition":
+                'attachment; filename="aggrisk_%s.csv"' % calc_id
+        },
+    )
+    writer = csv.writer(response)
+    writer.writerow(losses.dtype.names)
+    for row in losses:
+        writer.writerow(row)
+    return response
+
+
+def can_extract(request, resource):
+    try:
+        user = request.user
+    except AttributeError:
+        # without authentication
+        return True
+    if (any(resource == allowed
+            or resource.startswith(allowed + "/")
+            or resource.startswith(allowed + ".")
+            for allowed in EXTRACTABLE_RESOURCES)
+            or user.level >= 2
+            or user.has_perm(f'auth.can_view_{resource}')):
+        return True
+    if resource in MAP_RESOURCE_OUTPUT:
+        corresponding_output = MAP_RESOURCE_OUTPUT[resource]
+        if user.has_perm(f'auth.can_view_{corresponding_output}'):
+            return True
+    return False
+
+
+def _impact_summary_hidden(oqparam):
+    # loss types hidden in the impact summary table: the IMPACT_HIDDEN ones
+    # and, if a time of the event was selected, the fatalities and injured
+    # for the other times of the day
+    te = oqparam.report_time_event
+    if te is None:
+        return IMPACT_HIDDEN
+    return IMPACT_HIDDEN + [f'{lt}_{other}' for lt in TIME_LOSSES
+                            for other in TIME_EVENTS if other != te]
+
+
+def _impact_summary_labels(oqparam):
+    # display names of the loss types in the impact summary table; if a time
+    # of the event was selected, the fatalities and injured are shown only
+    # for that time, so their names do not mention it (the explanations do)
+    labels = dict(AGGRISK_FIELD_DESCRIPTION, injured='Injured people')
+    te = oqparam.report_time_event
+    if te is not None:
+        labels[f'occupants_{te}'] = labels['occupants']
+        labels[f'injured_{te}'] = labels['injured']
+    return labels
+
+
+@cross_domain_ajax
+@require_http_methods(['GET'])
+def extract_html_table(request, calc_id, name):
+    summarize = _get_bool_param(request.GET, 'summarize')
+    secondary_peril = request.GET.get('secondary_peril')
+    if secondary_peril:
+        name += f'?secondary_peril={secondary_peril}'
+    job = logs.dbcmd('get_job', int(calc_id))
+    if job is None:
+        return HttpResponseNotFound()
+    if not utils.user_has_permission(request, job.user_name, job.status):
+        return HttpResponseForbidden()
+    if not can_extract(request, name):
+        return HttpResponseForbidden()
+    try:
+        with datastore.read(job.ds_calc_dir + '.hdf5') as ds:
+            table = _extract(ds, name)
+            oqparam = ds['oqparam']
+    except Exception as exc:
+        tb = ''.join(traceback.format_tb(exc.__traceback__))
+        return HttpResponse(
+            content='%s: %s in %s\n%s' %
+            (exc.__class__.__name__, exc, name, tb),
+            content_type='text/plain', status=400)
+    # Using display names of the exporters if available
+    display_names = DISPLAY_NAME.copy()
+    display_names.update({
+        'aggrisk_tags': 'Impact',
+        'losses_by_site': 'Losses by site',
+        'losses_by_location': 'Losses by location',
+        'exposure_by_location': 'Exposure by location',
+        'exposure_by_lse?secondary_peril=liquefaction':
+            'Exposure grouped by Region and by Liquefaction LSE',
+        'exposure_by_lse?secondary_peril=landslide':
+            'Exposure grouped by Region and by Landslide LSE',
+    })
+    loss_names = ['aggrisk_tags', 'losses_by_site', 'losses_by_location']
+    exposure_names = ['mmi_tags', 'exposure_by_location',
+                      'exposure_by_lse?secondary_peril=liquefaction',
+                      'exposure_by_lse?secondary_peril=landslide']
+    table_name = display_names[name] if name in display_names else name
+
+    # Identify string columns from dtype before formatting the headers.
+    # dtype.kind: 'S' = bytes, 'U' = unicode, 'O' = object
+    string_short_names = {
+        col for col in table.columns
+        if table[col].dtype.kind in ('S', 'U') or table[col].dtype == object
+    }
+    column_sort_types = [
+        'string' if col in string_short_names else 'number'
+        for col in table.columns
+    ]
+
+    table_header = []
+    for short_name in table.columns:
+        display_name = ''
+        if name in loss_names and short_name in AGGRISK_FIELD_DESCRIPTION:
+            display_name = AGGRISK_FIELD_DESCRIPTION[short_name]
+        elif name in exposure_names:
+            clean_name = short_name
+            if short_name.startswith('value-'):
+                clean_name = short_name.split('value-')[1]
+            if clean_name in EXPOSURE_FIELD_DESCRIPTION:
+                display_name = EXPOSURE_FIELD_DESCRIPTION[clean_name]
+        # avoiding to show the internal short names when showing
+        # the summary table
+        if summarize and name == 'aggrisk_tags':
+            table_header.append(display_name)
+        else:
+            table_header.append(f'{short_name}<br><br><i>{display_name}</i>')
+
+    # string_columns must contain the formatted header strings that actually
+    # appear in table_header so that `header in string_columns` in the
+    # template matches correctly.
+    string_columns = {
+        header
+        for header, short_name in zip(table_header, table.columns)
+        if short_name in string_short_names
+    }
+
+    table_contents = table.to_numpy()
+    field_explanations = {}
+    if summarize and name == 'aggrisk_tags':  # the impact table
+        # keep only rows with '*total*' and discard first and last 2 columns
+        # (ID_0, ID and NAME)
+        table_header = table_header[1:-2]
+        column_sort_types = column_sort_types[1:-2]
+        table_contents = table_contents[table_contents[:, 0] == '*total*'][
+            :, 1:-2]
+
+        # NOTE: Intentionally excluding some loss types, see IMPACT_HIDDEN;
+        # fatalities and injured are shown only for the selected time
+        table_contents = table_contents[~numpy.isin(
+            table_contents[:, 0], _impact_summary_hidden(oqparam))]
+
+        # replace the following rows with their sum (economic loss)
+        rows_to_sum = ['structural', 'nonstructural', 'contents']
+        mask = numpy.isin(table_contents[:, 0], rows_to_sum)
+        summed = numpy.sum(table_contents[mask, 1:].astype(float), axis=0)
+        economic_loss_row = numpy.concatenate(
+            ([numpy.str_('economic')], summed))
+        remaining = table_contents[~mask]
+        table_contents = numpy.vstack([remaining, economic_loss_row])
+        # explain only the loss types displayed in the summary
+        displayed = set(table_contents[:, 0])
+        labels = _impact_summary_labels(oqparam)
+        for key, value in labels.items():
+            table_contents[table_contents == key] = value
+        loss_types = '<ul>' + ''.join(
+            '<li><strong>%s:</strong> %s%s</li>' % (
+                labels.get(key, key), explanation,
+                '<span>.</span>' if key.startswith('injured') else '.')
+            for key, explanation in AGGRISK_FIELD_EXPLANATION.items()
+            if key in displayed
+        ) + '</ul>'
+        exposed_values = '<ul>' + ''.join(
+            '<li><strong>%s:</strong> %s.</li>' % (
+                label, EXPOSED_VALUE_EXPLANATION[key])
+            for label, key in EXPOSED_VALUE_LABELS) + '</ul>'
+        reported_values = '<ul>' + ''.join(
+            '<li><strong>%s:</strong> %s.</li>' % (
+                AGGRISK_FIELD_DESCRIPTION[key], explanation)
+            for key, explanation in REPORTED_VALUE_EXPLANATION.items()
+        ) + '</ul>'
+        additional_explanations = {
+            'value': (
+                'The exposed value depends on the impact metric. Below we '
+                'describe the meaning of the exposed value per impact metric:'
+                + exposed_values),
+            'Reported values': reported_values,
+        }
+        explanations = {
+            'Loss types': loss_types,
+            **additional_explanations,
+        }
+        field_explanations = [
+            {
+                'description': AGGRISK_FIELD_DESCRIPTION.get(key, key),
+                'explanation': urlize(explanation),
+            }
+            for key, explanation in explanations.items()
+        ]
+
+    # Decode byte strings to plain str, while preserving the original values
+    # for client-side sorting. In particular, numbers can be humanized in the
+    # template, so sorting the displayed text would give incorrect results.
+    table_rows = []
+    for raw_row in table_contents:
+        display_row = decode(raw_row)
+        cells = []
+        for index, (header, display_value) in enumerate(
+                zip(table_header, display_row)):
+            sort_type = column_sort_types[index]
+            sort_value = decode(raw_row[index])
+            cells.append({
+                'display_value': display_value,
+                'is_string': (sort_type == 'string'
+                              or header in string_columns),
+                'sort_type': sort_type,
+                'sort_value': sort_value,
+            })
+        table_rows.append(cells)
+
+    return render(request, 'engine/show_table.html',
+                  {'calc_id': calc_id,
+                   'is_summary': summarize,
+                   'internal_name': name,
+                   'table_name': table_name,
+                   'table_header': table_header,
+                   'table_rows': table_rows,
+                   'string_columns': string_columns,
+                   'field_explanations': field_explanations})
+
+
+@csrf_exempt
+@cross_domain_ajax
+@require_http_methods(['POST'])
+def on_same_fs(request):
+    """
+    Accept a POST request to check access to a FS available by a client.
+
+    :param request:
+        `django.http.HttpRequest` object, containing mandatory parameters
+        filename and checksum. The caller authenticates with the internal
+        API key, since it is not necessarily a logged-in user.
+    """
+    if not internal_api.has_api_key(request):
+        return HttpResponseForbidden()
+    filename = request.POST.get('filename')
+    checksum_in = request.POST.get('checksum')
+
+    checksum = 0
+    try:
+        data = open(filename, 'rb').read(32)
+        checksum = zlib.adler32(data, checksum) & 0xffffffff
+        if checksum == int(checksum_in):
+            return JsonResponse({'success': True}, status=200)
+    except (IOError, TypeError, ValueError):
+        pass
+
+    return JsonResponse({'success': False}, status=200)
+
+
+@csrf_exempt
+@cross_domain_ajax
+@require_http_methods(['POST'])
+def calc_create_tag(request, tag_name):
+    """
+    Create a tag named `tag_name`
+    """
+    user_level = get_user_level(request)
+    return create_tag(user_level, tag_name)
+
+
+@csrf_exempt
+@cross_domain_ajax
+@require_http_methods(['POST'])
+def calc_delete_tag(request, tag_name):
+    """
+    Delete a tag named `tag_name`
+    """
+    user_level = get_user_level(request)
+    return delete_tag(user_level, tag_name)
+
+
+@csrf_exempt
+@cross_domain_ajax
+@require_http_methods(['POST'])
+def calc_add_tag(request, calc_id, tag_name):
+    """
+    Assign to the calculation of given `calc_id` a tag named `tag_name`
+    """
+    user_level = get_user_level(request)
+    return add_tag_to_job(user_level, calc_id, tag_name)
+
+
+@csrf_exempt
+@cross_domain_ajax
+@require_http_methods(['POST'])
+def calc_remove_tag(request, calc_id, tag_name):
+    """
+    Remove the tag named `tag_name` from the calculation of given `calc_id`
+    """
+    user_level = get_user_level(request)
+    return remove_tag_from_job(user_level, calc_id, tag_name)
+
+
+@csrf_exempt
+@cross_domain_ajax
+@require_http_methods(['POST'])
+def calc_set_preferred_job_for_tag(request, calc_id, tag_name):
+    """
+    Set the calculation of given `calc_id` as the preferred one for tag
+    `tag_name`
+    """
+    user_level = get_user_level(request)
+    return set_preferred_job_for_tag(user_level, calc_id, tag_name)
+
+
+@csrf_exempt
+@cross_domain_ajax
+@require_http_methods(['POST'])
+def calc_unset_preferred_job_for_tag(request, tag_name):
+    """
+    Unset the preferred job for tag `tag_name`
+    """
+    user_level = get_user_level(request)
+    return unset_preferred_job_for_tag(user_level, tag_name)
+
+
+@csrf_exempt
+@cross_domain_ajax
+@require_http_methods(['GET'])
+def calc_get_preferred_job_for_tag(request, tag_name):
+    """
+    Get the id of the calculation marked as the preferred one for the
+    given `tag_name`
+    """
+    return get_preferred_job_for_tag(tag_name)
+
+
+@csrf_exempt
+@cross_domain_ajax
+@require_http_methods(['GET'])
+def calc_list_tags(request):
+    """
+    List all the available tags
+    """
+    return list_tags()
+
+
+@require_http_methods(['GET'])
+def license(request, **kwargs):
+    return render(request, "engine/license.html")
+
+
+@require_http_methods(['GET'])
+def aelo_changelog(request, **kwargs):
+    aelo_changelog = base.get_aelo_changelog()
+    aelo_changelog_html = aelo_changelog.to_html(
+        index=False, escape=False, classes='changelog', border=0)
+    return render(request, "engine/aelo_changelog.html",
+                  dict(aelo_changelog=aelo_changelog_html))
+
+
+def _form(request):
+    """Return the form (fields and files) of a POST request."""
+    return internal_api.make_form(request.POST, request.FILES)
+
+
+def _valid_users(request):
+    """Return the list of valid users sent in the request headers."""
+    try:
+        return json.loads(request.headers.get('X-Valid-Users') or '[]')
+    except json.JSONDecodeError as exc:
+        raise internal_api.ApiError(400, 'Invalid user context') from exc
+
+
+@internal_api.internal_view('GET')
+def v1_calc_info(request, calc_id):
+    """Return the information about a calculation."""
+    return services.calc_info(int(calc_id))
+
+
+@internal_api.internal_view('GET')
+def v1_calc_list_count(request):
+    """Count the calculations matching the filters of the list view."""
+    return services.calc_list_count(
+        request.GET.dict(), _valid_users(request),
+        request.headers.get('X-User-ACL-On'))
+
+

@@ -1,0 +1,104 @@
+# -*- coding: utf-8 -*-
+# vim: tabstop=4 shiftwidth=4 softtabstop=4
+#
+# Copyright (C) 2014-2026 GEM Foundation
+#
+# OpenQuake is free software: you can redistribute it and/or modify it
+# under the terms of the GNU Affero General Public License as published
+# by the Free Software Foundation, either version 3 of the License, or
+# (at your option) any later version.
+#
+# OpenQuake is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU Affero General Public License for more details.
+#
+# You should have received a copy of the GNU Affero General Public License
+# along with OpenQuake. If not, see <http://www.gnu.org/licenses/>.
+
+import numpy as np
+from types import SimpleNamespace
+
+from openquake.hazardlib.gsim.abrahamson_2014 import (
+    AbrahamsonEtAl2014, get_epistemic_sigma)
+from openquake.hazardlib.tests.gsim.utils import BaseGSIMTestCase
+
+# Test data have been generated from the Matlab implementation available as
+# Annex 1 of Abrahamson et al. (2014)
+
+
+class Abrahamson2014EtAlTestCase(BaseGSIMTestCase):
+    """
+    Test the default model, the total standard deviation and the within-event
+    standard deviation. The between events std is implicitly tested
+    """
+
+    GSIM_CLASS = AbrahamsonEtAl2014
+
+    def test_median(self):
+        self.check('ASK14/ASK14_ResMEAN_RegCAL.csv',
+                   max_discrep_percentage=0.1)
+
+    def test_std(self):
+        self.check('ASK14/ASK14_ResStdTot_RegCAL.csv',
+                   'ASK14/ASK14_ResStdPhi_RegCAL.csv',
+                   max_discrep_percentage=0.1)
+
+
+class Abrahamson2014EtAlRegTWNTestCase(BaseGSIMTestCase):
+    """
+    Test the modified version of the base model. Regional model for Taiwan.
+    Standard deviation model is not tested since it's the same used for the
+    default model.
+    """
+
+    GSIM_CLASS = AbrahamsonEtAl2014
+
+    def test_all(self):
+        self.check('ASK14/ASK14_ResMEAN_RegTWN.csv',
+                   max_discrep_percentage=0.5,
+                   region='TWN')
+
+
+class Abrahamson2014EtAlRegCHNTestCase(BaseGSIMTestCase):
+    """
+    Test the modified version of the base model. Regional model for China.
+    Standard deviation model is not tested since it's the same used for the
+    default model.
+    """
+
+    GSIM_CLASS = AbrahamsonEtAl2014
+
+    def test_mean(self):
+        self.check('ASK14/ASK14_ResMEAN_RegCHN.csv',
+                   max_discrep_percentage=0.1,
+                   region='CHN')
+
+
+class Abrahamson2014EtAlRegJPNTestCase(BaseGSIMTestCase):
+    """
+    Test the modified version of the base model. Regional model for Japan
+    Standard deviation model is not tested since it's the same used for the
+    default model.
+    """
+    GSIM_CLASS = AbrahamsonEtAl2014
+
+    def test_mean(self):
+        self.check('ASK14/ASK14_ResMEAN_RegJPN.csv',
+                   max_discrep_percentage=0.1,
+                   region='JPN')
+
+    def test_std(self):
+        self.check('ASK14/ASK14_ResStdTot_RegJPN.csv',
+                   'ASK14/ASK14_ResStdPhi_RegJPN.csv',
+                   max_discrep_percentage=0.1,
+                   region='JPN')
+
+
+def test_epistemic_sigma_small_magnitudes():
+    # M < 5 must use the 5 <= M < 6 bin, not fall through to the M >= 7 bin
+    ctx = SimpleNamespace(mag=np.array([3.5, 4.5, 5.5, 6.5, 7.5]),
+                          rrup=np.full(5, 50.))
+    np.testing.assert_allclose(
+        get_epistemic_sigma(ctx),
+        0.4 * np.sqrt(2 / np.array([94, 94, 94, 13, 4])))

@@ -1,0 +1,505 @@
+# -*- coding: utf-8 -*-
+# vim: tabstop=4 shiftwidth=4 softtabstop=4
+#
+# Copyright (C) 2014-2026 GEM Foundation
+#
+# OpenQuake is free software: you can redistribute it and/or modify it
+# under the terms of the GNU Affero General Public License as published
+# by the Free Software Foundation, either version 3 of the License, or
+# (at your option) any later version.
+#
+# OpenQuake is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU Affero General Public License for more details.
+#
+# You should have received a copy of the GNU Affero General Public License
+# along with OpenQuake. If not, see <http://www.gnu.org/licenses/>.
+
+import sys
+import os
+import socket
+import getpass
+import tempfile
+import logging
+
+from django.core.exceptions import ImproperlyConfigured
+from openquake.baselib import config, is_server_installation
+from openquake.baselib.general import engine_version
+from openquake.commonlib import datastore
+from openquake.hazardlib import valid
+from openquake.server.utils import get_or_create_django_secret_key
+
+
+# optionally overridden in local_settings.py
+STANDALONE_APP_NAME_MAP = {}
+
+try:
+    from openquakeplatform.settings import STANDALONE, STANDALONE_APPS
+except ImportError:
+    STANDALONE = False
+    STANDALONE_APPS = ()
+
+try:
+    from openquakeplatform.settings import INSTALLED_APPS as OQP_INSTALLED_APPS
+except ImportError:
+    OQP_INSTALLED_APPS = []
+
+
+DEFAULT_AUTO_FIELD = 'django.db.models.BigAutoField'
+WEBUI_USER = 'openquake'
+
+TEST = ('test' in sys.argv or any('pytest' in arg for arg in sys.argv)
+        or os.environ.get('GITHUB_ACTIONS') or os.environ.get('OQ_TEST'))
+
+INSTALLED_APPS = ('openquake.server.db',)
+
+OQSERVER_ROOT = os.path.dirname(__file__)
+
+# Normally do not show debug pages in a server installation
+DEBUG = not is_server_installation()
+BASE_DIR = os.path.abspath(os.path.dirname(__file__))
+
+
+def env_flag(name, default=False):
+    """
+    Read a boolean flag from the environment variable `name` (accepting
+    '', '0', '1', 'false' and 'true', case-insensitively); a plain
+    os.environ.get would return a string and 'False' would count as true.
+    """
+    value = os.environ.get(name)
+    return default if value is None else valid.boolean(value)
+
+
+WEBUI_PATHPREFIX = os.getenv('WEBUI_PATHPREFIX', '')
+USE_X_FORWARDED_HOST = env_flag('USE_X_FORWARDED_HOST')
+
+CONTEXT_PROCESSORS = [
+    'django.template.context_processors.debug',
+    'django.template.context_processors.i18n',
+    'django.template.context_processors.media',
+    'django.template.context_processors.static',
+    'django.template.context_processors.tz',
+    'django.contrib.messages.context_processors.messages',
+    'openquake.server.utils.oq_server_context_processor',
+]
+
+TEMPLATES = [
+    {
+        'BACKEND': 'django.template.backends.django.DjangoTemplates',
+        'APP_DIRS': True,
+        'OPTIONS': {
+            'context_processors': CONTEXT_PROCESSORS,
+        },
+    },
+]
+
+MEDIA_ROOT = '%(mediaroot)s'
+STATIC_ROOT = '%(staticroot)s'
+
+# Additional directories which hold static files
+STATICFILES_DIRS = [
+    os.path.join(OQSERVER_ROOT, 'static'),
+]
+
+DATABASE = {
+    'ENGINE': 'django.db.backends.sqlite3',
+    'NAME': os.path.expanduser(config.server.dbfile),
+    'USER': getpass.getuser(),
+    'HOST': config.server.host,
+}
+DATABASES = {'default': DATABASE}
+
+ALLOWED_HOSTS = ['*']
+
+AUTHENTICATION_BACKENDS = ()
+
+# Local time zone for this installation. Choices can be found here:
+# http://en.wikipedia.org/wiki/List_of_tz_zones_by_name
+# although not all choices may be available on all operating systems.
+# If running in a Windows environment this must be set to the same as your
+# system time zone.
+TIME_ZONE = 'UTC'
+
+# USE_TZ = True is the default for Django >= 5.0. From Django documentation:
+# "
+# When support for time zones is enabled, Django stores datetime information
+# in UTC in the database, uses time-zone-aware datetime objects internally,
+# and translates them to the end user’s time zone in templates and forms.
+# This is handy if your users live in more than one time zone and you want
+# to display datetime information according to each user’s wall clock.
+# Even if your website is available in only one time zone, it’s still good
+# practice to store data in UTC in your database. The main reason is daylight
+# saving time (DST). Many countries have a system of DST, where clocks are
+# moved forward in spring and backward in autumn. If you’re working in local
+# time, you’re likely to encounter errors twice a year, when the transitions
+# happen.
+# "
+USE_TZ = True
+
+# Language code for this installation. All choices can be found here:
+# http://www.i18nguy.com/unicode/language-identifiers.html
+LANGUAGE_CODE = 'en-us'
+
+# If you set this to False, Django will make some optimizations so as not
+# to load the internationalization machinery.
+USE_I18N = True
+
+MIDDLEWARE = (
+    'django.middleware.common.CommonMiddleware',
+    'django.middleware.csrf.CsrfViewMiddleware',
+    # NOTE: the following can be useful for debugging
+    # 'openquake.server.middleware.PrintHeadersMiddleware',
+)
+
+# Authentication is not enabled by default
+LOCKDOWN = False
+# Forbid users to see other users outputs by default
+ACL_ON = True
+
+ALLOW_DATASTORE_DOWNLOAD = True
+
+# Add additional paths (as regular expressions) that don't require
+# authentication.
+AUTH_EXEMPT_URLS = ()
+
+ROOT_URLCONF = 'openquake.server.urls'
+WSGI_APPLICATION = 'openquake.server.wsgi.application'
+
+INSTALLED_APPS += (
+    'django.contrib.staticfiles',
+    'openquake.server',
+    'openquake.server.webui',
+)
+
+# A sample logging configuration. The only tangible logging
+# performed by this configuration is to send an email to
+# the site admins on every HTTP 500 error.
+# See http://docs.djangoproject.com/en/dev/topics/logging for
+# more details on how to customize your logging configuration.
+LOGGING = {
+    'version': 1,
+    'disable_existing_loggers': False,
+    'formatters': {
+        'simple': {
+            'format': '%(levelname)s %(message)s'
+        },
+    },
+    'handlers': {
+        'mail_admins': {
+            'level': 'ERROR',
+            'class': 'django.utils.log.AdminEmailHandler'
+        },
+        'console': {
+            'level': 'DEBUG',
+            'class': 'logging.StreamHandler',
+            'formatter': 'simple'
+        },
+    },
+    'loggers': {
+        'django': {
+            'handlers': ['console'],
+            'level': 'INFO',
+            'propagate': False,
+        },
+        'django.request': {
+            'handlers': ['console'],
+            'level': 'DEBUG',
+            'propagate': False,
+        },
+        'openquake.server': {
+            'handlers': ['console'],
+            'level': 'DEBUG',
+            'propagate': True,
+        },
+    },
+}
+
+SUPPRESS_PERMISSION_DENIED_WARNINGS = False
+
+FILE_UPLOAD_MAX_MEMORY_SIZE = 1
+FILE_UPLOAD_TEMP_DIR = config.directory.custom_tmp or tempfile.gettempdir()
+
+# A server name can be specified to customize the WebUI in case of
+# multiple installations of the Engine are available. This helps avoiding
+# confusion between different installations when the WebUI is used
+SERVER_NAME = socket.gethostname()
+
+# In the list of calculations, the name of the owner of the job can be
+# displayed with or without the host name
+# (either 'username@hostname' or just 'username')
+DISPLAY_USER_HOST = False
+CALC_LIST_PAGE_SIZE = 10
+
+APPLICATION_MODES = [
+    'PUBLIC',      # The default behavior without authentication
+    'RESTRICTED',  # Enabling authentication
+    'AELO',        # Specific configurations for AELO installations
+    'IMPACT',   # Specific configurations for IMPACT installations
+    'READ_ONLY',   # Inhibits the possibility to run calculations
+    'TOOLS_ONLY',  # Provides standalone tools
+]
+
+APPLICATION_MODE = 'PUBLIC'
+
+IMPACT_DEFAULT_USGS_ID = ''
+# IMPACT_DEFAULT_USGS_ID = 'us7000n7n8'  # loadable and convertible rupture
+# IMPACT_DEFAULT_USGS_ID = 'us6000jllz'  # loadable but with conversion err
+
+# Definition of Django applications
+STANDALONE_APP_NAME_MAP = {
+        'openquakeplatform_ipt': 'ipt',
+        'django_gem_taxonomy': 'taxonomy',
+    }
+if APPLICATION_MODE != 'TOOLS_ONLY':
+    STANDALONE_APP_NAME_MAP['openquakeplatform_taxonomy'] = 'glossary'
+
+EXTERNAL_TOOLS = os.environ.get('EXTERNAL_TOOLS', False) == 'True'
+
+# If False, a warning is displayed in case a newer version of the engine has
+# been released
+DISABLE_VERSION_WARNING = False
+
+# Set to True if using NGINX or some other reverse proxy
+# Externally visible url and port number is different from Django visible
+# values
+USE_REVERSE_PROXY = False
+
+# Expose the WebUI interface, otherwise only the REST API will be available
+WEBUI = True
+
+MAX_AELO_SITE_NAME_LEN = 256
+
+GOOGLE_ANALYTICS_TOKEN = None
+
+HELP_URL = 'https://docs.openquake.org/oq-engine/latest/manual/'
+
+EMAIL_BACKEND = os.environ.get('EMAIL_BACKEND')
+EMAIL_HOST = os.environ.get('EMAIL_HOST')
+EMAIL_PORT = os.environ.get('EMAIL_PORT')
+EMAIL_USE_TLS = env_flag('EMAIL_USE_TLS')
+EMAIL_HOST_USER = os.environ.get('EMAIL_USER')
+EMAIL_HOST_PASSWORD = os.environ.get('EMAIL_PASS')
+EMAIL_SUPPORT = os.environ.get('EMAIL_SUPPORT')
+
+# OpenQuake Standalone tools (IPT, Taxonomy Glossary)
+if STANDALONE and WEBUI:
+    INSTALLED_APPS += (
+        'openquakeplatform', 'corsheaders',
+    )
+
+    INSTALLED_APPS += STANDALONE_APPS
+
+    # cors-headers configuration
+    corsheader_middleware = 'corsheaders.middleware.CorsMiddleware'
+    if corsheader_middleware not in MIDDLEWARE:
+        MIDDLEWARE += (corsheader_middleware,)
+    CORS_ALLOW_ALL_ORIGINS = True
+    CORS_URLS_REGEX = r'^/taxtweb/explanation/.*$'
+
+    FILE_PATH_FIELD_DIRECTORY = datastore.get_datadir()
+
+    CONTEXT_PROCESSORS.insert(0, 'django.template.context_processors.request')
+    CONTEXT_PROCESSORS.append('openquakeplatform.utils.oq_context_processor')
+    TEMPLATES[0]['OPTIONS']['context_processors'] = CONTEXT_PROCESSORS
+
+if not TEST:
+    try:
+        # Try to load a local_settings.py from the current folder; this is
+        # useful when packages are used. A custom local_settings.py can be
+        # placed in /usr/share/openquake/engine, avoiding changes inside the
+        # python package
+        from local_settings import *  # noqa
+    except ImportError:
+        # If no local_settings.py is availble in the current folder let's try
+        # to load it from openquake/server/local_settings.py
+        try:
+            from openquake.server.local_settings import *  # noqa
+        except ImportError:
+            # If a local_setting.py does not exist
+            # settings in this file only will be used
+            pass
+
+# In a devel_server installation we might want to set DEBUG = True
+if is_server_installation() and DEBUG:
+    if 'git' in engine_version():  # devel_server
+        logging.warning(
+            'DEBUG is True. Please check if this is intentional!')
+    else:
+        raise ImproperlyConfigured(
+            'DEBUG = True is not allowed in a server installation:')
+
+# Local defaults must not affect the test suite. In particular, a configured
+# IMPACT_DEFAULT_USGS_ID can overwrite the ID selected by a UI test.
+if TEST:
+    IMPACT_DEFAULT_USGS_ID = ''
+
+if SUPPRESS_PERMISSION_DENIED_WARNINGS:
+    class SuppressPermissionDeniedWarnings(logging.Filter):
+        def filter(self, record):
+            if 'Forbidden' in record.getMessage():
+                # Avoid warnings like "WARNING Forbidden: /v1/calc/list"
+                return False
+            return True
+
+    LOGGING['filters'] = {
+        'suppress_403_warnings': {
+            '()': SuppressPermissionDeniedWarnings,
+        },
+    }
+    LOGGING['handlers']['console']['filters'] = ['suppress_403_warnings']
+
+# NOTE: the OQ_APPLICATION_MODE environment variable, if defined, overrides
+# both the default setting and the one specified in the local settings
+APPLICATION_MODE = os.environ.get('OQ_APPLICATION_MODE', APPLICATION_MODE)
+
+if APPLICATION_MODE in ('RESTRICTED', 'AELO', 'IMPACT'):
+    LOCKDOWN = True
+
+STATIC_URL = f'{WEBUI_PATHPREFIX}/static/'
+
+if APPLICATION_MODE not in ('PUBLIC',):
+    if 'django.template.context_processors.request' not in CONTEXT_PROCESSORS:
+        CONTEXT_PROCESSORS.insert(
+            0, 'django.template.context_processors.request')
+        TEMPLATES[0]['OPTIONS']['context_processors'] = CONTEXT_PROCESSORS
+    # add installed_apps for cookie-consent
+    for app in ('django.contrib.auth', 'django.contrib.contenttypes',
+                'openquake.server.authorization',
+                'openquake.server.user_profile', 'cookie_consent',):
+        if app not in INSTALLED_APPS:
+            INSTALLED_APPS += (app,)
+    COOKIE_CONSENT_NAME = "cookie_consent"
+    COOKIE_CONSENT_MAX_AGE = 31536000  # 1 year in seconds
+    COOKIE_CONSENT_LOG_ENABLED = False
+
+if LOCKDOWN:
+    if TEST:
+        # NOTE: keep the setting if already specified
+        #       (e.g. in local_settings.py)
+        EMAIL_BACKEND = (
+            EMAIL_BACKEND
+            or 'django.core.mail.backends.filebased.EmailBackend')
+        # FIXME: this is mandatory, but it writes anyway in /tmp/app-messages.
+        #        We should redefine it to a different directory for each test,
+        #        in order to avoid concurrency issues in case tests run in
+        #        parallel
+        EMAIL_FILE_PATH = os.path.join(
+            config.directory.custom_tmp or tempfile.gettempdir(),
+            'app-messages')
+    else:
+        EMAIL_BACKEND = (
+            EMAIL_BACKEND or 'django.core.mail.backends.smtp.EmailBackend')
+    if APPLICATION_MODE == 'IMPACT':
+        ALLOW_DATASTORE_DOWNLOAD = False
+        EMAIL_HOST_USER = EMAIL_HOST_USER or 'impactnoreply@openquake.org'
+        EMAIL_SUPPORT = EMAIL_SUPPORT or 'impactsupport@openquake.org'
+    elif APPLICATION_MODE == 'AELO':
+        EMAIL_HOST_USER = EMAIL_HOST_USER or 'aelonoreply@openquake.org'
+        EMAIL_SUPPORT = EMAIL_SUPPORT or 'aelosupport@openquake.org'
+    else:
+        EMAIL_HOST_USER = EMAIL_HOST_USER or 'noreply@openquake.org'
+        EMAIL_SUPPORT = EMAIL_SUPPORT or 'support@openquake.org'
+
+    # NOTE: the following variables are needed to send pasword reset emails
+    #       using the createnormaluser Django command.
+    USE_HTTPS = True
+    SERVER_PORT = 443
+
+    if 'django.contrib.auth.context_processors.auth' not in CONTEXT_PROCESSORS:
+        CONTEXT_PROCESSORS.insert(
+            0, 'django.contrib.auth.context_processors.auth')
+        TEMPLATES[0]['OPTIONS']['context_processors'] = CONTEXT_PROCESSORS
+
+    if 'openquakeplatform.utils.oq_context_processor' in CONTEXT_PROCESSORS:
+        print('WARNING: OpenQuake Tools are not loaded because'
+              ' authentication is enabled.')
+        CONTEXT_PROCESSORS.remove(
+            'openquakeplatform.utils.oq_context_processor')
+        TEMPLATES[0]['OPTIONS']['context_processors'] = CONTEXT_PROCESSORS
+
+    # do not log to file unless running through the webui
+    if getpass.getuser() == WEBUI_USER:
+        try:
+            log_filename = os.path.join(WEBUI_ACCESS_LOG_DIR,  # NOQA
+                                        'webui-access.log')
+        except NameError:
+            # In case WEBUI_ACCESS_LOG_DIR is not defined, we use the standard
+            # handler, without logging to file
+            pass
+        else:
+            LOGGING['formatters']['timestamp'] = {
+                'format': (
+                    '%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+            }
+            LOGGING['handlers']['file'] = {
+                'level': 'DEBUG',
+                'class': 'logging.FileHandler',
+                'formatter': 'timestamp',
+                'filename': log_filename,
+                'mode': 'a'
+            }
+            LOGGING['loggers']['openquake.server.signals'] = {
+                'handlers': ['file'],
+                'level': 'DEBUG',
+                'propagate': False,
+            }
+
+    AUTHENTICATION_BACKENDS += (
+        'django.contrib.auth.backends.ModelBackend',
+        # 'dpam.backends.PAMBackend',
+    )
+
+    MIDDLEWARE += (
+        'django.contrib.sessions.middleware.SessionMiddleware',
+        'django.contrib.messages.middleware.MessageMiddleware',
+        'django.contrib.auth.middleware.AuthenticationMiddleware',
+        'openquake.server.middleware.LoginRequiredMiddleware',
+    )
+
+    for app in ('django.contrib.auth',
+                'django.contrib.contenttypes',
+                'openquake.server.user_profile',
+                'django.contrib.messages',
+                'django.contrib.sessions',
+                'django.contrib.admin',
+                'openquake.server.announcements',):
+        if app not in INSTALLED_APPS:
+            INSTALLED_APPS += (app,)
+
+    LOGIN_REDIRECT_URL = f'{WEBUI_PATHPREFIX}/engine/'
+    LOGOUT_REDIRECT_URL = f'{WEBUI_PATHPREFIX}/accounts/login/'
+    LOGIN_EXEMPT_URLS = (
+        f'{WEBUI_PATHPREFIX}/accounts/ajax_login/',
+        f'{WEBUI_PATHPREFIX}/v1/authentication/status',
+        'reset_password', 'reset/', 'cookies/',
+        'v0/', 'v1/calc_info/', 'v1/calc_list/count', 'v1/on_same_fs',
+        'v1/aelo_site_classes', 'v1/get_impact_form_defaults',
+    )
+    LOGIN_URL = f'{WEBUI_PATHPREFIX}/accounts/login/'
+
+    AUTH_PASSWORD_VALIDATORS = [
+        {'NAME': 'django.contrib.auth.password_validation.'
+                 'UserAttributeSimilarityValidator', },
+        {'NAME': 'django.contrib.auth.password_validation.'
+                 'MinimumLengthValidator', },
+        {'NAME': 'django.contrib.auth.password_validation.'
+                 'CommonPasswordValidator', },
+        {'NAME': 'django.contrib.auth.password_validation.'
+                 'NumericPasswordValidator', },
+    ]
+
+for app in OQP_INSTALLED_APPS:
+    if app not in INSTALLED_APPS:
+        INSTALLED_APPS += (app,)
+
+try:
+    # it is defined if it was specified in local_settings.py
+    # NOTE: if it is defined in local_settings.py it has priority over the
+    #       DJANGO_SECRET_KEY env variable and the ~/.oq_django_secret_key file
+    #       If in local_settings.py SECRET_KEY is defined as an empty string,
+    #       Django raises an ImproperlyConfigured exception.
+    SECRET_KEY  # noqa
+    logging.info('Using Django SECRET_KEY from local_settings.py')
+except NameError:
+    SECRET_KEY = get_or_create_django_secret_key()

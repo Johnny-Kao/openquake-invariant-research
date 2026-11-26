@@ -1,0 +1,5 @@
+#,,,,,,,"generated_by='OpenQuake engine 3.27.0-gitd5b9a21a20', start_date='2026-10-28T03:26:15', checksum=112580141, investigation_time=1.0, risk_investigation_time=50.0"
+asset_id,cresta,site_id,state,taxonomy,lon,lat,structural
+a2,0.11,0,01,tax1,-122.00000,38.10000,1.49983E+03
+a3,0.11,0,01,tax1,-122.00000,38.10000,8.66047E+02
+a1,0.11,1,01,tax1,-122.00000,38.11300,7.12855E+02

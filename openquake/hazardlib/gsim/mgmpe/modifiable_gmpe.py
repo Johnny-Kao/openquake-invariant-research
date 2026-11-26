@@ -1,0 +1,783 @@
+# -*- coding: utf-8 -*-
+# vim: tabstop=4 shiftwidth=4 softtabstop=4
+#
+# Copyright (C) 2020, GEM Foundation
+#
+# OpenQuake is free software: you can redistribute it and/or modify it
+# under the terms of the GNU Affero General Public License as published
+# by the Free Software Foundation, either version 3 of the License, or
+# (at your option) any later version.
+#
+# OpenQuake is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU Affero General Public License for more details.
+#
+# You should have received a copy of the GNU Affero General Public License
+# along with OpenQuake. If not, see <http://www.gnu.org/licenses/>.
+"""
+Module :mod:`openquake.hazardlib.mgmpe.modifiable_gmpe` implements
+:class:`~openquake.hazardlib.mgmpe.ModifiableGMPE`
+"""
+
+import toml
+import numpy as np
+from openquake.hazardlib.imt import PGA
+from openquake.hazardlib.gsim.base import GMPE, registry, CoeffsTable
+from openquake.hazardlib.const import StdDev
+from openquake.hazardlib.imt import from_string
+
+# Site terms imports
+from openquake.hazardlib.gsim.mgmpe.nrcan15_site_term import (
+    NRCan15SiteTerm, BA08_AB06)
+from openquake.hazardlib.gsim.chiou_youngs_2014 import ChiouYoungs2014
+from openquake.hazardlib.gsim.mgmpe.cy14_site_term import _get_cy14_site_term
+from openquake.hazardlib.gsim.mgmpe.ba08_site_term import _get_ba08_site_term
+from openquake.hazardlib.gsim.mgmpe.bssa14_site_term import (
+    _get_bssa14_site_term)
+from openquake.hazardlib.gsim.mgmpe import swiss_amplification
+
+# Basin terms imports
+from openquake.hazardlib.gsim.mgmpe.cb14_basin_term import _get_cb14_basin_term
+from openquake.hazardlib.gsim.mgmpe.m9_basin_term import _apply_m9_basin_term
+
+# CEUS 2020 site term imports
+from openquake.hazardlib.gsim.nga_east import (
+    TAU_EXECUTION, get_phi_ss, TAU_SETUP, PHI_SETUP, get_tau_at_quantile,
+    get_phi_ss_at_quantile)
+from openquake.hazardlib.gsim.usgs_ceus_2019 import get_stewart_2019_phis2s
+
+from openquake.hazardlib.gsim.mgmpe.stewart2020 import (
+    stewart2020_linear_scaling)
+from openquake.hazardlib.gsim.mgmpe.hashash2020 import (
+    hashash2020_non_linear_scaling)
+
+
+# Per-adjustment extra ctx and model requirements
+ADJUSTMENT_REQUIREMENTS = {
+    'ba08_site_term': {
+        'sites': {'vs30'},
+        'rupture': {'rake'},
+        'distances': {'rjb'},
+    },
+    'bssa14_site_term': {
+        'sites': {'vs30'},
+        'rupture': {'rake'},
+        'distances': {'rjb'},
+    },
+    'cy14_site_term': {'sites': {'vs30'}},
+    'nrcan15_site_term': {'sites': {'vs30'}},
+    'ceus2020_site_term': {'sites': {'vs30'}},
+    'cb14_basin_term': {'sites': {'z2pt5'}},
+    'm9_basin_term': {'sites': {'z2pt5'}},
+    'add_between_within_stds': {
+        'stddev_types': {StdDev.TOTAL,
+                         StdDev.INTRA_EVENT,
+                         StdDev.INTER_EVENT},
+    },
+    **swiss_amplification.ADJUSTMENT_REQUIREMENTS,
+    'set_between_epsilon': {
+        'requires_gmpe_stddev': StdDev.INTER_EVENT,
+    },
+    'set_total_std_as_tau_plus_delta': {
+        'requires_gmpe_stddev': StdDev.INTER_EVENT,
+    },
+}
+
+
+# ############## HANDLER FUNCTIONS FOR CONDITIONAL GMPES ################ #
+
+
+def compute_imts_subset(gmpe, imts, imts_comp, ctx_copy, mean, sig, tau, phi):
+    """
+    Compute mean and sigms only for the required imts, and then assign them
+    to their correct positions in the original mean, sig, tau and phi arrays.
+
+    In the context of conditional GMPEs, it is used to compute the means and
+    sigmas for the IMTs required for the conditional models using the
+    underlying GMPE the predictions will be conditioned upon.
+
+    NOTE: This function is also used in the indirect AvgSA GMPE classes to
+    compute the non-AvgSA IMTs (in the case that non-AvgSA IMTs have been
+    specified in the job file and the user wishes to use the specified GMPE
+    to also compute predictions for these IMTs too in a single calculation).
+    """
+    # Need to map original order of IMTs for reordering
+    imts_map = {imt: i for i, imt in enumerate(imts)}
+
+    # Compute the original mean and std devs for required IMTs
+    shp = (len(imts_comp), len(ctx_copy))
+    mean_t, sig_t, tau_t, phi_t = (
+        np.zeros(shp), np.zeros(shp), np.zeros(shp), np.zeros(shp))
+    gmpe.compute(
+        ctx_copy, imts_comp, mean_t, sig_t, tau_t, phi_t)
+    
+    # For instance in test case_90 one has
+    # imts_map = {PGA: 0, PGV: 1, IA: 2, SA(0.2): 3, SA(1.0): 4}
+    # and imts_base = {SA(1.0), SA(0.2), PGA}
+    # then `m` takes the values [4, 3, 0] for `idx` in [0, 1, 2]
+    for idx, imt in enumerate(imts_comp):
+        m = imts_map[imt]
+        mean[m] = mean_t[idx]
+        sig[m] = sig_t[idx]
+        tau[m] = tau_t[idx]
+        phi[m] = phi_t[idx]
+
+
+def conditional_gmpe_compute(self, imts, ctx_copy, mean, sig, tau, phi):
+    """
+    This function:
+        1) Compute the means and standard deviations for the IMTs
+           required by the conditional GMPEs.
+        2) Compute the means and standard deviations for the other IMTs
+    """
+    # Compute the means and std devs for IMTs required by conditional GMPEs
+    imts_req = self.imts_req
+    sh = (len(imts_req), len(ctx_copy))
+    mean_b, sig_b, tau_b, phi_b = (
+        np.zeros(sh), np.zeros(sh), np.zeros(sh), np.zeros(sh))
+    self.gmpe.compute(ctx_copy, imts_req, mean_b, sig_b, tau_b, phi_b)
+
+    # Store them for use in conditional GMPE(s) later
+    preds = self.params["conditional_gmpe"]["base_preds"] = {
+               imt.string: {} for imt in imts_req}  # imt -> stat -> array
+    for i, imt in enumerate(imts_req):
+        preds[imt.string]["mean"] = mean_b[i]
+        preds[imt.string]["sig"] = sig_b[i]
+        preds[imt.string]["tau"] = tau_b[i]
+        preds[imt.string]["phi"] = phi_b[i]
+        
+    # Might need underlying GSIM within conditional GMPEs compute method
+    # if has ctx-dependent conditioning periods
+    preds["base"] = self.gmpe
+
+    # Now get the IMTs we wish to compute using the underlying GSIM
+    imt_names = {imt.__name__ for imt in
+                self.gmpe.DEFINED_FOR_INTENSITY_MEASURE_TYPES}
+    imts_base = {imt for imt in imts if imt.name in imt_names}
+
+    # NOTE: 'imts_base' can be empty if all IMTs in job file will be
+    # computed using conditional GMPEs (e.g. classical/case_09 test
+    # where only IA from Macedo 2019 is required). In this case the
+    # the means and std devs will be returned as zeroed arrays
+    if imts_base:
+        compute_imts_subset(
+            self.gmpe, imts, imts_base, ctx_copy, mean, sig, tau, phi)
+    
+
+def conditional_gmpe(ctx, imt, me, si, ta, ph, **kwargs):
+    """
+    This function applies a conditional GMPE for the computing of the
+    ground-motion for the given intensity measure type.
+    """
+    # Get the conditional GMPE per IMT
+    conditional_gmpes = {k: v for k, v in kwargs.items() if k != "base_preds"}
+
+    # Get predictions per IMT required by the conditional GMPEs
+    base_preds = kwargs.get('base_preds')
+    
+    # If the imt is requested from a conditional gmpe... 
+    if imt.string in conditional_gmpes: 
+
+        # Get the conditional GMM specified for the given IMT
+        cond = conditional_gmpes[imt.string]["gsim"]
+
+        # Check that conditional GMPE supports the IMT we want to use it for
+        imt_names = {func.__name__ for func in cond.
+                     DEFINED_FOR_INTENSITY_MEASURE_TYPES}
+        if imt.name not in imt_names:
+            raise ValueError(
+                f"{cond.__class__.__name__} does not support {imt}")
+
+        # Check that we have required predictions from the underlying GMM
+        # for use in the conditional GMM
+        cond_imts = [imt_cond.string for imt_cond in cond.REQUIRES_IMTS]
+        missing = [imt_req for imt_req in cond_imts
+                   if imt_req not in base_preds]
+        if missing:
+            raise ValueError(
+                f"To use {cond.__class__.__name__} for the calculation "
+                f"of {imt}, the user must provide a GMM which is defined for "
+                f"the following IMTS: {cond_imts} (Missing = {missing})")
+
+        # Compute mean and sigma for IMT conditioned
+        me_c, sig_c, tau_c, phi_c = cond.compute(ctx, base_preds)
+
+        # Assign the mean and sigma of the conditioned GMPE
+        me[:] = me_c
+        si[:] = sig_c
+        ta[:] = tau_c
+        ph[:] = phi_c
+
+
+# ################ SITE TERMS AND BASIN TERMS ################## #
+
+
+SITE_TERMS = ["cy14_site_term",
+              "ba08_site_term",
+              "bssa14_site_term",
+              "nrcan15_site_term",
+              "ceus2020_site_term"]
+
+
+def nrcan15_site_term(ctx, imt, me, si, ta, ph, kind):
+    """
+    This function adds the NRCan15 site term to GMMs requiring it
+    """
+    C = NRCan15SiteTerm.COEFFS_BA08[imt]
+    C2 = NRCan15SiteTerm.COEFFS_AB06r[imt]
+    exp_mean = np.exp(me)
+    fa = BA08_AB06(kind, C, C2, ctx.vs30, imt, exp_mean)
+    me[:] = np.log(exp_mean * fa)
+
+
+def ceus2020_site_term(
+        ctx, imt, me, si, ta, phi, wimp, ref_vs30, ref_pga, usgs=False):
+    """
+    This function adds the Stewart et al. (2020; EQS) site term that uses as
+    a reference 760 m/s.
+
+    :param wimp:
+        The 'wimp' factor in eq. 5 of Stewart et al. (2020)
+    :param ref_vs30:
+        The reference Vs30 value
+    :param ref_pga:
+        The reference PGA value computed for a vs30 corresponding to `ref_vs30`
+    :param usgs:
+        If True, use the US 2023 NSHM variant of the site term: the USGS
+        F760 coefficients in the linear Stewart et al. (2020) scaling AND
+        the US 2023 NSHM form of the Hashash et al. (2020) nonlinear
+        term (0.5*f4 + 0.5*f4_mod averaging in use since the US 2023
+        NSHM release, plus the Vs30 floor at 200 m/s and PGA-rock cap at
+        1.0 g adopted by the US 2023 NSHM revisions in Powers et al.
+        (Earthquake Spectra, 2026)).
+    """
+    if not hasattr(ref_pga, '__len__'):
+        ref_pga = np.array([ref_pga])
+    assert len(ref_pga) == len(ctx.vs30)
+
+    # Compute the linear term
+    slin = stewart2020_linear_scaling(imt, ctx.vs30, wimp, usgs)
+
+    # Compute the nonlinear term
+    snlin = hashash2020_non_linear_scaling(
+        imt, ctx.vs30, ref_pga, ref_vs30, usgs=usgs)
+
+    # Final mean
+    me[:] += (slin + snlin)
+
+
+def ceus2020_setup(gmpe, ctx, params, n_sites):
+    """
+    Compute the reference PGA (natural log) at the CEUS2020 reference Vs30
+    using the underlying GMPE, needed by the CEUS2020 site term
+    """
+    ref = np.zeros((1, n_sites))
+    tmp = np.zeros((1, n_sites))
+
+    tctx = ctx.copy()
+    ref_vs30 = params['ceus2020_site_term']['ref_vs30']
+    tctx.vs30 = np.ones_like(tctx.vs30) * ref_vs30
+    timt = (PGA(),)
+
+    gmpe.compute(tctx, timt, ref, tmp, tmp, tmp)
+
+    return np.squeeze(ref)
+
+
+def cy14_site_term(ctx, imt, me, si, ta, phi):
+    """
+    This function adds the CY14 site term to GMMs requiring it.
+    """
+    C = ChiouYoungs2014.COEFFS[imt]
+    fa = _get_cy14_site_term(C, ctx.vs30, me)  # Ref mean must be in nat log
+    me[:] += fa
+
+
+def ba08_site_term(ctx, imt, me, si, ta, phi):
+    """
+    This function adds the BA08 site term to GMMs requiring it.
+    """
+    me[:] += _get_ba08_site_term(imt, ctx)
+
+
+def bssa14_site_term(ctx, imt, me, si, ta, phi):
+    """
+    This function adds the BSSA14 site term to GMMs requiring it.
+    """
+    me[:] += _get_bssa14_site_term(imt, ctx)
+
+
+def apply_swiss_amplification(ctx, imt, me, si, ta, ph):
+    """
+    Adds the Swiss amplfactor to the log mean.
+    """
+    me[:] += ctx.amplfactor
+
+
+def apply_swiss_amplification_sa(ctx, imt, me, si, ta, ph):
+    """
+    Legacy Swiss SA amplification at 0.3 and 0.6 s with intra-event correction.
+    """
+    swiss_amplification._apply_swiss_amplification_sa(
+        ctx, imt, me, si, ta, ph)
+
+
+def apply_swiss_site_specific_amplification_sa(
+        ctx, imt, me, si, ta, ph,
+        periods=swiss_amplification.SWISS_SITE_SPECIFIC_PERIODS):
+    """
+    Applies supplied natural-log site corrections at selected SA periods.
+    """
+    swiss_amplification._apply_swiss_site_specific_amplification_sa(
+        ctx, imt, me, si, ta, ph, periods)
+
+
+def cb14_basin_term(ctx, imt, me, si, ta, phi):
+    """
+    This function adds the CB14 basin term to GMMs requiring it.
+    """
+    me[:] += _get_cb14_basin_term(imt, ctx)
+
+
+def m9_basin_term(ctx, imt, me, si, ta, phi):
+    """
+    This function applies the M9 basin adjustment
+    """
+    me = _apply_m9_basin_term(ctx, imt, me)
+
+
+# ################ FUNCTIONS MODIFYING mean_stds ################## #
+
+
+IMT_DEPENDENT_ADJ = ["set_scale_median_vector",
+                     "set_scale_total_sigma_vector",
+                     "set_fixed_total_sigma"]
+
+
+def sigma_model_alatik2015(ctx, imt, me, si, ta, ph,
+                           ergodic, tau_model, phi_ss_coetab, tau_coetab):
+    """
+    This function uses the sigma model of Al Atik (2015) as the standard
+    deviation of a specified GMPE
+    """
+    phi = get_phi_ss(imt, ctx.mag, phi_ss_coetab)
+    if ergodic:
+        phi_s2s = get_stewart_2019_phis2s(imt, ctx.vs30)
+        phi = np.sqrt(phi ** 2. + phi_s2s ** 2.)
+    tau = TAU_EXECUTION[tau_model](imt, ctx.mag, tau_coetab)
+    si[:] = np.sqrt(tau ** 2. + phi ** 2.)
+    ta[:] = tau
+    ph[:] = phi
+
+
+def alatik2015_setup(params):
+    """
+    Resolve tau and phi_ss coefficient tables for sigma_model_alatik2015
+    from the user-supplied params, filling in defaults for ergodic,
+    tau_model and phi_model.
+    """
+    key = 'sigma_model_alatik2015'
+
+    # Phi S2SS and ergodic param
+    # params[key]['phi_s2ss'] = None
+    params[key]['ergodic'] = params[key].get("ergodic", True)
+
+    # Tau
+    tau_model = params[key].get("tau_model", "global")
+    if "tau_model" not in params:
+        params[key]['tau_model'] = tau_model
+    tau_quantile = params[key].get("tau_quantile", None)
+    params[key]['tau_coetab'] = get_tau_at_quantile(
+        TAU_SETUP[tau_model]["MEAN"],
+        TAU_SETUP[tau_model]["STD"],
+        tau_quantile)  # NB: this a dict an not a CoeffsTable :-/
+
+    # Phi SS
+    phi_model = params[key].get("phi_model", "global")
+    if "phi_model" in params:
+        del params[key]["phi_model"]
+    phi_ss_quantile = params[key].get("phi_ss_quantile", None)
+    params[key]['phi_ss_coetab'] = get_phi_ss_at_quantile(
+        PHI_SETUP[phi_model], phi_ss_quantile)
+
+
+def add_between_within_stds(ctx, imt, me, si, ta, ph, with_betw_ratio):
+    """
+    This adds the between and within standard deviations to a model which has
+    only the total standard deviation. This function requires a ratio between
+    the within-event standard deviation and the between-event one.
+
+    :param with_betw_ratio:
+        The ratio between the within and between-event standard deviations
+    """
+    ta[:] = (si**2 / (1 + with_betw_ratio**2))**0.5
+    ph[:] = with_betw_ratio * ta
+
+
+def set_between_epsilon(ctx, imt, me, si, ta, ph, epsilon_tau):
+    """
+    :param epsilon_tau:
+        the epsilon value used to constrain the between event variability
+    """
+    # index for the between event standard deviation
+    me[:] += epsilon_tau * ta
+
+    # set between event variability to 0
+    ta[:] = 0
+
+    # set total variability equal to the within-event one
+    si[:] = ph
+
+
+def set_scale_median_scalar(ctx, imt, me, si, ta, ph, scaling_factor):
+    """
+    :param scaling_factor:
+        Simple scaling factor (in linear space) to increase/decrease median
+        ground motion, which applies to all IMTs
+    """
+    me[:] += np.log(scaling_factor)
+
+
+def set_scale_median_vector(ctx, imt, me, si, ta, ph, scaling_factor):
+    """
+    :param scaling_factor:
+        IMT-dependent median scaling factors (in linear space) as
+        a CoeffsTable
+    """
+    me[:] += np.log(scaling_factor[imt]["scaling_factor"])
+
+
+def set_scale_total_sigma_scalar(ctx, imt, me, si, ta, ph, scaling_factor):
+    """
+    Scale the total standard deviations by a constant scalar factor
+    :param scaling_factor:
+        Factor to scale the standard deviations
+    """
+    si[:] *= scaling_factor
+
+
+def set_scale_total_sigma_vector(ctx, imt, me, si, ta, ph, scaling_factor):
+    """
+    Scale the total standard deviations by a IMT-dependent scalar factor
+    :param scaling_factor:
+        IMT-dependent total standard deviation scaling factors as a
+        CoeffsTable
+    """
+    si[:] *= scaling_factor[imt]["scaling_factor"]
+
+
+def set_fixed_total_sigma(ctx, imt, me, si, ta, ph, total_sigma):
+    """
+    Sets the total standard deviations to a fixed value per IMT
+    :param total_sigma:
+        IMT-dependent total standard deviation as a CoeffsTable
+    """
+    si[:] = total_sigma[imt]["total_sigma"]
+
+
+def add_delta_to_total_std_scalar(ctx, imt, me, si, ta, ph, delta):
+    """
+    :param delta:
+        A delta e.g. a phi S2S to be removed from total GMM sigma
+        across all IMTs (IMT-constant)
+    """
+    # First check if adjusted sigma would be negative
+    new_sig = np.sqrt(si**2 + np.sign(delta) * delta**2)
+    if np.any(np.isnan(new_sig)):
+        raise ValueError(
+            f"delta={delta} produces a negative GMM (total) sigma - "
+            f"minimum GMM sigma would be {new_sig.min():.6f}"
+        )
+
+    # Adjust sigma
+    si[:] = new_sig
+
+
+def add_delta_to_tau_std_scalar(ctx, imt, me, si, ta, ph, delta):
+    """
+    :param delta:
+        A delta to be applied to tau across all IMTs (IMT-constant)
+    """
+    # First check if adjusted tau would be negative
+    new_tau = np.sqrt(ta**2 + np.sign(delta) * delta**2)
+    if np.any(np.isnan(new_tau)):
+        raise ValueError(
+            f"delta={delta} produces a negative tau - "
+            f"minimum tau would be {new_tau.min():.3f}"
+        )
+
+    # Adjust tau
+    ta[:] = new_tau
+
+    # Need to adjust total sig too after adjusting tau
+    si[:] = np.sqrt(ta**2 + ph**2)
+
+
+def add_delta_to_phi_std_scalar(ctx, imt, me, si, ta, ph, delta):
+    """
+    :param delta:
+        A delta to be applied to phi across all IMTs (IMT-constant)
+    """
+    # First check if adjusted phi would be negative
+    new_phi = np.sqrt(ph**2 + np.sign(delta) * delta**2)
+    if np.any(np.isnan(new_phi)):
+        raise ValueError(
+            f"delta={delta} produces a negative phi - "
+            f"minimum phi would be {new_phi.min():.3f}"
+        )
+
+    # Adjust phi
+    ph[:] = new_phi
+
+    # Need to adjust total sig too after adjusting phi
+    si[:] = np.sqrt(ta**2 + ph**2)
+
+
+def add_delta_to_total_std_vector(ctx, imt, me, si, ta, ph, delta):
+    """
+    :param delta:
+        A dictionary of IMT-dependent deltas to be applied to total GMM
+        sigma for a given IMT. 
+    """
+    # First check if adjusted sigma would be negative for given IMT
+    sig_delta = delta[imt.string]
+    new_sig = np.sqrt(si**2 + np.sign(sig_delta) * sig_delta**2)
+    if np.any(np.isnan(new_sig)):
+        raise ValueError(
+            f"delta={sig_delta} for {imt} produces a negative total sigma "
+            f"- minimum sigma for {imt} would be {new_sig.min():.6f}"
+        )
+
+    # Adjust total sigma for given IMT
+    si[:] = new_sig
+
+
+def add_delta_to_tau_std_vector(ctx, imt, me, si, ta, ph, delta):
+    """
+    :param delta:
+        A dictionary of IMT-dependent deltas to be applied to tau for
+        a given IMT.
+    """
+    # First check if adjusted tau would be negative for given IMT
+    delta = delta[imt.string]
+    new_tau = np.sqrt(ta**2 + np.sign(delta) * delta**2)
+    if np.any(np.isnan(new_tau)):
+        raise ValueError(
+            f"delta={delta} for {imt} produces a negative tau - "
+            f"minimum tau for {imt} would be {new_tau.min():.3f}"
+        )
+
+    # Adjust tau for given IMT
+    ta[:] = new_tau
+
+    # Need to adjust total sig too after adjusting tau for given IMT
+    si[:] = np.sqrt(ta**2 + ph**2)
+
+
+def add_delta_to_phi_std_vector(ctx, imt, me, si, ta, ph, delta):
+    """
+    :param delta:
+        A dictionary of IMT-dependent deltas to be applied to phi for
+        a given IMT.
+    """
+    # First check if adjusted phi would be negative for given IMT
+    delta = delta[imt.string]
+    new_phi = np.sqrt(ph**2 + np.sign(delta) * delta**2)
+    if np.any(np.isnan(new_phi)):
+        raise ValueError(
+            f"delta={delta} for {imt} produces a negative phi - "
+            f"minimum phi for {imt} would be {new_phi.min():.3f}"
+        )
+
+    # Adjust phi for given IMT
+    ph[:] = new_phi
+
+    # Need to adjust total sig too after adjusting phi for given IMT
+    si[:] = np.sqrt(ta**2 + ph**2)
+
+
+def set_total_std_as_tau_plus_delta(ctx, imt, me, si, ta, ph, delta):
+    """
+    :param delta:
+        A delta std e.g. a phi SS to be combined with between std, tau.
+    """
+    si[:] = (ta[2]**2 + np.sign(delta) * delta**2)**0.5
+
+
+# ################ FUNCTIONS FOR SETUP ################## #
+
+
+def set_ref_ctx(ctx, params):
+    """
+    Return a ctx with vs30 replaced by a rock reference Vs30 when a site
+    term is specified or the original ctx unchanged if no site term is
+    configured.
+    """
+    if not any(sm in params for sm in SITE_TERMS):
+        return ctx
+    ctx_copy = ctx.copy()
+    rock_vs30 = 1130. if 'cy14_site_term' in params else 760.
+    ctx_copy.vs30 = np.full_like(ctx.vs30, rock_vs30)  # rock
+
+    return ctx_copy
+
+
+def _dict_to_coeffs_table(input_dict, name):
+    """
+    Transform a dictionary of parameters organised by IMT into a
+    coefficient table
+    """
+    coeff_dict = {from_string(k): {name: input_dict[k]} for k in input_dict}
+    return {name: CoeffsTable.fromdict(coeff_dict)}
+
+
+def init_underlying_gmpes(cond_gmpe_by_imt):
+    """
+    :param cond_gmpe_by_imt: dictionary describing a conditional GMPE
+    """
+    # NB: in classical/case_90 cond_gmpe_by_imt is the dictionary
+    # {'IA': {'gmpe': {'MacedoEtAl2019SInter': {'region': 'Japan'}}},
+    #  'PGV': {'gmpe': {'AbrahamsonBhasin2020PGA': {}}}}
+
+    # Get each conditional GMM's required IMTs and also instantiate them
+    imts_req = set()
+    for imt in cond_gmpe_by_imt:
+        if imt == "base_preds":
+            continue
+
+        # Instantiate here and store for later
+        [(gmpe_name, kw)] = cond_gmpe_by_imt[imt]["gmpe"].items()
+        cond = registry[gmpe_name](**kw)
+        cond.from_mgmpe = True
+        if not hasattr(cond, "REQUIRES_IMTS"):
+            raise ValueError(f"{cond.__class__.__name__} lacks the "
+                             f"REQUIRES_IMTS attribute - this is "
+                             f"required for a conditional GMPE's "
+                             f"OpenQuake Engine implementation.")
+        if not cond.conditional:
+            raise ValueError(f"{cond.__class__.__name__} is not a "
+                             f"conditional GMPE - it cannot be used "
+                             f"in ModifiableGMPE as a GMPE to predict "
+                             f"conditioned ground-motions for {imt}.")
+
+        cond_gmpe_by_imt[imt]["gsim"] = cond
+
+        # Add each required IMT so we compute all using underlying GMM once
+        imts_req.update(cond.REQUIRES_IMTS)
+
+    return sorted(imts_req)
+
+
+class ModifiableGMPE(GMPE):
+    """
+    This is a class to modify an underlying GMPE.
+    It should NEVER be instantiated directly; users should call
+    hazardlib.valid.modifiable_gmpe(gmpe, **kwargs) instead.
+    """
+    REQUIRES_SITES_PARAMETERS = set()
+    REQUIRES_DISTANCES = set()
+    REQUIRES_RUPTURE_PARAMETERS = set()
+    DEFINED_FOR_INTENSITY_MEASURE_TYPES = set()
+    DEFINED_FOR_INTENSITY_MEASURE_COMPONENT = ''
+    DEFINED_FOR_STANDARD_DEVIATION_TYPES = {StdDev.TOTAL}
+    DEFINED_FOR_TECTONIC_REGION_TYPE = ''
+    DEFINED_FOR_REFERENCE_VELOCITY = None
+
+    def __init__(self, **kwargs):
+        # Create the original GMPE
+        _toml = toml.dumps(kwargs['gmpe'])
+        [(gmpe_name, kw)] = kwargs.pop('gmpe').items()
+        self.params = kwargs  # non-gmpe parameters
+        g = globals()
+        for k in self.params:
+            if k not in g:
+                raise ValueError('Unknown %r in ModifiableGMPE' % k)
+        self.gmpe = registry[gmpe_name](**kw)
+        self.gmpe._toml = _toml
+        if hasattr(self.gmpe, 'gmpe_table'):
+            self.gmpe_table = self.gmpe.gmpe_table
+        self.set_parameters()
+
+        self.REQUIRES_SITES_PARAMETERS |= (
+            swiss_amplification.get_site_parameters(self.params))
+
+        # Validate the underlying GMPE against per-adjustment requirements
+        for meth in self.params:
+            req_stddev = ADJUSTMENT_REQUIREMENTS.get(
+                meth, {}).get('requires_gmpe_stddev')
+            if (req_stddev is not None and req_stddev not in
+                    self.gmpe.DEFINED_FOR_STANDARD_DEVIATION_TYPES):
+                raise ValueError(
+                    f'{self.gmpe} does not have {req_stddev} std')
+
+        # Apply per-adjustment ctx and model requirements
+        for meth in self.params:
+            reqs = ADJUSTMENT_REQUIREMENTS.get(meth, {})
+            if 'gmpe_sites' in reqs:
+                self.gmpe.REQUIRES_SITES_PARAMETERS = reqs['gmpe_sites']
+            for sp in reqs.get('sites', ()):
+                if sp not in self.gmpe.REQUIRES_SITES_PARAMETERS:
+                    self.REQUIRES_SITES_PARAMETERS |= {sp}
+            for rp in reqs.get('rupture', ()):
+                if rp not in self.gmpe.REQUIRES_RUPTURE_PARAMETERS:
+                    self.REQUIRES_RUPTURE_PARAMETERS |= {rp}
+            for dp in reqs.get('distances', ()):
+                if dp not in self.gmpe.REQUIRES_DISTANCES:
+                    self.REQUIRES_DISTANCES |= {dp}
+            if 'stddev_types' in reqs:
+                self.DEFINED_FOR_STANDARD_DEVIATION_TYPES = (
+                    reqs['stddev_types'])
+
+        # Resolve tau and phi_ss coefficient tables for Al Atik (2015)
+        if 'sigma_model_alatik2015' in self.params:
+            alatik2015_setup(self.params)
+
+        # Set params
+        for key in self.params:
+            if key in IMT_DEPENDENT_ADJ:
+                # If the modification is period-dependent
+                for subkey in self.params[key]:
+                    if isinstance(self.params[key][subkey], dict):
+                        self.params[key] = _dict_to_coeffs_table(
+                            self.params[key][subkey], subkey)
+
+    def compute(self, ctx: np.recarray, imts, mean, sig, tau, phi):
+        """
+        See :meth:`superclass method
+        <.base.GroundShakingIntensityModel.compute>`
+        for spec of input and result values.
+        """
+        # Set reference Vs30 if required
+        ctx_copy = set_ref_ctx(ctx, self.params)
+
+        # If necessary, compute the means and std devs for the required
+        # IMTs that are not going to be calculated using conditional GMPEs 
+        if "conditional_gmpe" in self.params:
+            if not hasattr(self, 'imts_req'):
+                self.imts_req = init_underlying_gmpes(
+                    self.params["conditional_gmpe"])
+            conditional_gmpe_compute(self, imts, ctx_copy, mean, sig, tau, phi)
+        else:
+            # otherwise, compute the original mean and std devs for all IMTs
+            self.gmpe.compute(ctx_copy, imts, mean, sig, tau, phi)
+
+        # Compute reference PGA for the CEUS2020 site term
+        if 'ceus2020_site_term' in self.params:
+            ref = ceus2020_setup(self.gmpe, ctx, self.params, len(sig[0]))
+
+        # Apply sequentially the modifications
+        g = globals()
+        for methname, kw in self.params.items():
+
+            # CEUS 2020 site term needs ref PGA stored
+            if methname in ['ceus2020_site_term']:
+                kw['ref_pga'] = np.exp(ref)
+
+            # Conditional GMPEs
+            if methname in ["conditional_gmpe"]:
+                kw['base_preds'] = self.params["conditional_gmpe"]["base_preds"]
+                
+            for m, imt in enumerate(imts):
+                me, si, ta, ph = mean[m], sig[m], tau[m], phi[m]
+                g[methname](ctx, imt, me, si, ta, ph, **kw)

@@ -1,0 +1,43 @@
+<?xml version="1.0" encoding="utf-8"?>
+<nrml
+xmlns="http://openquake.org/xmlns/nrml/0.5"
+xmlns:gml="http://www.opengis.net/gml"
+>
+    <sourceModel
+    name="Example Source Model Containing a Point Source"
+    >
+        <sourceGroup
+        name="group 2"
+        tectonicRegion="Stable Continental Crust"
+        >
+            <pointSource
+            id="first"
+            name="Point Source"
+            tectonicRegion="Stable Continental Crust"
+            >
+                <pointGeometry>
+                    <gml:Point>
+                        <gml:pos>-1.0000000E-01 -3.0000000E-01</gml:pos>
+                    </gml:Point>
+                    <upperSeismoDepth>0</upperSeismoDepth>
+                    <lowerSeismoDepth>15</lowerSeismoDepth>
+                </pointGeometry>
+                <magScaleRel>
+                    WC1994
+                </magScaleRel>
+                <ruptAspectRatio>
+                    1.0000000E+00
+                </ruptAspectRatio>
+                <truncGutenbergRichterMFD aValue="4.5000000E+00" bValue="1.0000000E+00" maxMag="7.0000000E+00" minMag="5.0000000E+00"/>
+                <nodalPlaneDist>
+                    <nodalPlane dip="90" probability="1" rake="0" strike="0"/>
+                </nodalPlaneDist>
+                <hypoDepthDist>
+                  <hypoDepth depth="5" probability=".2"/>
+                  <hypoDepth depth="10" probability=".6"/>
+                  <hypoDepth depth="15" probability=".2"/>
+                </hypoDepthDist>
+            </pointSource>
+        </sourceGroup>
+    </sourceModel>
+</nrml>

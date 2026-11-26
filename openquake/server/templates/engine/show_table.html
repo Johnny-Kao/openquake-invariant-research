@@ -1,0 +1,85 @@
+{% extends "engine/base.html" %}
+{% load servertags %}
+<title>{% block title %}OpenQuake engine: {{ table_name }} from calculation {{ calc_id }}{% endblock %}</title>
+
+{% block nav-items %}
+{{ block.super }}
+              <li class="calc">
+                  <a href="{% url "index" %}">Back to Calculations</a>
+              </li>
+{% endblock nav-items %}
+
+{% block main %}
+{{ block.super }}
+  <div class="content-wrap">
+    <div class="container">
+      <div class="row">
+        <div id="oq-body-wrapper">
+          <div class="span12">
+            <h2>{{ table_name }}</h2>
+            <table id="extracted_html_table">
+              <thead>
+                <tr>
+                  {% for header in table_header %}
+                  <th class="sortable-table-header"
+                      data-column-index="{{ forloop.counter0 }}"
+                      tabindex="0" aria-sort="none">
+                    {{ header|safe }}
+                    <span class="sort-indicator" aria-hidden="true"></span>
+                  </th>
+                  {% endfor %}
+                </tr>
+              </thead>
+              <tbody>
+                {% for row in table_rows %}
+                <tr>
+                {% for cell in row %}
+                    {% if forloop.first %}
+                    <td data-sort-type="{{ cell.sort_type }}"
+                        data-sort-value="{{ cell.sort_value }}">{{ cell.display_value|stringformat:"s"|linebreaksbr }}</td>
+                    {% elif cell.is_string %}
+                    <td data-sort-type="{{ cell.sort_type }}"
+                        data-sort-value="{{ cell.sort_value }}">{{ cell.display_value|stringformat:"s"|linebreaksbr }}</td>
+                    {% else %}
+                    {% if cell.display_value|stringformat:"s"|floatformat %}
+                      <td style="text-align: right;"
+                          data-sort-type="{{ cell.sort_type }}"
+                          data-sort-value="{{ cell.sort_value }}">{{ cell.display_value|humanize_number }}</td>
+                    {% else %}
+                      <td data-sort-type="{{ cell.sort_type }}"
+                          data-sort-value="{{ cell.sort_value }}">{{ cell.display_value|stringformat:"s"|linebreaksbr }}</td>
+                    {% endif %}
+                    {% endif %}
+                {% endfor %}
+                </tr>
+                {% endfor %}
+              </tbody>
+            </table>
+            {% if internal_name == 'aggrisk_tags' %}
+            <div id="summary-btn">
+              {% if is_summary %}
+              <a href="{{ oq_engine_server_url }}/v1/calc/{{ calc_id }}/extract_html_table/aggrisk_tags?summarize=0" class="btn btn-sm">Show full table</a>
+              <hr/>
+              <h4>Definitions</h4>
+              <ul>
+                {% for item in field_explanations %}
+                <li><strong>{{ item.description }}:</strong> {{ item.explanation|safe }}</li>
+                {% endfor %}
+              </ul>
+              {% else %}
+              <a href="{{ oq_engine_server_url }}/v1/calc/{{ calc_id }}/extract_html_table/aggrisk_tags?summarize=1" class="btn btn-sm">Show summary</a>
+              {% endif %}
+            </div>
+            {% endif %}
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+{% endblock main %}
+
+{% block extra_script %}
+{{ block.super }}
+<script type="text/javascript" src="{{ STATIC_URL }}js/extracted_table.js"></script>
+{% endblock extra_script %}

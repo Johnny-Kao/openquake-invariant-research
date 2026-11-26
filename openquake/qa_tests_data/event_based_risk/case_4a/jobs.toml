@@ -1,0 +1,23 @@
+[multi.workflow]
+description = "multi-workflow"
+env.OQ_SAMPLE_ASSETS = 1
+may_fail = ["riskJob"]
+override = {out_file="SES.hdf5", hazard_calculation_id="SES.hdf5"}
+
+[hazard.Job]
+ini = "job_hazard.ini"
+mosaic_model = "USA"
+ground_motion_fields = false
+number_of_logic_tree_samples = 10
+
+[hazard.success]
+func = "openquake.engine.postjobs.build_ses"
+out_file = "ses.hdf5"
+
+[risk.Job]
+ini = "job_risk.ini"
+hazard_calculation_id = "ses.hdf5"
+
+[risk.success]
+func = "openquake.engine.postjobs.import_outputs"
+out_types = ["aggexp_tags", "aggrisk", "avg_losses_by", "aggcurves"]

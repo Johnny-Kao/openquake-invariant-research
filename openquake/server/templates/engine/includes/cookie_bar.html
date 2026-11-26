@@ -1,0 +1,62 @@
+{% load static %}
+{% load cookie_consent_tags %}
+{% load servertags %}
+{% if request|cookie_consent_enabled %}
+    {% no_optional_cookie_groups_except_hide_cookie_bar_exist request as no_optional_groups %}
+    {% hide_cookie_bar_accepted request as hide_cookie_bar %}
+    {# NOTE: checking only the undecided cookie groups would not display the cookie bar if only required cookie groups are present #}
+    {% if not request|all_cookies_accepted and not hide_cookie_bar %}
+        {% url "cookie_consent_cookie_group_list" as url_cookies %}
+        {% url "cookie_consent_status" as status_url %}
+        {% static "cookie_consent/cookiebar.module.js" as cookiebar_src %}
+        {# emits <script type="application/json" id="cookie-consent__cookie-groups">, read by showCookieBar #}
+        {% all_cookie_groups "cookie-consent__cookie-groups" %}
+        <template id="cookie-consent__cookie-bar">
+            {% if no_optional_groups %}
+            <div class="cookie-bar">This site needs essential cookies to function properly. <a href="#" class="cc-cookie-accept">Accept and continue</a> <a href="#" class="cc-cookie-decline" style="display: none;">Decline</a> <a href="{{ url_cookies }}">Cookies info</a></div>
+            {% else %} {# at least one group of optional cookies exists #}
+            <div class="cookie-bar">This site uses cookies for better performance and user experience. <a href="#" class="cc-cookie-accept">Accept all and continue</a> <a href="#" class="cc-cookie-decline">Decline all</a> <a href="{{ url_cookies }}">Customize cookies</a></div>
+            {% endif %}
+        </template>
+        <script type="module">
+            // The cookie bar is shown only if some cookie groups were neither
+            // accepted nor declined. Accepting or declining is sent to the
+            // server with a POST request, including the CSRF token provided
+            // by the status endpoint, and the server sets the consent cookie.
+            import {showCookieBar} from '{{ cookiebar_src|escapejs }}';
+            const body = document.querySelector('body');
+            showCookieBar({
+                statusUrl: '{{ status_url|escapejs }}',
+                templateSelector: '#cookie-consent__cookie-bar',
+                cookieGroupsSelector: '#cookie-consent__cookie-groups',
+                acceptSelector: '.cc-cookie-accept',
+                declineSelector: '.cc-cookie-decline',
+                onShow: () => body.classList.add('with-cookie-bar'),
+                onAccept: () => body.classList.remove('with-cookie-bar'),
+                onDecline: (declinedGroups, event) => {
+                    body.classList.remove('with-cookie-bar');
+                    if (event === undefined) {
+                        return;  // called on page load, not by a click
+                    }
+                    /* We may want to logout the user when pressing 'Decline all'
+                    const csrftoken = getCookie('csrftoken');
+                    fetch("{#{% url 'logout' %}#}", {
+                        method: 'POST',
+                        headers: {
+                            'Content-Type': 'application/json',
+                            'X-CSRFToken': csrftoken
+                        },
+                    }).then(response => {
+                        if (response.ok) {
+                            window.location.href = '/'; // Redirect to the homepage
+                        } else {
+                            console.error('Logout failed');
+                        }
+                    })
+                    .catch(error => console.error('Error:', error));
+                    */
+                },
+            });
+        </script>
+    {% endif %}
+{% endif %}

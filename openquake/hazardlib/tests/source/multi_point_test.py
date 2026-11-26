@@ -1,0 +1,128 @@
+# -*- coding: utf-8 -*-
+# vim: tabstop=4 shiftwidth=4 softtabstop=4
+#
+# Copyright (C) 2017-2026 GEM Foundation
+#
+# OpenQuake is free software: you can redistribute it and/or modify it
+# under the terms of the GNU Affero General Public License as published
+# by the Free Software Foundation, either version 3 of the License, or
+# (at your option) any later version.
+#
+# OpenQuake is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU Affero General Public License for more details.
+#
+# You should have received a copy of the GNU Affero General Public License
+# along with OpenQuake.  If not, see <http://www.gnu.org/licenses/>.
+import unittest
+import numpy
+from openquake.baselib import hdf5, general
+from openquake.hazardlib.sourcewriter import obj_to_node
+from openquake.hazardlib.mfd.multi_mfd import MultiMFD
+from openquake.hazardlib.source.multi_point import MultiPointSource
+from openquake.hazardlib.geo.mesh import Mesh
+from openquake.hazardlib.scalerel.peer import PeerMSR
+from openquake.hazardlib.geo import NodalPlane
+from openquake.hazardlib.pmf import PMF
+
+
+class MultiPointTestCase(unittest.TestCase):
+
+    def test_old_constructor_signature(self):
+        old_args = ('mp1', 'test', 'Active Shallow Crust', None,
+                    PeerMSR(), 1.0, 0, 20, None, None, None)
+        for args in (old_args, old_args + (None,)):
+            with self.subTest(num_args=len(args)):
+                with self.assertRaisesRegex(
+                        TypeError, 'insert rupture_mesh_spacing.*'
+                        'temporal_occurrence_model immediately after '
+                        'rupture_aspect_ratio'):
+                    MultiPointSource(*args)
+
+    def test(self):
+        npd = PMF([(0.5, NodalPlane(1, 20, 3)),
+                   (0.5, NodalPlane(2, 2, 4))])
+        hd = PMF([(1, 14)])
+        mesh = Mesh(numpy.array([0, 1]), numpy.array([0.5, 1]))
+        mmfd = MultiMFD('incrementalMFD',
+                        size=2,
+                        min_mag=[4.5],
+                        bin_width=[2.0],
+                        occurRates=[[.3, .1], [.4, .2, .1]])
+        mps = MultiPointSource('mp1', 'multi point source',
+                               'Active Shallow Crust',
+                               mmfd, None, PeerMSR(), 1.0, None,
+                               10, 20, npd, hd, mesh)
+        # test the splitting
+        splits = list(mps)
+        self.assertEqual(len(splits), 2)
+        for split in splits:
+            self.assertEqual(split.ts_samples, mps.ts_samples)
+
+        got = obj_to_node(mps).to_str()
+        print(got)
+        exp = '''\
+multiPointSource{id='mp1', name='multi point source'}
+  multiPointGeometry
+    gml:posList [0.0, 0.5, 1.0, 1.0]
+    upperSeismoDepth 10
+    lowerSeismoDepth 20
+  magScaleRel 'PeerMSR'
+  ruptAspectRatio 1.0
+  multiMFD{kind='incrementalMFD', size=2}
+    bin_width [2.0]
+    min_mag [4.5]
+    occurRates [0.3, 0.1, 0.4, 0.2, 0.1]
+    lengths [2, 3]
+  nodalPlaneDist
+    nodalPlane{dip=20, probability=0.5, rake=3, strike=1}
+    nodalPlane{dip=2, probability=0.5, rake=4, strike=2}
+  hypoDepthDist
+    hypoDepth{depth=14, probability=1.0}
+'''
+        self.assertEqual(got, exp)
+
+        # test serialization to and from hdf5
+        tmp = general.gettemp(suffix='.hdf5')
+        with hdf5.File(tmp, 'w') as f:
+            f[mps.source_id] = mps
+        with hdf5.File(tmp, 'r') as f:
+            f[mps.source_id]
+
+        # test the bounding box
+        bbox = mps.get_bounding_box(maxdist=100)
+        numpy.testing.assert_almost_equal(
+            (-0.8994569916564479, -0.39932, 1.8994569916564479, 1.89932),
+            bbox)
+
+    def test_hypo_dip_fracs_passed_to_point_sources(self):
+        # hypo_dip_fracs propagates to every PointSource from __iter__
+        fracs = (0.5, 2 / 3)
+        hd = PMF([(0.5, 5), (0.5, 14)])
+        npd = PMF([(1, NodalPlane(0, 60, 90))])
+        mesh = Mesh(numpy.array([0., 1.]), numpy.array([0., 0.]))
+        mmfd = MultiMFD('incrementalMFD', size=2, min_mag=[4.5],
+                        bin_width=[1.0], occurRates=[[0.1], [0.2]])
+        hd.hypo_dip_fracs = fracs
+        mps = MultiPointSource('mp2', 'test', 'Active Shallow Crust',
+                               mmfd, None, PeerMSR(), 1.0, None,
+                               0, 20, npd, hd, mesh)
+        for ps in mps:
+            self.assertEqual(ps.hypo_dip_fracs, fracs)
+
+    def test_lsd_shrink_filters_and_renormalises_hypos(self):
+        hd = PMF([(0.2, 4.0), (0.5, 8.0), (0.3, 12.0)])
+        hd.hypo_dip_fracs = (0.5, 0.6, 0.7)
+        npd = PMF([(1, NodalPlane(0, 60, 90))])
+        mesh = Mesh(numpy.array([0., 1.]), numpy.array([0., 0.]))
+        mmfd = MultiMFD('incrementalMFD', size=2, min_mag=[4.5],
+                        bin_width=[1.0], occurRates=[[0.1], [0.2]])
+        mps = MultiPointSource('mp3', 'test', 'Active Shallow Crust',
+                               mmfd, None, PeerMSR(), 1.0, None,
+                               0, 15, npd, hd, mesh)
+        mps.modify_set_lower_seismogenic_depth(10.0)
+        data = mps.hypocenter_distribution.data
+        self.assertEqual([d for _, d in data], [4.0, 8.0])
+        self.assertAlmostEqual(data[0][0], 0.2 / 0.7)
+        self.assertEqual(mps.hypo_dip_fracs, (0.5, 0.6))

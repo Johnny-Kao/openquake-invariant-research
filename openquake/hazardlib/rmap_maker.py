@@ -1,0 +1,870 @@
+# -*- coding: utf-8 -*-
+# vim: tabstop=4 shiftwidth=4 softtabstop=4
+#
+# Copyright (C) 2018-2026 GEM Foundation
+#
+# OpenQuake is free software: you can redistribute it and/or modify it
+# under the terms of the GNU Affero General Public License as published
+# by the Free Software Foundation, either version 3 of the License, or
+# (at your option) any later version.
+#
+# OpenQuake is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU Affero General Public License for more details.
+#
+# You should have received a copy of the GNU Affero General Public License
+# along with OpenQuake.  If not, see <http://www.gnu.org/licenses/>.
+
+import copy
+import time
+import collections
+import numpy
+
+from openquake.baselib.general import (
+    AccumDict, getsizeof)
+from openquake.baselib.general import decode
+from openquake.baselib.hdf5 import vfloat32
+from openquake.hazardlib import valid, InvalidFile
+from openquake.hazardlib.tom import PoissonTOM
+from openquake.hazardlib.calc.filters import (
+    SourceFilter, FilteredAway)
+from openquake.hazardlib.map_array import MapArray
+from openquake.hazardlib.site_amplification import (
+    AmplificationFunction)
+from openquake.hazardlib.contexts import (
+    ContextMaker, concat, F32, F64, U32, TWO20, TWO24)
+
+# the MFD variants of a block of contexts stored once by store_ctxs: the
+# rows start:stop of the rup datasets belong to the base variant (the
+# grp_id and base gid are the ones of the rows) and the variant gid has
+# the occurrence rates multiplied by the ratios, one per row (zero for the
+# rows missing in the variant), see make_results
+VARIANT_DT = numpy.dtype([('gid', U32), ('start', numpy.int64),
+                          ('stop', numpy.int64), ('ratios', vfloat32)])
+
+
+class RmapMaker(object):
+    """
+    A class to compute the PoEs from a given source
+    """
+    def __init__(self, cmaker, sitecol, group):
+        vars(self).update(vars(cmaker))
+        self.cmaker = cmaker
+        if hasattr(sitecol, 'sitecol'):
+            self.srcfilter = sitecol
+        else:
+            self.srcfilter = SourceFilter(sitecol, cmaker.maximum_distance)
+        self.N = len(self.srcfilter.sitecol.complete)
+        try:
+            self.sources = group.sources
+        except AttributeError:  # already a list of sources
+            self.sources = group
+        self.src_mutex = getattr(group, 'src_interdep', None) == 'mutex'
+        if getattr(group, 'rup_interdep', None) != 'mutex':
+            self.rup_mutex = {}
+        else:
+            self.rup_mutex = {}  # src_id, rup_id -> rup_weight
+            for src in group:
+                for i, (rup, _) in enumerate(src.data):
+                    self.rup_mutex[src.id, i] = rup.weight
+        self.fewsites = self.N <= cmaker.max_sites_disagg
+        self.grp_probability = getattr(group, 'grp_probability', 1.)
+        self.cluster = self.cmaker.cluster = getattr(group, 'cluster', 0)
+        if self.cluster:
+            tom = group.temporal_occurrence_model
+        else:
+            # NOTE: I think we should raise an error here
+            tom = getattr(self.sources[0], 'temporal_occurrence_model',
+                          PoissonTOM(self.cmaker.investigation_time))
+        self.cmaker.tom = self.tom = tom
+        M, G = len(self.cmaker.imtls), len(self.cmaker.gsims)
+        self.maxsize = 8 * TWO20 // (M*G)  # crucial for a fast get_mean_stds
+
+    def count_bytes(self, ctxs):
+        # # usuful for debugging memory issues
+        rparams = len(self.cmaker.REQUIRES_RUPTURE_PARAMETERS)
+        sparams = len(self.cmaker.REQUIRES_SITES_PARAMETERS) + 1
+        dparams = len(self.cmaker.REQUIRES_DISTANCES)
+        nbytes = 0
+        for ctx in ctxs:
+            nsites = len(ctx)
+            nbytes += 8 * rparams
+            nbytes += 8 * sparams * nsites
+            nbytes += 8 * dparams * nsites
+        return nbytes
+
+    def gen_ctxs(self, src):
+        if src.code == b'F':
+            sites = self.srcfilter.sitecol
+        else:
+            sites = self.srcfilter.get_close_sites(src)
+            if sites is None:
+                return
+        for ctx in self.cmaker.get_ctxs(src, sites):
+            if self.cmaker.deltagetter:
+                # Every rup listed in delta_rates is an aftershock, so
+                # shift its occurrence_rate and set is_aftershock as True
+                # so aftershock terms are applied in GMMs containing them
+                with self.cmaker.delta_mon:
+                    delta = self.cmaker.deltagetter(src.id)
+                    row = delta[ctx.rup_id]
+                    d = row['delta']
+                    ctx.occurrence_rate += d
+                    if 'is_aftershock' in ctx.dtype.names:
+                        ctx.is_aftershock = d != 0
+                    if 'crjb' in ctx.dtype.names:
+                        ctx.crjb = row['crjb']
+            if self.fewsites:  # keep rupdata in memory
+                if self.src_mutex:
+                    # needed for Disaggregator.init
+                    ctx.src_id = valid.fragmentno(src)
+                self.rupdata.append(ctx)
+            yield ctx
+
+    def _make_src_indep(self):
+        # sources with the same ID
+        cm = self.cmaker
+        allctxs = []
+        ctxlen = 0
+        source_nctxs = []
+        t0 = time.time()
+        sids = self.srcfilter.sitecol.sids
+        # using memory here, limited by pmap_max_mb
+        pnemap = MapArray(
+            sids, self.cmaker.imtls.size, len(self.cmaker.gsims),
+            not self.cluster).fill(self.cluster)
+        for src in self.sources:
+            nctxs = 0
+            for ctx in self.gen_ctxs(src):
+                ctxlen += len(ctx)
+                nctxs += len(ctx)
+                allctxs.append(ctx)
+                if ctxlen > self.maxsize:
+                    ctxt = concat(allctxs)  # at most a few dozens of MB
+                    cm.update(pnemap, ctxt)
+                    allctxs.clear()
+                    ctxlen = 0
+            source_nctxs.append(nctxs)
+        if allctxs:
+            # all sources have the same tom by construction
+            cm.update(pnemap, concat(allctxs))
+            allctxs.clear()
+
+        dt = (time.time() - t0) / len(self.sources)
+        for src, nctxs in zip(self.sources, source_nctxs):
+            self.update_source_data(src, cm.task_no, dt, nctxs)
+        return pnemap
+
+    def _make_src_mutex(self):
+        # used in Japan (case_27) and in New Madrid (case_80)
+        cm = self.cmaker
+        G = len(self.cmaker.gsims)
+        sids = self.srcfilter.sitecol.sids
+        pmap = MapArray(sids, self.cmaker.imtls.size, G).fill(0)
+        for src in self.sources:
+            t0 = time.time()
+            pm = MapArray(
+                pmap.sids, cm.imtls.size, len(cm.gsims)
+            ).fill(not self.rup_mutex)
+            ctxs = list(self.gen_ctxs(src))
+            n = sum(len(ctx) for ctx in ctxs)
+            if n == 0:
+                continue
+            for ctx in ctxs:
+                cm.update(pm, ctx, self.rup_mutex)
+            if self.rup_mutex:
+                # in classical/case_80
+                pmap.array += (1.- pmap.array) * pm.array
+            else:
+                # in classical/case_27
+                pmap.array += (1. - pm.array) * src.mutex_weight
+            self.update_source_data(src, cm.task_no, time.time() - t0, n)
+        pmap.array *= self.grp_probability
+        return ~pmap
+
+    def update_source_data(self, src, task_no, dt, nctxs):
+        src.dt = dt
+        self.source_data['src_id'].append(valid.basename(src))
+        self.source_data['grp_id'].append(src.grp_id)
+        self.source_data['nctxs'].append(nctxs)
+        self.source_data['nrupts'].append(src.num_ruptures)
+        self.source_data['weight'].append(src.weight)
+        self.source_data['ctimes'].append(src.dt)
+        self.source_data['taskno'].append(task_no)
+
+    def make(self):
+        dic = {}
+        self.rupdata = []
+        # NB: the cfactor of the cmaker is shared by the results of the
+        # task and accumulated in the master, so
+        # only the increment of this result must be returned
+        cfactor0 = self.cmaker.cfactor.copy()
+        self.source_data = AccumDict(accum=[])
+        if not self.src_mutex and not self.rup_mutex:
+            pnemap = self._make_src_indep()
+        else:
+            pnemap = self._make_src_mutex()
+        if self.cluster:  # very fast
+            MINFLOAT = 1.4E-45  # minimum 32 bit float
+            probs = F32(self.tom.get_probability_n_occurrences(
+                self.tom.occurrence_rate, numpy.arange(20)))
+            # the probs are usually very small, like
+            # [9.9999881e-01, 1.2000586e-06, 7.2007114e-13, ,,,]
+            # they rapidly go below the minimum 32 bit float, so
+            # the length of the loop can be reduced (i.e. from 20 to 7)
+            probs = probs[probs > MINFLOAT]
+            array = numpy.full(pnemap.shape, probs[0], dtype=F32)
+            for nocc, probn in enumerate(probs[1:], 1):
+                array += pnemap.array ** nocc * probn
+            pnemap.array = array
+
+        dic['rmap'] = pnemap.to_rates()
+        dic['cfactor'] = self.cmaker.cfactor - cfactor0
+        if self.oq.keep_rupdata:
+            dic['rup_data'] = concat(self.rupdata)
+        else:
+            dic['rup_data'] = ()
+        dic['source_data'] = self.source_data
+        dic['task_no'] = self.task_no
+        dic['dparam_mb'] = getsizeof(self.cmaker.dparam) / TWO20
+        dic['source_mb'] = self.cmaker.source_mb
+        if self.disagg_by_src:
+            # all the sources in the group must have the same source_id because
+            # of the groupby(group, corename) in classical.py
+            coreids = set(map(valid.corename, self.sources))
+            if len(coreids) > 1:
+                raise NameError('Invalid source naming: %s' % coreids)
+
+            # in oq-risk-tests test_phl there are multiple srcids
+            # (mps-0!b1;0, mps-0!b1;1, ...); you can simply use the first,
+            # since in `store_mean_rates_by_src` we use corename
+            dic['basename'] = valid.basename(self.sources[0])
+        return dic
+
+
+def _rates_by_mag(sources):
+    # :param sources: a list of sources
+    # :returns: a list of dictionaries mag -> annual occurrence rate, one
+    #     per source, read from the MFD (cheap, no ruptures enumerated)
+    out = []
+    for src in sources:
+        # NB: nonparametric sources have no MFD, so they are not supported
+        # by make_results and the callers must fall back to the slow path
+        if not hasattr(src, 'get_annual_occurrence_rates'):
+            raise ValueError('%s has no MFD' % type(src).__name__)
+        dic = {}
+        for mag, rate in src.get_annual_occurrence_rates():
+            mag = round(mag, 3)
+            dic[mag] = dic.get(mag, 0.) + rate
+        out.append(dic)
+    return out
+
+
+def _mag_ratios(base, dic):
+    # :param base: dictionary mag -> rate of a base source
+    # :param dic: dictionary mag -> rate of another variant of the source
+    # :returns: dictionary mag -> ratio of the rates, i.e. the factor
+    #     applied to the occurrence rates of the base contexts of that mag;
+    #     the magnitudes missing in the variant get ratio 0 (see get),
+    #     the ones missing in the base are not supported
+    #
+    # NB: this assumes that the MFD variants rescale uniformly the
+    # ruptures of a magnitude, i.e. the relative weights of the ruptures
+    # (hypocenters, nodal planes) do not change, see make_results
+    if set(dic) - set(base):
+        raise ValueError('new magnitudes in a variant')
+    return {mag: dic.get(mag, 0.) / rate for mag, rate in base.items()
+            if rate > 0}
+
+
+def _discard_filtered(mag_ratios, groups, srcfilter):
+    # Set to zero the ratios of the sources discarded by the source filter
+    # in a variant. The filter depends on the maximum magnitude of the
+    # source (see RmapMaker.gen_ctxs), so a source close to the maximum
+    # distance can be discarded in a variant with a small maximum magnitude
+    # and kept in the base: without this the variant would get the
+    # ruptures of the base contexts that it would not generate if computed
+    # alone, and the hazard would depend on the variants computed together
+    for v, grp in enumerate(groups):
+        for s, src in enumerate(grp):
+            if src.code != b'F' and srcfilter.get_close_sites(src) is None:
+                mag_ratios[v][s] = dict.fromkeys(mag_ratios[v][s], 0.)
+
+
+def mag_support(sources):
+    # :param sources: a list of sources, as in a group
+    # :returns: a hashable key with the magnitudes of each source; the
+    #     variants with magnitudes contained in the ones of the base can be
+    #     computed together by make_results, see _mag_ratios and
+    #     classical._split_by_mags
+    return tuple(tuple(sorted(dic)) for dic in _rates_by_mag(sources))
+
+
+def make_results(groups, cmakers, sites):
+    """
+    Compute the rates of several variants of the same groups, i.e. groups
+    with the same sources and the same geometry but different MFDs, with
+    the contexts computed only once (called by classical.bysrc_results).
+
+    :param groups: a list of V groups, one per variant, with the same
+        sources in the same order
+    :param cmakers: a list of V cmakers, one per variant, with the gids
+    :param sites: a SiteCollection instance
+    :returns: a list of V dictionaries, as returned by RmapMaker.make
+    :raises ValueError: if the variants cannot be computed this way
+    :raises FilteredAway: if some sources of a variant were filtered away
+
+    The contexts are generated from the base variant, i.e. the one with
+    the most magnitudes, and for each other variant the occurrence rates
+    of the contexts are rescaled by the ratio of the rates of their magnitude
+    (see _mag_ratios). Only independent Poisson sources are supported,
+    since the probabilities are then linear in the rates.
+    """
+    # Non-Poisson occurrence PMFs must be recomputed for each MFD variant;
+    # rescaling occurrence_rate while reusing probs_occur is incorrect.
+    if any(not isinstance(getattr(src, 'temporal_occurrence_model', None),
+                          PoissonTOM) for grp in groups for src in grp):
+        raise ValueError('non-Poisson sources')
+    rates = [_rates_by_mag(grp) for grp in groups]
+    b = max(range(len(groups)),
+            key=lambda v: sum(len(d) for d in rates[v]))
+    rmaker = RmapMaker(cmakers[b], sites, groups[b])
+    if rmaker.src_mutex or rmaker.rup_mutex or rmaker.cluster:
+        raise ValueError('mutually exclusive sources')
+    sources = rmaker.sources
+    # NB: the variants can have fewer sources than the base, since the
+    # sources are filtered by minimum_magnitude after the uncertainties
+    # are applied, see classical.groups_gkeys
+    nsrcs = [len(grp) for grp in groups]
+    if any(n != len(sources) for n in nsrcs):
+        raise FilteredAway(
+            'the variants have %s sources, expected %d: some sources were '
+            'filtered away by the uncertainties' % (nsrcs, len(sources)))
+    # mag_ratios[v][s] = dictionary mag -> ratio for source s of variant v
+    # e.g. logictree/case_18/job_bis: the 9 variants of a depth (3 abGR x
+    # 3 maxMagGR) are computed together, since the magnitudes 5.5, 6.5 of
+    # the 6 variants with maxMag 7.0 and 7.3 are contained in the
+    # magnitudes 5.5, 6.5, 7.5 of the 3 variants with maxMag 7.6 (see
+    # classical._split_by_mags); in the first call the base is variant 2,
+    # with rate 0.115893 at M 5.5, variant 3 has rate 0.284605, i.e. ratio
+    # 2.4558, and variant 0 has no M 7.5, i.e. ratio 0 at M 7.5
+    mag_ratios = [[_mag_ratios(rates[b][s], rates[v][s])
+                   for s in range(len(sources))]
+                  for v in range(len(groups))]
+    _discard_filtered(mag_ratios, groups, rmaker.srcfilter)
+    sids = rmaker.srcfilter.sitecol.sids
+    cm = rmaker.cmaker
+    pnemaps = [MapArray(sids, cm.imtls.size, len(cm.gsims),
+                        True).fill(False) for _ in groups]
+    rmaker.source_data = AccumDict(accum=[])
+    # the rup_data are kept once, for the base variant, together with the
+    # ratios of the occurrence rates of each variant, one per row, instead
+    # of a rescaled copy of the contexts per variant (see _keep_rups);
+    # e.g. logictree/case_18/job_bis: at the first depth the base has 6
+    # ruptures (magnitudes 5.5, 6.5, 7.5) and the 6 variants with
+    # magnitudes 5.5, 6.5 have ratio 0 for 2 of them
+    rups = []
+    ratios = [[] for _ in groups]
+    t0 = time.time()
+    cfactor0 = cm.cfactor.copy()  # see RmapMaker.make
+    nctxs = _process_sources(rmaker, mag_ratios, pnemaps, rups, ratios)
+    cfactor = cm.cfactor - cfactor0
+    dt = (time.time() - t0) / len(sources)
+    # the source data are recorded only for the first variant, the
+    # others get zeros, otherwise the statistics would be repeated
+    for s, src in enumerate(sources):
+        rmaker.update_source_data(src, rmaker.task_no, dt, nctxs[s])
+    out = []
+    for v, pnemap in enumerate(pnemaps):
+        sdata = rmaker.source_data if v == 0 else _zero_source_data(
+            rmaker.source_data)
+        # the cfactor too is recorded only for the first variant
+        dic = dict(rmap=pnemap.to_rates(),
+                   cfactor=cfactor if v == 0 else numpy.zeros_like(cfactor),
+                   rup_data=(), source_data=sdata,
+                   task_no=rmaker.task_no, dparam_mb=0.,
+                   source_mb=cm.source_mb)
+        if v == b and rups:
+            # the base carries the contexts and, for each other variant
+            # (identified by its index), the ratios aligned to the rows;
+            # the base itself has ratio 1 on all the kept rows
+            dic['rup_data'] = concat(rups)
+            dic['rup_ratios'] = [(w, numpy.concatenate(ratios[w]))
+                                 for w in range(len(groups)) if w != b]
+        if rmaker.disagg_by_src:  # see RmapMaker.make
+            dic['basename'] = valid.basename(sources[0])
+        out.append(dic)
+    return out
+
+
+def _process_sources(rmaker, mag_ratios, pnemaps, rups, ratios):
+    # Feed the probability maps of the variants with the contexts of all the
+    # sources, see make_results. The contexts are concatenated in chunks, as
+    # in _make_src_indep, otherwise gen_poes is called on tiny arrays and the
+    # mean_stds are computed many more times; the chunks are processed by
+    # update_variants, which computes the GMPEs once per magnitude and chunk.
+    #
+    # :param rmaker: a RmapMaker instance for the base variant
+    # :param mag_ratios: mag_ratios[v][s] as in make_results
+    # :param pnemaps: a list of V MapArrays, one per variant, to update
+    # :param rups: a list with the rup_data of the base variant, to extend
+    # :param ratios: a list of V lists of ratios, see _keep_rups, to extend
+    # :returns: the number of contexts of each source
+    cm = rmaker.cmaker
+    tspan = rmaker.tom.time_span
+    nctxs = []
+    chunk, sidxs, nrows = [], [], 0
+    rmaker.rupdata = []  # used by gen_ctxs with few sites
+    for s, src in enumerate(rmaker.sources):
+        ctxs = list(rmaker.gen_ctxs(src))
+        rmaker.rupdata = []  # the contexts are kept in ctxs
+        nctxs.append(sum(len(ctx) for ctx in ctxs))
+        # the ruptures of the variants, kept only with few sites as in gen_ctxs
+        if cm.oq.keep_rupdata and rmaker.fewsites:
+            _keep_rups(ctxs, [mr[s] for mr in mag_ratios], rups, ratios)
+        for ctx in ctxs:
+            chunk.append(ctx)
+            sidxs.append(numpy.full(len(ctx), s))
+            nrows += len(ctx)
+        if nrows > rmaker.maxsize:
+            update_variants(cm, pnemaps, mag_ratios, tspan, chunk, sidxs)
+            chunk, sidxs, nrows = [], [], 0
+    if chunk:
+        update_variants(cm, pnemaps, mag_ratios, tspan, chunk, sidxs)
+    return nctxs
+
+
+# maximum number of floats of the contributions by source, see _update_poisson
+MAX_LINEAR = 2 ** 24
+
+
+# NB: this is crucial for the performance of the BCHydro calculation
+def _update_poisson(cm, pnemaps, mag_factors, ctxt, si, itime):
+    # Update the probability maps of the variants with the contexts of a
+    # single magnitude, for Poisson ruptures only. The rate of a row is
+    # occ_rate * mag_factors[v, s], and update_pmap_r adds rate * poe *
+    # itime to the map, so the contributions of each source are summed
+    # once, and each variant gets the sum of its contributions weighted by
+    # mag_factors[v, s]
+    pmap = pnemaps[0]
+    N, L, G = pmap.array.shape
+    contribs = numpy.zeros((N, L, len(mag_factors[0]), G))  # N, L, S, G
+    for poes, _, _, _, slc in cm._gen_poes(ctxt):
+        c = ctxt[slc]
+        sidxs = pmap.sidx[c.sids]
+        # NB: the rows of the same source and site are summed by add.at
+        contrib = poes.astype(F64) * (c.occurrence_rate * itime)[:, None, None]
+        numpy.add.at(contribs, (sidxs, slice(None), si[slc]), contrib)
+    for v, pnemap in enumerate(pnemaps):
+        pnemap.array += mag_factors[v] @ contribs
+
+
+def update_variants(cm, pnemaps, mag_ratios, tspan, ctxs, sidxs):
+    """
+    Update the probability maps of the variants with the contexts of
+    several sources, computing the PoEs once per magnitude (see
+    make_results)
+
+    :param cm: a ContextMaker instance
+    :param pnemaps: a list of V MapArrays, one per variant
+    :param mag_ratios: mag_ratios[v][s] is the dictionary mag -> ratio
+        for the source s of the variant v, see _mag_ratios
+    :param tspan: the time span of the temporal occurrence model
+    :param ctxs: a list of context arrays of the sources
+    :param sidxs: a list of arrays with the source index of each row
+    """
+    with cm.upd_mon:
+        ctx = concat(ctxs)
+        sidx = numpy.concatenate(sidxs)
+        ctx.mag = numpy.round(ctx.mag, 3)
+        # sorting by magnitude (stable, so the order within each magnitude is
+        # preserved) allows to process each magnitude as a contiguous slice
+        order = numpy.argsort(ctx.mag, kind='stable')
+        ctx = ctx[order]
+        sidx = sidx[order]
+        umags, starts, counts = numpy.unique(
+            ctx.mag, return_index=True, return_counts=True)
+        itime = tspan
+        # the rates are linear in the mag_ratios only for Poisson ruptures, see
+        # _update_poisson; the probability mode is not linear in the rates
+        linear = pnemaps[0].rates and not any(
+            len(probs) for probs in ctx.probs_occur)
+        S = len(mag_ratios[0])
+        for mag, start, count in zip(umags, starts, counts):
+            ctxt = ctx[start:start+count]
+            si = sidx[start:start+count]
+            # mag_factors is an array of shape (V, S) for the magnitude mag:
+            # mag_factors[v, s] is the rate ratio of the source s in the
+            # variant v
+            mag_factors = numpy.array([[r.get(float(mag), 0.) for r in rv]
+                                       for rv in mag_ratios])
+            cm.cfactor[0] += len(ctxt)  # as in gen_poes
+            # contexts saved by computing them once: a variant computed alone
+            # would generate the contexts of the sources containing the
+            # magnitude, i.e. the ones with a positive ratio
+            # number of variants per source
+            nvariants = (mag_factors > 0).sum(axis=0)
+            nctxs = numpy.bincount(si, minlength=S)  # contexts per source
+            cm.cfactor[3] += nvariants @ nctxs - count
+            if linear and S * pnemaps[0].array.size <= MAX_LINEAR:
+                _update_poisson(cm, pnemaps, mag_factors, ctxt, si, itime)
+                continue
+            for poes, _, _, _, slc in cm._gen_poes(ctxt):
+                c = ctxt[slc]
+                # read the record fields once for all the variants
+                sids = c.sids
+                probs_occur = c.probs_occur
+                occ_rate = c.occurrence_rate
+                poes = poes.astype(F64)
+                for v, pnemap in enumerate(pnemaps):
+                    rates_v = occ_rate * mag_factors[v, si[slc]]
+                    pnemap._update_indep_arrays(poes, rates_v, probs_occur,
+                                                sids, itime)
+
+
+def _keep_rups(rupdata, src_ratios, rups, ratios):
+    # Keep the contexts of a source once, instead of a rescaled copy per
+    # variant, which would use V times more memory (GBs for BCHydro)
+    #
+    # :param rupdata: a list of context arrays of the same source
+    # :param src_ratios: a list of V dictionaries mag -> ratio of the
+    #     occurrence rates of the source, see _mag_ratios
+    # :param rups: a list of context arrays, to extend with copies of the
+    #     rows having a positive ratio in at least one variant
+    # :param ratios: a list of V lists, to extend with the ratios of the
+    #     kept rows; a zero ratio means a magnitude missing in the variant
+    for ctxs in rupdata:
+        mags = numpy.round(ctxs.mag.astype(float), 3)
+        factor = numpy.array([[ratio.get(m, 0.) for m in mags]
+                              for ratio in src_ratios], F32)  # shape (V, U)
+        mask = factor.max(axis=0) > 0
+        # NB: copying, since update_variants can change the original
+        rups.append(ctxs[mask].copy())
+        for ratio, fac in zip(ratios, factor):
+            ratio.append(fac[mask])
+
+
+def _add_variants(ctx, variants):
+    # Rebuild the contexts of the MFD variants computed together by
+    # make_results, stored once with the gid of the base variant: the
+    # contexts of a variant are the base rows with the occurrence rates
+    # multiplied by the stored ratios; the rows with zero ratio are dropped
+    #
+    # :param ctx: a recarray with all the stored contexts, in storage order
+    # :param variants: an array of dtype VARIANT_DT
+    out = [ctx]
+    for rec in variants:
+        start, stop, ratio = rec['start'], rec['stop'], rec['ratios']
+        ok = ratio > 0
+        new = ctx[start:stop][ok].copy()
+        new.occurrence_rate *= ratio[ok]
+        new.gid = rec['gid']
+        out.append(new)
+    return numpy.concatenate(out).view(numpy.recarray)
+
+
+def _zero_source_data(sdata):
+    # :returns: a copy of the source data with zero counts, i.e. the
+    #     same grp_id and src_id but no contexts, ruptures or times
+    out = AccumDict(accum=[])
+    for key in sdata:
+        vals = sdata[key]
+        out[key] = [0 * v if key in ('nctxs', 'nrupts', 'weight',
+                                     'ctimes') else v for v in vals]
+    return out
+
+
+class ContextMakerSequence(collections.abc.Sequence):
+    """
+    Wrapper over a sequence of ContextMakers
+    """
+    def __init__(self, cmakers, inverse, trt_smrs):
+        self.cmakers = cmakers
+        self.inverse = inverse
+        self.trt_smrs = trt_smrs
+
+    @property
+    def Gt(self):
+        """
+        The total number of gsims in the underlying context makers
+        """
+        return sum(len(cm.gsims) for cm in self.cmakers)
+
+    def __getitem__(self, idx):
+        return self.cmakers[idx]
+
+    def __len__(self):
+        return len(self.cmakers)
+
+    def enumerate(self):
+        for grp_id, inv in enumerate(self.inverse):
+            yield grp_id, self[inv]
+
+    def to_array(self, grp_ids=slice(None)):
+        return numpy.array([self[inv] for inv in self.inverse[grp_ids]])
+
+    def get_rmap(self, src_groups, sitecol):
+        """
+        :returns: a RateMap of shape (N, L, Gt)
+        """
+        cmakers = self.to_array()
+        assert cmakers[0].oq.use_rates
+        assert len(src_groups) == len(cmakers)
+        L = cmakers[0].imtls.size
+        rmap = MapArray(sitecol.sids, L, self.Gt).fill(0)
+        for group, cmaker in zip(src_groups, cmakers):
+            local = RmapMaker(cmaker, sitecol, group).make()['rmap']
+            local.gid = cmaker.gsim_idx
+            rmap += local
+        return rmap
+
+    def get_rmaps(self, sources, sitecol):
+        """
+        :param sources: a list of R variations of the same source
+        :param sitecol: a SiteCollection instance
+        :returns: a list of RateMaps of shape (N, L, G), one per smr
+        """
+        # FIXME: works only for logic trees not changing the geometries
+        # and only for pointlike sources
+        R = len(sources)
+        cmaker = self.cmakers[0]
+        assert cmaker.oq.use_rates
+        assert len(self) == R, (len(self), R)
+        L = cmaker.imtls.size
+        G = len(cmaker.gsims)
+        tom = PoissonTOM(cmaker.oq.investigation_time)
+        pmaps = [MapArray(sitecol.sids, L, G, True).fill(0) for rlz in range(R)]
+        ctx = cmaker.from_srcs([sources[0]], sitecol)
+        magrates = [{numpy.round(mag, 3): rate
+                     for mag, rate in src.get_annual_occurrence_rates()}
+                     for src in sources]
+        for poes, mea, sig, tau, ctxt in cmaker.gen_poes(ctx):
+            mag = ctxt.mag[0]  # ctxt contains a single magnitude
+            for smr, magrate in enumerate(magrates):
+                orate = ctxt.occurrence_rate / magrates[0][mag] * magrate[mag]
+                pmaps[smr].update_indep(poes, ctxt, tom.time_span, orate)
+        return [pmap.to_rates() for pmap in pmaps]
+
+    def combine_rates(self, rmap):
+        """
+        :returns: an array of shape (N, L, R) for the given site ID
+        """
+        N, L, G = rmap.array.shape
+        assert self.Gt == G, (self.Gt, G)
+        maxr = 0
+        for cm in self.cmakers:
+            for rlzs in cm.gsims.values():
+                maxr = max(maxr, rlzs[-1])
+        r0 = numpy.zeros((N, L, maxr + 1))
+        g = 0
+        for cm in self.cmakers:
+            for i, rlzs in enumerate(cm.gsims.values()):
+                rates = rmap.array[:, :, g]
+                for rlz in rlzs:
+                    r0[:, :, rlz] += rates
+                g += 1
+        return r0
+
+    def __repr__(self):
+        name = self.__class__.__name__
+        return f'<{name} Gt={self.Gt}, groups={len(self.inverse)}>'
+
+
+def get_unique_inverse(all_trt_smrs):
+    """
+    :returns: unique tuples trt_smrs and an array of indices
+    """
+    strings = [','.join(map(str, ts)) for ts in all_trt_smrs]
+    unique, inverse = numpy.unique(strings, return_inverse=True)
+    return [tuple(map(int, u.split(','))) for u in unique], inverse
+
+
+def build_cmakers(all_trt_smrs, full_lt, oq):
+    """
+    :params all_trt_smrs: a list of arrays, one per source group
+    :param full_lt: a FullLogicTree instance
+    :param oq: object containing the calculation parameters
+    :returns: computation-only ContextMakers with local GSIM columns
+    """
+    if not hasattr(full_lt, 'weights'):
+        full_lt.init()
+    unique_trt_smrs, inverse = get_unique_inverse(all_trt_smrs)
+    if 'amplification' in oq.inputs and oq.amplification_method == 'kernel':
+        df = AmplificationFunction.read_df(oq.inputs['amplification'])
+        oq.af = AmplificationFunction.from_dframe(df)
+    else:
+        oq.af = None
+    trts = list(full_lt.gsim_lt.values)
+    cmakers, memberships = [], []
+    for trt_smrs in unique_trt_smrs:
+        rlzs_by_gsim = full_lt.get_rlzs_by_gsim(trt_smrs)
+        if not rlzs_by_gsim:  # happens for gsim_lt.reduce() on empty TRTs
+            continue
+        trti = trt_smrs[0] // TWO24
+        cm = ContextMaker(trts[trti], list(rlzs_by_gsim), oq)
+        cm.trti = trti
+        cmakers.append(cm)
+        memberships.append(trt_smrs)
+    return ContextMakerSequence(cmakers, inverse, memberships)
+
+
+def get_cmakers(all_trt_smrs, full_lt, oq):
+    """Bind group realizations and weights for GMFs and postprocessors."""
+    cmakers = build_cmakers(all_trt_smrs, full_lt, oq)
+    numbering = cmakers.trt_smrs
+    gweights = full_lt.g_weights(numbering)[:, -1]
+    for cm, ts, gids in zip(cmakers, numbering, full_lt.get_gids(numbering)):
+        # Computation uses local GSIM columns. These consumers also need
+        # the realization membership and weights of the complete group.
+        rlzs = full_lt.get_rlzs_by_gsim(ts).values()
+        cm.gsims = dict(zip(cm.gsims, rlzs))
+        cm.gsim_idx = gids
+        cm.wei = gweights[gids]
+    return cmakers
+
+
+def read_unc_ts_sets(dstore):
+    """
+    :param dstore: a DataStore instance, possibly closed
+    :returns: the ordered list of unique trt_smrs tuples, one per
+        realization set, or None if unc_ts_sets is not stored
+
+    The stored row order determines the gid numbering.
+    """
+    with dstore:  # NB: the datastore is closed when passed to a task
+        # Preserve the stored order, which determines gid numbering.
+        if 'unc_ts_sets' in dstore:
+            return [tuple(t) for t in dstore['unc_ts_sets'][:]]
+
+
+def read_cmakers(dstore, full_lt=None):
+    """
+    :param dstore: a DataStore-like object
+    :param all_trt_smrs: a list of arrays
+    :returns: an array of ContextMaker instances, one per source group
+    """
+    oq = dstore['oqparam']
+    oq.mags_by_trt = {
+        k: decode(v[:]) for k, v in dstore['source_mags'].items()}
+    all_trt_smrs = dstore['trt_smrs'][:]
+    if not full_lt:
+        full_lt = dstore['full_lt'].init()
+    cmakers = get_cmakers(all_trt_smrs, full_lt, oq)
+    return cmakers
+
+
+def read_full_lt_by_label(dstore, full_lt=None):
+    """
+    :param dstore: a DataStore-like object
+    :param full_lt: FullLogicTree instance; if None, it is read from the dstore
+    :returns: a dictionary label -> full_lt
+    """
+    oq = dstore['oqparam']
+    full_lt = full_lt or dstore['full_lt'].init()
+    glt = full_lt.gsim_lt
+    attrs = vars(full_lt)
+    dic = {'Default': full_lt}
+    for label in oq.site_labels:
+        dic[label] = flt = copy.copy(full_lt)
+        dic[label].__dict__.update(attrs)
+        dic[label]._rlzs_by = {}  # reset cache, tested in logictree/case_06
+        flt.label = label
+        dic[label].gsim_lt = dstore['gsim_lt' + label]
+        flt.weights = numpy.array(
+            [rlz.weight for rlz in flt.get_realizations()])
+
+        # all gsim logic trees in the dictionary must have the same
+        # trts and the same number of gsims per trt
+        exp = list(glt.values)
+        got = list(flt.gsim_lt.values)
+        if exp != got:
+            raise InvalidFile(
+                f'{oq.inputs["gsim_logic_tree"]}: expected {exp} got {got}')
+        for trt, gsims in full_lt.gsim_lt.values.items():
+            got = len(gsims)
+            exp = len(glt.values[trt])
+            if exp != got:
+                raise InvalidFile(
+                    f'{oq.inputs["gsim_logic_tree"]}: expected {exp} gsims '
+                    f'got {got} for {trt=}')
+
+    # sanity check: the gids must be consistent
+    unique_trt_smrs, _ = get_unique_inverse(dstore['trt_smrs'][:])
+    default_gids = dic['Default'].get_gids(unique_trt_smrs)
+    for label in list(dic)[1:]:
+        gids = dic[label].get_gids(unique_trt_smrs)
+        numpy.testing.assert_equal(gids, default_gids)
+    return dic
+
+
+# used in event_based
+def read_cmaker(dstore, trt_smr):
+    """
+    :param dstore: a DataStore-like object
+    :returns: a ContextMaker instance
+    """
+    oq = dstore['oqparam']
+    full_lt = dstore['full_lt']
+    trts = list(full_lt.gsim_lt.values)
+    trt = trts[trt_smr // len(full_lt.sm_rlzs)]
+    rlzs_by_gsim = full_lt._rlzs_by_gsim(trt_smr)
+    return ContextMaker(trt, rlzs_by_gsim, oq)
+
+
+def get_src_mutex(srcs):
+    """
+    :param srcs: a list of sources with weights and the same grp_id
+    :returns: a dictionary grp_id -> {'src_id': [...], 'weight': [...]}
+    """
+    grp_ids = [src.grp_id for src in srcs]
+    [grp_id] = set(grp_ids)
+    ok = all(hasattr(src, 'mutex_weight') for src in srcs)
+    if not ok:
+        return {grp_id: {}}
+    dic = dict(src_ids=U32([src.id for src in srcs]),
+               weights=F64([src.mutex_weight for src in srcs]))
+    return {grp_id: dic}
+
+
+def read_ctx_by_grp(dstore):
+    """
+    :param dstore: DataStore instance
+    :returns: dictionary grp_id -> ctx
+
+    The contexts of the MFD variants computed together by make_results
+    are stored once, with the ratios of the occurrence rates of each
+    variant, and they are rebuilt here, as if stored separately
+    """
+    sitecol = dstore['sitecol'].complete.array
+    # NB: the gid of each context, i.e. of the index of rate attribution
+    # it was computed for, is a column of the rup dataframe; the gids are
+    # the gsim_idx, see gmf.py
+    params = {n: dstore['rup/' + n][:] for n in dstore['rup']}
+    dtlist = []
+    for par, val in params.items():
+        if len(val) == 0:
+            return {}
+        elif par == 'probs_occur':
+            item = (par, object)
+        elif par == 'occurrence_rate':
+            item = (par, F64)
+        else:
+            item = (par, val[0].dtype)
+        dtlist.append(item)
+    for par in sitecol.dtype.names:
+        if par != 'sids':
+            dtlist.append((par, sitecol.dtype[par]))
+    ctx = numpy.zeros(len(params['grp_id']), dtlist).view(numpy.recarray)
+    for par, val in params.items():
+        ctx[par] = val
+    for par in sitecol.dtype.names:
+        if par != 'sids':
+            ctx[par] = sitecol[par][ctx.sids]
+    if 'rup_variants' in dstore and len(dstore['rup_variants']):
+        # must be done before sorting, since the variants refer to
+        # the storage order
+        ctx = _add_variants(ctx, dstore['rup_variants'][:])
+    grp_ids = numpy.unique(ctx.grp_id)
+    ctx = ctx[numpy.argsort(ctx.mag)]  # NB: crucial for performance
+    return {grp_id: ctx[ctx.grp_id == grp_id] for grp_id in grp_ids}

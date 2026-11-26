@@ -1,0 +1,755 @@
+# The Hazard Library
+# Copyright (C) 2012-2026 GEM Foundation
+#
+# This program is free software: you can redistribute it and/or modify
+# it under the terms of the GNU Affero General Public License as
+# published by the Free Software Foundation, either version 3 of the
+# License, or (at your option) any later version.
+#
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU Affero General Public License for more details.
+#
+# You should have received a copy of the GNU Affero General Public License
+# along with this program.  If not, see <http://www.gnu.org/licenses/>.
+"""
+Module :mod:`openquake.hazardlib.source.simple_fault` defines
+:class:`SimpleFaultSource`.
+"""
+import copy
+import math
+from collections import namedtuple
+from functools import lru_cache
+import numpy
+from openquake.baselib.general import round
+from openquake.hazardlib import mfd
+from openquake.hazardlib.codes import SIMPLE_FAULT
+from openquake.hazardlib.source.base import ParametricSeismicSource
+from openquake.hazardlib.geo.surface.simple_fault import SimpleFaultSurface
+from openquake.hazardlib.geo import Point, Line
+from openquake.hazardlib.geo.mesh import mean_inclination_azimuth
+from openquake.hazardlib.geo.nodalplane import NodalPlane
+from openquake.hazardlib.source.rupture import ParametricProbabilisticRupture
+from openquake.hazardlib.mfd.truncated_gr import TruncatedGRMFD
+from openquake.hazardlib.mfd.alternative_characteristic_mfd import AlternativeCharacteristicMFD
+from openquake.hazardlib.mfd.evenly_discretized import EvenlyDiscretizedMFD
+
+
+# Grouping all the "extra" hypo depth options to reduce num args in class
+HypoData = namedtuple('HypoData', ['hypo_list', 'slip_list', 'depth_list'],
+                      defaults=[(), (), ()])
+
+
+@lru_cache(maxsize=256)
+def whole_fault_shape(trace_key, upper, lower, dip, mesh_spacing,
+                      dip_spacing=None):
+    """
+    :param trace_key: tuple of (lon, lat, depth) tuples of the fault trace
+    :returns: shape of the whole-fault mesh (rows, cols)
+
+    Bounded LRU cache: sources sharing the same geometry (typically many
+    logic-tree branches) reuse the mesh shape, while the memory footprint
+    stays limited to `maxsize` small entries.
+    """
+    trace = Line([Point(*p) for p in trace_key])
+    surface = SimpleFaultSurface.from_fault_data(
+        trace, upper, lower, dip, mesh_spacing, dip_spacing=dip_spacing)
+    return surface.mesh.shape
+
+
+# for each row of cells of the whole fault mesh returns the cumulative sums
+# along the columns of the inclination and azimuth terms of the cells,
+# prepended by zeros, and a flag telling if the row is on the earth
+# surface; they are used to compute the dip and strike of each floating
+# rupture in constant time, without recomputing them from its mesh
+def _cum_terms(mesh):
+    terms = mesh.get_inclination_azimuth_terms()  # 4 arrays (R-1, C-1)
+    zeros = numpy.zeros((len(terms[0]), 1))
+    cums = [numpy.concatenate([zeros, term.cumsum(axis=1)], axis=1)
+            for term in terms]
+    on_surface = ((mesh.depths[:-1] == 0).all(axis=1) &
+                  (mesh.depths[1:] == 0).all(axis=1))
+    return cums, on_surface
+
+
+class SimpleFaultSource(ParametricSeismicSource):
+    """
+    Simple fault source typology represents seismicity occurring on a fault
+    surface with simple geometry.
+
+    :param upper_seismogenic_depth:
+        Minimum depth an earthquake rupture can reach, in km.
+    :param lower_seismogenic_depth:
+        Maximum depth an earthquake rupture can reach, in km.
+    :param fault_trace:
+        A :class:`~openquake.hazardlib.geo.line.Line` representing
+        the line of intersection between the fault plane and the Earth's
+        surface.
+    :param dip:
+        Angle between earth surface and fault plane in decimal degrees.
+    :param rake:
+        the direction of hanging wall relative to the foot wall.
+    :param rupture_slip_direction:
+        Angle describing rupture propagation direction in decimal degrees.
+    :param HypoData:
+        Instance used to group the input arguments for the two alternative ways
+        of specifying the hypocentres within a SimpleFaultSource.
+
+        Alternative approach 1 is described by hypo_list and slip_list:
+    
+            :param hypo_list:
+                Array describing the relative position of the hypocentre on the
+                rupture surface. Each line represents a hypocentral position
+                defined in terms of the relative distance along strike and dip
+                (from the upper, left corner of the fault surface i.e. the
+                corner which results from the projection at depth of the first
+                vertex of the fault trace) and the corresponding weight.
+                Example 1: one single hypocentral position at the center of the
+                rupture will be described by the following array[(0.5, 0.5,
+                1.0)]. Example 2: two possible hypocenters are admitted for a
+                rupture. One hypocentre is located along the strike at 1/4 of
+                the fault length and at 1/4 of the fault width along the dip and
+                occurs with a weight of 0.3, the other one is at 3/4 of fault
+                length along strike and at 3/4 of fault width along strike with
+                a weight of 0.7. The numpy array would be entered as
+                numpy.array([[0.25, 0.25, 0.3], [0.75, 0.75, 0.7]]).
+
+            :param slip_list:
+                Array describing the rupture slip direction, which desribes the
+                rupture propagation direction on the rupture surface. Each line
+                represents a rupture slip direction and the corresponding
+                weight. Example 1: one single rupture slip direction with
+                angle 90 degree will be described by the following array[(90,
+                1.0)]. Example 2: two possible rupture slip directions are
+                admitted for a rupture. One slip direction is at 90 degree
+                with a weight of 0.7, the other one is at 135 degree with a
+                weight of 0.3. The numpy array would be entered as
+                numpy.array([[90, 0.7], [135, 0.3]]).
+
+        Alternative approach 2 is described by hypo_depth_list:
+
+            :param hypo_depth_list:
+                List of (probability, depth, fixed_dip_frac) describing a
+                hypocentre depth distribution. fixed_dip_frac is optional
+                (None if not set) and overrides the computed down-dip fraction
+                for that depth if provided. All depths must lie within the
+                seismogenic depth range or an error is raised. Cannot be
+                combined with alternative approach 1 (hypo_list/slip_list).
+
+    See also :class:`openquake.hazardlib.source.base.ParametricSeismicSource`
+    for description of other parameters.
+
+    :raises ValueError:
+        If :meth:`~openquake.hazardlib.geo.surface.simple_fault.
+        SimpleFaultSurface.check_fault_data` fails, if rake value is
+        invalid and if rupture mesh spacing is too high for the lowest
+        magnitude value.
+    """
+    code = SIMPLE_FAULT
+    dip_spacing = 'mesh_spacing'
+    # the dip and the seismogenic depths are scalars, rebound by the
+    # modifications and never mutated in place
+    shallow_uncertainties = frozenset([
+        'simpleFaultDipAbsolute', 'simpleFaultDipRelative',
+        'setLowerSeismDepthAbsolute', 'setUpperSeismDepthAbsolute',
+        'setLowerSeismDepthRelative', 'setUpperSeismDepthRelative'])
+    MODIFICATIONS = {
+        'adjust_aspect_ratio',
+        'adjust_dip',
+        'adjust_mfd_from_slip',
+        'recompute_mmax',
+        'set_aspect_ratio',
+        'set_bGR',
+        'set_dip',
+        'set_geometry',
+        'set_lower_seismogenic_depth',
+        'adjust_lower_seismogenic_depth',
+        'set_mmax_truncatedGR',
+        'set_msr',
+        'set_slip_rate',
+        'set_hypo_depth_dist',
+        'set_recurrow',
+    }
+    def __init__(self, source_id, name, tectonic_region_type,
+                 mfd, rupture_mesh_spacing,
+                 magnitude_scaling_relationship,
+                 rupture_aspect_ratio,
+                 temporal_occurrence_model,
+                 # simple fault specific parameters
+                 upper_seismogenic_depth, lower_seismogenic_depth,
+                 fault_trace, dip, rake,
+                 hypo_data=None):
+        super().__init__(
+            source_id, name, tectonic_region_type, mfd, rupture_mesh_spacing,
+            magnitude_scaling_relationship, rupture_aspect_ratio,
+            temporal_occurrence_model)
+        NodalPlane.check_rake(rake)
+        SimpleFaultSurface.check_fault_data(
+            fault_trace, upper_seismogenic_depth, lower_seismogenic_depth,
+            dip, rupture_mesh_spacing)
+
+        self.fault_trace = fault_trace
+        self.upper_seismogenic_depth = upper_seismogenic_depth
+        self.lower_seismogenic_depth = lower_seismogenic_depth
+        self.dip = dip
+        self.rake = rake
+
+        min_mag, _max_mag = self.mfd.get_min_max_mag()
+        cols_rows = self._get_rupture_dimensions(float('inf'), float('inf'),
+                                                 min_mag)
+        if hypo_data is not None:
+            self.hypo_list = hypo_data.hypo_list
+            self.slip_list = hypo_data.slip_list
+            self.hypo_depth_list = tuple(
+                e if len(e) == 3 else (e[0], e[1], None)
+                for e in hypo_data.depth_list)
+        else:
+            self.hypo_list = ()
+            self.slip_list = ()
+            self.hypo_depth_list = ()
+
+        if (len(self.hypo_list) and not len(self.slip_list) or
+           not len(self.hypo_list) and len(self.slip_list)):
+            raise ValueError('hypo_list and slip_list have to be both given '
+                             'or neither given')
+
+        if self.hypo_depth_list and (
+                len(self.hypo_list) or len(self.slip_list)):
+            raise ValueError('hypo_depth_list and hypo_list/slip_list cannot '
+                             'be used together')
+        if self.hypo_depth_list:
+            total = sum(wei for wei, _depth, _fdf in self.hypo_depth_list)
+            if abs(total - 1.0) > 1e-7:
+                raise ValueError('hypo_depth_list probabilities sum to '
+                                 f'{total}, expected 1.0')
+        for _wei, depth, fdf in self.hypo_depth_list:
+            if not upper_seismogenic_depth <= depth <= lower_seismogenic_depth:
+                raise ValueError(
+                    f'hypo_depth_list {depth} km is outside the '
+                    f'seismogenic zone [{upper_seismogenic_depth}, '
+                    f'{lower_seismogenic_depth}] km')
+            if fdf is not None and not (0.0 < fdf <= 1.0):
+                raise ValueError(
+                    f'hypo_depth_list fixedDipFrac {fdf} for depth {depth} km '
+                    f'must be in the range [0, 1]')
+
+        if 1 in cols_rows:
+            raise ValueError('mesh spacing %s is too high to represent '
+                             'ruptures of magnitude %s' %
+                             (rupture_mesh_spacing, min_mag))
+
+    def _hypo_depth_allocation(self, rup_rows, n_rows_total, n_cols_total):
+        """
+        Allocate the hypo depth distribution over the floating ruptures for
+        a given magnitude. Each depth with probability p_d is spread uniformly
+        over its N_d compatible rows and all columns so the input depth
+        distribution is preserved as a marginal.
+
+        Returns {first_row: [(dip_frac, rate_fraction), ...]}, empty if
+        no depth falls in any floating rupture's depth range.
+
+        If fixedDipFrac is specified in the hypoDepthDist then it is
+        assigned to the corresponding depth instead of a fraction computed
+        using the floating rupture's depth range.
+
+        NOTE: Depths that resolve to the same dip_frac (whether from
+        fixedDipFrac or coincidental computed equality) are collapsed
+        into one pair with their rate fractions summed.
+        """
+        sin_dip = math.sin(math.radians(self.dip))
+        down_dip_delta = self.rupture_mesh_spacing * sin_dip
+        # For each floating row collect compatible (dip_frac, depth_idx)
+        # pairs and count how many rows each depth fits (N_d)
+        per_row = {}
+        n_rows_per_depth = [0] * len(self.hypo_depth_list)
+        for first_row in range(n_rows_total):
+            # Compute top and bottom depth of this floating rupture
+            top = self.upper_seismogenic_depth + first_row * down_dip_delta
+            bot = (self.upper_seismogenic_depth +
+                   (first_row + rup_rows - 1) * down_dip_delta)
+            rup_depth_range = bot - top
+
+            # Keep hypocentres inside given floating rupture's depth range
+            entries = []
+            for d_idx, (prob, depth, fdf) in enumerate(self.hypo_depth_list):
+                if top <= depth <= bot:
+                    # Use fixedDipFrac if provided and otherwise compute from depth
+                    dip_frac = (fdf if fdf is not None
+                                else (depth - top) / rup_depth_range
+                                if rup_depth_range > 0 else 0.0)
+                    entries.append((dip_frac, d_idx))
+                    n_rows_per_depth[d_idx] += 1
+            if entries:
+                per_row[first_row] = entries
+
+        # Renormalise probability over depths that fit at least one row
+        # so the total MFD rate is preserved if a depth fits no row
+        total_valid_prob = sum(
+            prob for d_idx, (prob, _, _) in enumerate(self.hypo_depth_list)
+            if n_rows_per_depth[d_idx] > 0)
+        if total_valid_prob == 0:
+            return {}
+
+        # For each valid row build the (dip_frac, rate_fraction) list,
+        # collapsing depths that share a dip_frac summing their fractions
+        alloc = {}
+        for first_row, entries in per_row.items():
+            by_frac = {}
+            for dip_frac, d_idx in entries:
+                prob = self.hypo_depth_list[d_idx][0]
+                rate_frac = ((prob / total_valid_prob) /
+                             (n_rows_per_depth[d_idx] * n_cols_total))
+                by_frac[dip_frac] = by_frac.get(dip_frac, 0.0) + rate_frac
+            alloc[first_row] = list(by_frac.items())
+        return alloc
+
+    def _iter_ruptures_hypo_slip(self, surface, occurrence_rate, mag):
+        """
+        Yield ruptures for given floating position on fault surface using
+        hypo_list and slip_list.
+        """
+        for hypo in self.hypo_list:
+            for slip in self.slip_list:
+                hypocenter = surface.get_hypo_location(
+                    self.rupture_mesh_spacing, hypo[:2])
+                yield ParametricProbabilisticRupture(
+                    mag, self.rake, self.tectonic_region_type,
+                    hypocenter, surface, occurrence_rate * hypo[2] * slip[1],
+                    self.temporal_occurrence_model, slip[0])
+
+    def _hypo_depth_allocation_or_raise(self, mag, rup_rows,
+                                        n_rows_total, n_cols_total):
+        """
+        Call _hypo_depth_allocation and raise a diagnostic ValueError
+        if no depth fits any floating rupture at the given magnitude.
+        """
+        alloc = self._hypo_depth_allocation(
+            rup_rows, n_rows_total, n_cols_total)
+        if not alloc:
+            raise ValueError(
+                f'No hypo_depth_list depth fits any floating '
+                f'rupture at M={mag:.2f} on source {self.source_id}')
+        return alloc
+
+    def _iter_ruptures_hypo_depth(self, surface, mag, mag_occ_rate, entries):
+        """
+        Yield ruptures for a given floating position using the
+        (dip_frac, rate_fraction) entries from _hypo_depth_allocation.
+        """
+        for dip_frac, rate_frac in entries:
+            hypo = surface.get_hypo_location(
+                self.rupture_mesh_spacing, (0.5, dip_frac))
+            yield ParametricProbabilisticRupture(
+                mag, self.rake, self.tectonic_region_type,
+                hypo, surface, mag_occ_rate * rate_frac,
+                self.temporal_occurrence_model)
+
+    def _rates_hypo_depth(self, alloc, num_rup_along_width,
+                          num_rup_along_length, mag_occ_rate, step):
+        """
+        Return the per-rupture rate array for the hypo_depth_list path
+        in the same order that _iter_ruptures emits ruptures, or None
+        if no float survives the step subsampling.
+        """
+        n_cols = len(range(num_rup_along_length)[::step])
+        parts = []
+        for first_row in range(num_rup_along_width)[::step]:
+            entries = alloc.get(first_row)
+            if not entries:
+                continue
+            rates = numpy.array([r for _, r in entries])
+            parts.append(numpy.tile(rates, n_cols))
+        if not parts:
+            return None
+        return numpy.concatenate(parts) * mag_occ_rate
+
+    def iter_ruptures(self, **kwargs):
+        """
+        See :meth:
+        `openquake.hazardlib.source.base.BaseSeismicSource.iter_ruptures`.
+
+        Generates a ruptures using the "floating" algorithm: for all the
+        magnitude values of assigned MFD calculates the rupture size with
+        respect to MSR and aspect ratio and then places ruptures of that
+        size on the surface of the whole fault source. The occurrence
+        rate of each of those ruptures is the magnitude occurrence rate
+        divided by the number of ruptures that can be placed in a fault.
+        """
+        step = kwargs.get('step', 1)
+        only_rates = kwargs.get('rates')
+        n_slip = len(self.slip_list) or 1
+        whole_fault_surface = SimpleFaultSurface.from_fault_data(
+            self.fault_trace, self.upper_seismogenic_depth,
+            self.lower_seismogenic_depth, self.dip, self.rupture_mesh_spacing,
+            dip_spacing=(self.rupture_mesh_spacing
+                         if self.dip_spacing == 'inferred' else None))
+        whole_fault_mesh = whole_fault_surface.mesh
+        mesh_rows, mesh_cols = whole_fault_mesh.shape
+        fault_length = float((mesh_cols - 1) * self.rupture_mesh_spacing)
+        if self.dip_spacing == 'mesh_spacing':
+            fault_width = float((mesh_rows - 1) * self.rupture_mesh_spacing)
+        else:
+            fault_width = whole_fault_surface.get_width()
+        if not only_rates:
+            cums, on_surface = _cum_terms(whole_fault_mesh)
+
+        for mag, mag_occ_rate in self.get_annual_occurrence_rates():
+            rup_cols, rup_rows = self._get_rupture_dimensions(
+                fault_length, fault_width, mag)
+            num_rup_along_length = mesh_cols - rup_cols + 1
+            num_rup_along_width = mesh_rows - rup_rows + 1
+            num_rup = num_rup_along_length * num_rup_along_width
+            if self.hypo_depth_list:
+                alloc = self._hypo_depth_allocation_or_raise(
+                    mag, rup_rows, num_rup_along_width,
+                    num_rup_along_length)
+            else:
+                occurrence_rate = mag_occ_rate / float(num_rup)
+            if only_rates:
+                if self.hypo_depth_list:
+                    rates = self._rates_hypo_depth(
+                        alloc, num_rup_along_width, num_rup_along_length,
+                        mag_occ_rate, step)
+                    if rates is None:
+                        continue
+                    yield rates
+                else:
+                    n_hypo = len(self.hypo_list) or 1
+                    yield numpy.full(
+                        num_rup * n_hypo * n_slip, occurrence_rate)
+                continue
+            for first_row in range(num_rup_along_width)[::step]:
+                if self.hypo_depth_list and first_row not in alloc:
+                    continue
+                for first_col in range(num_rup_along_length)[::step]:
+                    mesh = whole_fault_mesh[first_row: first_row + rup_rows,
+                                            first_col: first_col + rup_cols]
+                    surface = SimpleFaultSurface(mesh)
+                    # the dip and strike of the top row of cells, i.e. the
+                    # same values computed by surface.get_dip(), but faster
+                    last_col = first_col + rup_cols - 1
+                    xi, yi, xa, ya = (
+                        cum[first_row, last_col] - cum[first_row, first_col]
+                        for cum in cums)
+                    surface.dip, surface.strike = mean_inclination_azimuth(
+                        xi, yi, xa, ya, on_surface[first_row])
+                    if self.hypo_depth_list:
+                        yield from self._iter_ruptures_hypo_depth(
+                            surface, mag, mag_occ_rate, alloc[first_row])
+                    elif len(self.hypo_list) and len(self.slip_list):
+                        yield from self._iter_ruptures_hypo_slip(
+                            surface, occurrence_rate, mag)
+                    else:
+                        # Regular version using surf centroid
+                        yield ParametricProbabilisticRupture(
+                            mag, self.rake, self.tectonic_region_type,
+                            mesh.get_middle_point(), surface, occurrence_rate,
+                            self.temporal_occurrence_model)
+
+    def get_fault_surface_area(self):
+        """
+        Computes the area covered by the surface of the fault.
+
+        :returns:
+            A float defining the area of the surface of the fault [km^2]
+        """
+        sfc = SimpleFaultSurface.from_fault_data(
+            self.fault_trace,
+            self.upper_seismogenic_depth, self.lower_seismogenic_depth,
+            self.dip, 1.0)
+        return sfc.get_area()
+
+    def count_ruptures(self):
+        """
+        See :meth:
+        `openquake.hazardlib.source.base.BaseSeismicSource.count_ruptures`.
+        """
+        # the same geometry is shared by many sources in a logic tree,
+        # so the (expensive) whole-fault mesh shape is cached
+        trace_key = tuple((p.longitude, p.latitude, p.depth)
+                          for p in self.fault_trace.points)
+        try:
+            mesh_rows, mesh_cols = whole_fault_shape(
+                trace_key, self.upper_seismogenic_depth,
+                self.lower_seismogenic_depth, self.dip,
+                self.rupture_mesh_spacing,
+                (self.rupture_mesh_spacing
+                 if self.dip_spacing == 'inferred' else None))
+        except Exception as exc:
+            source_id = self.source_id
+            exc.args = (f'in {source_id=}: {exc.args[0]}',) + exc.args[1:]
+            raise
+        fault_length = float((mesh_cols - 1) * self.rupture_mesh_spacing)
+        if self.dip_spacing == 'mesh_spacing':
+            fault_width = float((mesh_rows - 1) * self.rupture_mesh_spacing)
+        else:
+            fault_width = ((self.lower_seismogenic_depth -
+                            self.upper_seismogenic_depth) /
+                           math.sin(math.radians(self.dip)))
+        self._nr = []
+        n_slip = len(self.slip_list) or 1
+        for (mag, mag_occ_rate) in self.get_annual_occurrence_rates():
+            if mag_occ_rate == 0:
+                continue
+            rup_cols, rup_rows = self._get_rupture_dimensions(
+                fault_length, fault_width, mag)
+            num_rup_along_length = mesh_cols - rup_cols + 1
+            num_rup_along_width = mesh_rows - rup_rows + 1
+            if self.hypo_depth_list:
+                alloc = self._hypo_depth_allocation_or_raise(
+                    mag, rup_rows, num_rup_along_width,
+                    num_rup_along_length)
+                n_hypo_total = sum(len(entries) for entries in alloc.values())
+                self._nr.append(num_rup_along_length * n_hypo_total * n_slip)
+            else:
+                n_hypo = len(self.hypo_list) or 1
+                self._nr.append(num_rup_along_length * num_rup_along_width *
+                                n_hypo * n_slip)
+        counts = sum(self._nr)
+        return counts
+
+    def _get_rupture_dimensions(self, fault_length, fault_width, mag):
+        """
+        Calculate rupture dimensions for a given magnitude.
+
+        :param fault_length:
+            The length of the fault as a sum of all segments, in km.
+        :param fault_width:
+            The width of the fault, in km.
+        :param mag:
+            Magnitude value to calculate rupture geometry for.
+        :returns:
+            A tuple of two integer items, representing rupture's dimensions:
+            number of mesh points along length and along width respectively.
+
+        The rupture is reshaped (conserving area, if possible) if one
+        of dimensions exceeds fault geometry. If both do, the rupture
+        is considered to cover the whole fault.
+        """
+        area = self.magnitude_scaling_relationship.get_median_area(
+            mag, self.rake)
+        rup_length = math.sqrt(area * self.get_aspect_ratio(mag))
+        rup_width = area / rup_length
+
+        # clip rupture's length and width to fault's length and width
+        # if there is no way to fit the rupture otherwise
+        if area >= fault_length * fault_width:
+            rup_length = fault_length
+            rup_width = fault_width
+        # reshape rupture (conserving area) if its length or width
+        # exceeds fault's length or width
+        elif rup_width > fault_width:
+            rup_length = rup_length * (rup_width / fault_width)
+            rup_width = fault_width
+        elif rup_length > fault_length:
+            rup_width = rup_width * (rup_length / fault_length)
+            rup_length = fault_length
+
+        # round rupture dimensions with respect to mesh_spacing
+        # and compute number of points in the rupture along length
+        # and width (aka strike and dip)
+        rup_cols = int(round(rup_length / self.rupture_mesh_spacing) + 1)
+        rup_rows = int(round(rup_width / self.rupture_mesh_spacing) + 1)
+        return rup_cols, rup_rows
+
+    def modify_set_geometry(self, fault_trace, upper_seismogenic_depth,
+                            lower_seismogenic_depth, dip, spacing):
+        """
+        Modifies the current source geometry including trace, seismogenic
+        depths and dip
+        """
+        # Check the new geometries are valid
+        SimpleFaultSurface.check_fault_data(
+            fault_trace, upper_seismogenic_depth, lower_seismogenic_depth,
+            dip, spacing
+        )
+        self.fault_trace = fault_trace
+        self.upper_seismogenic_depth = upper_seismogenic_depth
+        self.lower_seismogenic_depth = lower_seismogenic_depth
+        self.dip = dip
+        self.rupture_mesh_spacing = spacing
+
+    def modify_adjust_dip(self, increment):
+        """
+        Modifies the dip by an incremental value
+
+        :param float increment:
+            Value by which to increase or decrease the dip (the resulting
+            dip must still be within 0.0 to 90.0 degrees)
+        """
+        SimpleFaultSurface.check_fault_data(
+            self.fault_trace, self.upper_seismogenic_depth,
+            self.lower_seismogenic_depth, self.dip + increment,
+            self.rupture_mesh_spacing)
+        self.dip += increment
+
+    def modify_set_lower_seismogenic_depth(self, lsd):
+        """
+        Modifies the lower seismogenic depth
+
+        :param float lsd:
+            New value of the lsd [km]
+        """
+        SimpleFaultSurface.check_fault_data(
+            self.fault_trace, self.upper_seismogenic_depth, lsd,
+            self.dip, self.rupture_mesh_spacing)
+        self.lower_seismogenic_depth = lsd
+
+    def modify_adjust_lower_seismogenic_depth(self, increment):
+        """
+        Modifies the lower seismogenic depth by adding an increment
+
+        :param float increment:
+            Value (in km) by which to increase or decrease the lower
+            seismogenic depth
+        """
+        lsd = self.lower_seismogenic_depth + increment
+        SimpleFaultSurface.check_fault_data(
+            self.fault_trace, self.upper_seismogenic_depth, lsd,
+            self.dip, self.rupture_mesh_spacing)
+        self.lower_seismogenic_depth = lsd
+
+    def modify_set_dip(self, dip):
+        """
+        Modifies the dip to the specified value
+
+        :param float dip:
+            New value of dip (must still be within 0.0 to 90.0 degrees)
+        """
+        SimpleFaultSurface.check_fault_data(
+            self.fault_trace, self.upper_seismogenic_depth,
+            self.lower_seismogenic_depth, dip, self.rupture_mesh_spacing)
+        self.dip = dip
+
+    def modify_set_recurrow(self, recurrow):
+        """
+        Rebuild the MFD from a recurrow using self.recur_model + self.mmax
+        set by an earlier recurSet application.
+
+        Params are read from the recurrow dict, preferring fault-prefixed
+        keys (e.g. fault_b_value, fault_ref_mag, fault_rate) so a single
+        alt3-style recurRow branch can carry different but correlated
+        background and fault parameters; otherwise the unprefixed alt2-style
+        keys are used.
+
+        How it works is determined by the values of rate_split_fault_frac
+        (set by an earlier rateSplit application, absent otherwise) and
+        rate_frac (from the source's rateFrac XML attribute, defaults to
+        1.0 if not set):
+
+        - No rateSplit and rate_frac == 1.0: build the parametric TE or
+          AC MFD from the row params and use it as it is.
+
+        - Alt3 (no rateSplit, rate_frac != 1.0): scale every bin of the
+          parametric MFD by rate_frac and make an EvenlyDiscretizedMFD.
+
+        - Alt2 (rateSplit present): zero bins below Mmax-1 (their rate
+          belongs to the background via the alt2 partition, not the
+          fault) and scale the remaining bins by
+          rate_split_fault_frac * rate_frac; make an EvenlyDiscretizedMFD.
+
+        NOTE: This is currently only intended for support of the BC Hydro
+        NVA SSC logic tree. We may expand it to become a more general
+        capability.
+
+        :param recurrow:
+            Dict of values to use in given type of MFD (e.g. b_value,
+            ref_mag, rate). Alt3-style rows use prefixes of "fault" for
+            the same keys.
+        """
+        # Constants for BC Hydro NVA model
+        b_ac = 0.3
+        delta_mac = 1.0
+        gamma_eff = 0.9185 # Corrected gamma_eff from eq 1.2 of BCHydro AC memo
+        # the job parameter width_of_mfd_bin, 0.1 if not set
+        bin_width = getattr(self, 'width_of_mfd_bin', 0.1)
+
+        # Get params from recurRow, preferring fault-prefixed keys (alt3)
+        mmax = self.mmax
+        recur_model = self.recur_model
+        bval = float(recurrow.get("fault_b_value", recurrow.get("b_value")))
+        ref_mag = float(
+            recurrow.get("fault_ref_mag", recurrow.get("ref_mag")))
+        rate = float(recurrow.get("fault_rate", recurrow.get("rate")))
+
+        # Build the MFD
+        if recur_model == "TE":
+            a_val = math.log10(rate) + bval * ref_mag
+            parent = TruncatedGRMFD(
+                min_mag=ref_mag, max_mag=mmax,
+                bin_width=bin_width, a_val=a_val, b_val=bval,
+            )
+        else:
+            assert recur_model == "AC"
+            parent = AlternativeCharacteristicMFD(
+                min_mag=ref_mag, max_mag=mmax, b_GR=bval, b_AC=b_ac,
+                bin_width=bin_width, gamma=gamma_eff, delta_m_AC=delta_mac,
+                total_rate=rate,
+            )
+
+        fault_frac = getattr(self, 'rate_split_fault_frac', None)
+        rate_frac = getattr(self, 'rate_frac', 1.0)
+
+        # Neither rateSplit nor rateFrac set: no BC Hydro partition to apply
+        if fault_frac is None and rate_frac == 1.0:
+            self.mfd = parent
+            return
+
+        # Alt3-style: rate_frac scaling
+        if fault_frac is None:
+            bins = parent.get_annual_occurrence_rates()
+            occ = [r * rate_frac for _, r in bins]
+            self.mfd = EvenlyDiscretizedMFD(
+                min_mag=bins[0][0], bin_width=bin_width,
+                occurrence_rates=occ)
+            return
+
+        # Alt2-style: zero rates below Mmax-1, scale rest by fault_frac x rate_frac
+        scale = fault_frac * rate_frac
+        threshold = mmax - 1.0
+        bins = parent.get_annual_occurrence_rates()
+        occ = [
+            (r * scale if m >= threshold - bin_width / 4 else 0.0)
+            for m, r in bins
+        ]
+
+        # Trim leading zeros to avoid rup-mesh warnings on tiny-M fault rups
+        first = next((i for i, r in enumerate(occ) if r > 0), None)
+        if first is None:
+            raise ValueError(
+                f"no rate remains above Mmax-1 for fault {self.source_id}")
+        self.mfd = EvenlyDiscretizedMFD(
+            min_mag=bins[first][0], bin_width=bin_width,
+            occurrence_rates=occ[first:])
+
+    def __iter__(self):
+        mag_rates = self.get_annual_occurrence_rates()
+        if len(mag_rates) == 1:  # not splittable
+            yield self
+            return
+        self.num_ruptures
+        for i, (mag, rate) in enumerate(mag_rates):
+            # This is needed in order to reproduce the logic in the
+            # `rupture_count` method
+            if rate == 0:
+                continue
+            src = copy.copy(self)
+            src.mfd = mfd.ArbitraryMFD([mag], [rate])
+            src._num_ruptures = self._nr[i]
+            yield src
+
+    @property
+    def polygon(self):
+        """
+        The underlying polygon
+        `"""
+        return SimpleFaultSurface.surface_projection_from_fault_data(
+            self.fault_trace, self.upper_seismogenic_depth,
+            self.lower_seismogenic_depth, self.dip)
+
+    def wkt(self):
+        """
+        :returns: the geometry as a WKT string
+        """
+        return self.polygon.wkt

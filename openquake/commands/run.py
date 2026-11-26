@@ -1,0 +1,200 @@
+# -*- coding: utf-8 -*-
+# vim: tabstop=4 shiftwidth=4 softtabstop=4
+#
+# Copyright (C) 2014-2026 GEM Foundation
+#
+# OpenQuake is free software: you can redistribute it and/or modify it
+# under the terms of the GNU Affero General Public License as published
+# by the Free Software Foundation, either version 3 of the License, or
+# (at your option) any later version.
+#
+# OpenQuake is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU Affero General Public License for more details.
+#
+# You should have received a copy of the GNU Affero General Public License
+# along with OpenQuake. If not, see <http://www.gnu.org/licenses/>.
+
+import logging
+import os.path
+import socket
+import cProfile
+import getpass
+
+import numpy
+from openquake.baselib import performance, general, config
+from openquake.hazardlib import valid
+from openquake.commonlib import logs, readinput, datastore
+from openquake.hazardlib.calc.mean_rates import (
+    get_rmap, get_gweights, calc_mean_rates)
+from openquake.hazardlib.source_reader import (
+    get_bset_values, modified_groups)
+from openquake.calculators import base, views
+from openquake.commonlib import dbapi
+from openquake.engine.engine import create_jobs, run_jobs
+from openquake.engine.workflow import run_workflow
+from openquake.server import db
+
+calc_path = None  # set only when the flag --slowest is given
+
+
+# print the mean hazard rates of the first site, without parallelization,
+# pretty useful when debugging single site calculations
+def _mean_rates(job_ini):
+    _log, dstore = datastore.create_job_dstore(
+        f'mean rates of {job_ini}')
+    with dstore:
+        oq = readinput.get_oqparam(job_ini)
+        csm = readinput.get_composite_source_model(oq, dstore)
+        csm.set_msparams()  # needed by the multifault sources, if any
+        # NB: there are no workers here, so the uncertainties are applied
+        # here, one set of realizations at a time; this way the groups
+        # returned have the trt_smrs of a single set of uncertainties,
+        # as expected by get_rmap
+        src_groups = []
+        for grp in csm.src_groups:
+            bset_values = get_bset_values(csm.full_lt, grp)
+            src_groups.extend(
+                sg for _trt_smrs, sg in modified_groups(grp, bset_values))
+        sitecol = readinput.get_site_collection(oq)
+        assert len(sitecol) <= oq.max_sites_disagg, sitecol
+        rmap, _cmakers = get_rmap(src_groups, csm.full_lt, sitecol, oq)
+        gws = get_gweights(src_groups, csm.full_lt)
+        rates = calc_mean_rates(
+            rmap, gws, csm.full_lt.gsim_lt.wget, oq.imtls)
+        N, _M, L1 = rates.shape
+        mrates = numpy.zeros((N, L1), oq.imt_dt())
+        for m, imt in enumerate(oq.imtls):
+            mrates[imt] = rates[:, m]
+        print('Mean hazard rates for the first site')
+        print(views.text_table(mrates[0], ext='org'))
+
+
+# called when profiling
+def _run(job_ini, concurrent_tasks, pdb, loglevel, exports,
+         params, user_name, host=None):
+    global calc_path
+    hc_string = 'hazard_calculation_id' in params and isinstance(
+            params['hazard_calculation_id'], str)
+    if 'hazard_calculation_id' in params and not hc_string:
+        hc_id = int(params['hazard_calculation_id'])
+        if hc_id < 0:  # interpret negative calculation ids
+            calc_ids = logs.get_calc_ids()
+            try:
+                params['hazard_calculation_id'] = calc_ids[hc_id]
+            except IndexError:
+                raise SystemExit(
+                    'There are %d old calculations, cannot '
+                    'retrieve the %s' % (len(calc_ids), hc_id))
+        else:
+            params['hazard_calculation_id'] = hc_id
+    dic = readinput.get_params(job_ini, params)
+    if hc_string:
+        dic['hazard_calculation_id'] = params['hazard_calculation_id']
+
+    # set the logs first of all
+    log = logs.init(dic, log_level=getattr(logging, loglevel.upper()),
+                    user_name=user_name, host=host, pdb=pdb)
+    logs.dbcmd('update_job', log.calc_id,
+               {'status': 'executing', 'pid': os.getpid()})
+    with log, performance.Monitor('total runtime', measuremem=True) as monitor:
+        calc = base.calculators(log.get_oqparam(), log.calc_id)
+        calc.run(concurrent_tasks=concurrent_tasks, exports=exports)
+
+    logging.info('Total time spent: %s s', monitor.duration)
+    logging.info('Memory allocated: %s', general.humansize(monitor.mem))
+    calc_path, _ = os.path.splitext(calc.datastore.filename)  # used below
+    return calc
+
+
+def main(job_ini,
+         pdb=False,
+         mean_rates=False,
+         *,
+         slowest: int = None,
+         hc: valid.calculation = None,
+         param=None,
+         concurrent_tasks: int = None,
+         exports: valid.export_formats = '',
+         loglevel='info',
+         nodes: int = 1,
+         workflow_id=None,
+         kfilter=''):
+    """
+    Run a set of calculations or a workflow
+    """
+    user_name = getpass.getuser()
+
+    dbfile = os.path.expanduser(config.server.dbfile)
+    if not os.path.exists(dbfile):
+        db.actions.upgrade_db(dbapi.db)
+    try:
+        host = socket.gethostname()
+    except Exception:  # gaierror
+        host = None
+    if param:
+        params = {}
+        for par in param:
+            k, v = par.split('=', 1)
+            params[k] = v
+    else:
+        params = {}
+    if hc:
+        if hc == -1:
+            hc = logs.dbcmd('get_job', -1, user_name).id
+        params['hazard_calculation_id'] = str(hc)
+    if concurrent_tasks is not None:
+        params['concurrent_tasks'] = str(concurrent_tasks)
+    if mean_rates:  # print the mean hazard rates of the first site
+        return _mean_rates(job_ini)
+    if slowest:
+        prof = cProfile.Profile()
+        prof.runctx('_run(job_ini, None, pdb, loglevel, '
+                    'exports, params, host)', globals(), locals())
+        pstat = calc_path + '.pstat'
+        prof.dump_stats(pstat)
+        print('Saved profiling info in %s' % pstat)
+        data = performance.get_pstats(pstat, slowest)
+        print(views.text_table(data, ['ncalls', 'cumtime', 'path'],
+                               ext='org'))
+        return
+    if job_ini.endswith(('.ini', '.zip')):
+        mode = 'ini'
+    elif job_ini.endswith('.toml'):
+        mode = 'toml'
+    else:
+        raise ValueError(f'Unknown extension in{job_ini}')
+    if mode == 'ini':
+        dic = readinput.get_params(job_ini)
+        dic.update(params)
+        dic['exports'] = ','.join(exports)
+        if 'job_id' in dic:  # in sensitivity analysis
+            logs.dbcmd('update_job', dic['job_id'],
+                       {'calculation_mode': dic['calculation_mode']})
+        jobs = create_jobs([dic], loglevel, hc_id=hc, user_name=user_name,
+                           host=host, pdb=pdb)
+        run_jobs(jobs, concurrent_jobs=1, nodes=nodes)
+        return jobs[0].calc_id  # used in commands_test
+    else:  # toml
+        if workflow_id:
+           params['workflow_id'] = int(workflow_id)
+        return run_workflow(job_ini, params, nodes=nodes, pdb=pdb,
+                            kfilter=kfilter)
+
+main.job_ini = dict(help='calculation configuration file')
+main.pdb = dict(help='enable post mortem debugging', abbrev='-d')
+main.mean_rates = dict(help='print the mean hazard rates of the first site, '
+                       'computed without parallelization')
+main.slowest = dict(help='profile and show the slowest operations')
+main.hc = dict(help='previous calculation ID')
+main.param = dict(help='override parameters with TOML syntax', nargs='*',
+                  action='extend')
+main.concurrent_tasks = dict(help='hint for the number of tasks to spawn',
+                             abbrev='--ct')
+main.exports = dict(help='export formats as a comma-separated string')
+main.loglevel = dict(help='logging level',
+                     choices='debug info warn error critical'.split())
+main.nodes=dict(help='number of worker nodes to start')
+main.workflow_id = "ID of a previous workflow or description of a new workflow"
+main.kfilter = "Filter workflow jobs with a regex"

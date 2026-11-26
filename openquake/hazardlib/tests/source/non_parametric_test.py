@@ -1,0 +1,185 @@
+# The Hazard Library
+# Copyright (C) 2013-2026 GEM Foundation
+#
+# This program is free software: you can redistribute it and/or modify
+# it under the terms of the GNU Affero General Public License as
+# published by the Free Software Foundation, either version 3 of the
+# License, or (at your option) any later version.
+#
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU Affero General Public License for more details.
+#
+# You should have received a copy of the GNU Affero General Public License
+# along with this program.  If not, see <http://www.gnu.org/licenses/>.
+import os
+import pickle
+import unittest
+import numpy
+
+from openquake.hazardlib import nrml
+from openquake.hazardlib.source.non_parametric import \
+    NonParametricSeismicSource
+from openquake.hazardlib.source.rupture import BaseRupture, \
+    NonParametricProbabilisticRupture
+from openquake.hazardlib.geo import Point
+from openquake.hazardlib.geo.surface.planar import PlanarSurface
+from openquake.hazardlib.pmf import PMF
+from openquake.hazardlib.sourceconverter import SourceConverter
+
+from openquake.hazardlib.tests import assert_pickleable
+
+DATA = os.path.join(os.path.dirname(__file__), '..', 'calc', 'data')
+
+
+def make_non_parametric_source():
+    surf1 = PlanarSurface(
+        strike=0, dip=90,
+        top_left=Point(0., -1., 0.), top_right=Point(0., 1., 0.),
+        bottom_right=Point(0., 1., 10.), bottom_left=Point(0., -1., 10.)
+    )
+    surf2 = PlanarSurface(
+        strike=90., dip=90.,
+        top_left=Point(-1., 0., 0.), top_right=Point(1., 0., 0.),
+        bottom_right=Point(1., 0., 10.), bottom_left=Point(-1., 0., 10.)
+    )
+    rup1 = BaseRupture(
+        mag=5., rake=90., tectonic_region_type='ASC',
+        hypocenter=Point(0., 0., 5.), surface=surf1)
+    rup2 = BaseRupture(
+        mag=6, rake=0, tectonic_region_type='ASC',
+        hypocenter=Point(0., 0., 5.), surface=surf2)
+    pmf1 = PMF([(0.7, 0), (0.3, 1)])
+    pmf2 = PMF([(0.7, 0), (0.2, 1), (0.1, 2)])
+    kwargs = {
+        'source_id': 'source_id', 'name': 'source name',
+        'tectonic_region_type': 'tectonic region',
+        'data': [(rup1, pmf1), (rup2, pmf2)]
+    }
+    npss = NonParametricSeismicSource(**kwargs)
+    assert_pickleable(npss)
+    return npss, kwargs
+
+
+class NonParametricSourceTestCase(unittest.TestCase):
+
+    def make_non_parametric_source(self):
+        source, kwargs = make_non_parametric_source()
+        for key in kwargs:
+            self.assertIs(getattr(source, key), kwargs[key])
+
+        return source, kwargs
+
+    def test_creation(self):
+        self.make_non_parametric_source()
+
+    def test_iter_ruptures(self):
+        source, kwargs = self.make_non_parametric_source()
+        for i, rup in enumerate(source.iter_ruptures()):
+            exp_rup, exp_pmf = kwargs['data'][i]
+            self.assertIsInstance(rup, NonParametricProbabilisticRupture)
+            self.assertEqual(rup.mag, exp_rup.mag)
+            self.assertEqual(rup.rake, exp_rup.rake)
+            self.assertEqual(
+                rup.tectonic_region_type, source.tectonic_region_type
+            )
+            self.assertEqual(rup.hypocenter, exp_rup.hypocenter)
+            self.assertIsInstance(rup.surface, PlanarSurface)
+            self.assertEqual(rup.surface.strike, exp_rup.surface.strike)
+            self.assertEqual(rup.surface.dip, exp_rup.surface.dip)
+            self.assertEqual(rup.surface.top_left, exp_rup.surface.top_left)
+            self.assertEqual(rup.surface.top_right, exp_rup.surface.top_right)
+            self.assertEqual(
+                rup.surface.bottom_right, exp_rup.surface.bottom_right)
+            numpy.testing.assert_allclose(
+                rup.probs_occur, [prob for prob, occ in exp_pmf.data])
+
+    def test_count_ruptures(self):
+        source, _ = self.make_non_parametric_source()
+        self.assertEqual(source.num_ruptures, 2)
+
+
+class NankaiTest(unittest.TestCase):
+
+    def test_bounding_box(self):
+        """ Test calculation of bounding box for gridded source """
+        fname = os.path.join(DATA, 'nankai', 'nankai.xml')
+        sc = SourceConverter(investigation_time=50., rupture_mesh_spacing=2.)
+        groups = nrml.to_python(fname, sc)
+        src = groups[0][0]
+        west, south, east, north = src.get_bounding_box(0.0)
+        expected = [131.772, 31.336, 138.606, 35.43]
+        numpy.testing.assert_almost_equal(expected, [west, south, east, north])
+
+    def test_compact_pickle(self):
+        # gridded ruptures are pickled as arrays with float32 meshes
+        fname = os.path.join(DATA, 'nankai', 'nankai.xml')
+        sc = SourceConverter(investigation_time=50., rupture_mesh_spacing=2.)
+        src = nrml.to_python(fname, sc)[0][0]
+        new = pickle.loads(pickle.dumps(src))
+        self.assertIn('_arrays', vars(new))
+        self.assertEqual(new.count_ruptures(), src.count_ruptures())
+        self.assertEqual(new.get_min_max_mag(), src.get_min_max_mag())
+        numpy.testing.assert_allclose(
+            new.get_bounding_box(10.), src.get_bounding_box(10.),
+            rtol=0, atol=1e-5)
+        for (r1, p1), (r2, p2) in zip(src.data, new.data):
+            self.assertEqual((r1.mag, r1.rake), (r2.mag, r2.rake))
+            self.assertEqual(vars(r1.hypocenter), vars(r2.hypocenter))
+            numpy.testing.assert_array_equal(
+                r1.surface.mesh.array.astype(numpy.float32),
+                r2.surface.mesh.array)
+            self.assertEqual(r2.surface.mesh.array.dtype, numpy.float32)
+            self.assertEqual(type(r1), type(r2))
+            self.assertEqual(vars(r1).keys(), vars(r2).keys())
+            self.assertEqual(p1.data, p2.data)
+
+        # splitting the arrays gives the same blocks as splitting the data
+        src.data = src.data * 250
+        new = pickle.loads(pickle.dumps(src))
+        self.assertEqual(new.get_mags(), src.get_mags())
+        numpy.testing.assert_allclose(
+            new.get_bounding_box(10.), src.get_bounding_box(10.),
+            rtol=0, atol=1e-5)
+        blocks1, blocks2 = list(src), list(new)
+        self.assertEqual([b.source_id for b in blocks1],
+                         [b.source_id for b in blocks2])
+        for b1, b2 in zip(blocks1, blocks2):
+            self.assertIn('_arrays', vars(b2))
+            self.assertEqual(b1.count_ruptures(), b2.count_ruptures())
+            self.assertEqual(b1._num_ruptures, b2._num_ruptures)
+            self.assertEqual(b1.data.weight, b2.data.weight)
+            for (r1, _), (r2, _) in zip(b1.data, b2.data):
+                numpy.testing.assert_array_equal(
+                    r1.surface.mesh.array.astype(numpy.float32),
+                    r2.surface.mesh.array)
+                self.assertEqual(r1.weight, r2.weight)
+
+        # ruptures with planar surfaces are pickled as they are
+        src, _ = make_non_parametric_source()
+        self.assertNotIn('_arrays', vars(pickle.loads(pickle.dumps(src))))
+
+    def test_gridded_dict(self):
+        # HDF5 and compact pickles share the same rupture conversion.
+        fname = os.path.join(DATA, 'nankai', 'nankai.xml')
+        sc = SourceConverter(investigation_time=50., rupture_mesh_spacing=2.)
+        src = nrml.to_python(fname, sc)[0][0]
+        compact = pickle.loads(pickle.dumps(src))
+        expected = src.todict()
+        actual = compact.todict()
+        self.assertEqual(set(actual), set(expected))
+        for key in expected:
+            numpy.testing.assert_array_equal(actual[key], expected[key])
+            self.assertEqual(actual[key].dtype, expected[key].dtype)
+        self.assertEqual(actual['hypocenter'].dtype, numpy.float32)
+        self.assertEqual(actual['slice'].dtype, numpy.uint32)
+
+        # Importing the HDF5 arrays preserves rupture weights as well.
+        weights = numpy.arange(src.count_ruptures(), dtype=float)
+        restored = NonParametricSeismicSource(
+            src.source_id, src.name, src.tectonic_region_type, [])
+        restored.fromdict(actual, weights)
+        numpy.testing.assert_array_equal(restored.rup_weights, weights)
+        for key, value in restored.todict().items():
+            numpy.testing.assert_array_equal(value, expected[key])

@@ -1,0 +1,738 @@
+# -*- coding: utf-8 -*-
+# vim: tabstop=4 shiftwidth=4 softtabstop=4
+#
+# Copyright (C) 2015-2026 GEM Foundation
+#
+# OpenQuake is free software: you can redistribute it and/or modify it
+# under the terms of the GNU Affero General Public License as published
+# by the Free Software Foundation, either version 3 of the License, or
+# (at your option) any later version.
+#
+# OpenQuake is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU Affero General Public License for more details.
+#
+# You should have received a copy of the GNU Affero General Public License
+# along with OpenQuake. If not, see <http://www.gnu.org/licenses/>.
+
+# NB: run these tests with OQ_APPLICATION_MODE=IMPACT,
+import time
+import os
+import sys
+import json
+import subprocess
+import tempfile
+from types import SimpleNamespace
+import numpy
+import pandas
+import pytest
+from io import BytesIO
+
+import django
+from django.apps import apps
+from django.conf import settings
+from django.http import HttpResponseNotFound
+from django.test import RequestFactory
+from django.urls import reverse
+from openquake.baselib.general import gettemp
+from openquake.commonlib.auth import API_KEY
+from openquake.commonlib import logs, datastore
+from openquake.commonlib.readinput import loadnpz
+from openquake.server.views import format_oqparam, _impact_base_url
+from openquake.server.services import _impact_urls
+from openquake.server.tests.views_test import (
+    get_or_create_user, start_webui, stop_webui)
+
+CALC_RUN_TIMEOUT = 100
+
+
+@pytest.mark.parametrize('prefix', ['', '/oq'])
+def test_impact_urls_match_the_routes(settings, prefix):
+    # the URLs returned by impact_run and sent by email are built without
+    # Django, so they must be kept in sync with the named routes of urls.py,
+    # including the path prefix of the WebUI, if any (the routes are not
+    # mounted under the prefix here, so it is added to the expected paths)
+    settings.WEBUI_PATHPREFIX = prefix
+    request = RequestFactory().get('/', HTTP_HOST='localhost:8800')
+    urls = _impact_urls(_impact_base_url(request))(42)
+    expected = {'outputs_uri_web': reverse('outputs_impact', args=[42]),
+                'outputs_uri': reverse('results', args=[42]),
+                'log_uri': reverse('log', args=[42, '0', '']),
+                'traceback_uri': reverse('traceback', args=[42])}
+    assert urls == {key: 'http://localhost:8800' + prefix + path
+                    for key, path in expected.items()}
+
+
+def test_format_oqparam_displays_selected_nodal_plane():
+    oqparam = SimpleNamespace(
+        rupture_dict={
+            'approach': 'build_rup_from_usgs', 'usgs_id': 'us7000n7n8',
+            'shakemap_desc': 'v10', 'nodal_plane': 'NP2', 'lon': 1,
+            'lat': 2, 'dep': 3, 'mag': 4, 'msr': 'WC1994',
+            'aspect_ratio': 2, 'rake': 90, 'dip': 45, 'strike': 10},
+        time_event=None, report_time_event='night',
+        maximum_distance={'default': [[0, 300]]},
+        truncation_level=3, number_of_ground_motion_fields=10,
+        asset_hazard_distance={'default': 15}, ses_seed=42,
+        mosaic_model='MODEL', tectonic_region_type='TRT', inputs={},
+        within_event_correlation_model='DuNing2021Interpolated',
+        within_event_correlation_params={},
+        between_event_correlation_model='AbrahamsonEtAl2014BetweenEvent')
+    inputs = format_oqparam(oqparam)
+    assert inputs['Nodal plane'] == 'NP2'
+    assert inputs['Within-event correlation model'] == (
+        'DuNing2021Interpolated')
+    assert inputs['Between-event correlation model'] == (
+        'AbrahamsonEtAl2014BetweenEvent')
+    assert inputs['Time of the event'] == 'night'
+    assert list(inputs).index('Nodal plane') < list(inputs).index(
+        'Magnitude scaling relationship')
+
+
+def check_email(job_id, email_content, expected_error):
+    if expected_error:
+        assert 'failed' in email_content
+    else:
+        assert 'finished correctly' in email_content
+    email_from = settings.EMAIL_HOST_USER
+    email_to = settings.EMAIL_SUPPORT
+    assert f'From: {email_from}' in email_content
+    assert 'To: django-test-user-level-1@email.test' in email_content
+    assert f'Reply-To: {email_to}' in email_content
+    if expected_error:
+        assert expected_error in email_content
+    else:
+        assert 'Please find the results here:' in email_content
+        assert f'engine/{job_id}/outputs_impact' in email_content
+
+
+class ImpactModeTestCase(django.test.TransactionTestCase):
+    datadir = os.path.join(os.path.dirname(__file__), 'data')
+
+    # general utilities
+
+    @classmethod
+    def post(cls, path, prefix='/v1/calc/', data=None):
+        return cls.c.post(f'{prefix}{path}', data)
+
+    @classmethod
+    def get(cls, path, prefix='/v1/calc/', expected_status_code=200, **data):
+        url = f'{prefix}%s' % path
+        resp = cls.c.get(url, data, HTTP_HOST='testserver')
+        if not resp.status_code == expected_status_code:
+            if resp.streaming:
+                content = b"".join(resp.streaming_content)
+            else:
+                content = resp.content
+            try:
+                content = content.decode('utf8')
+            except (AttributeError, UnicodeDecodeError):
+                pass
+            err_msg = (f"Error calling {url}\n"
+                       f"Unexpected status code"
+                       f" {resp.status_code} != {expected_status_code}")
+            if expected_status_code == 200:
+                err_msg += f"\n{content}"
+            raise RuntimeError(err_msg)
+        return resp
+
+    @classmethod
+    def get_json(cls, path, **data):
+        resp = cls.c.get('/v1/calc/%s' % path, data,
+                         headers={'X-API-Key': API_KEY})
+        if hasattr(resp, 'content'):
+            assert resp.content, (
+                'No content from http://localhost:8800/v1/calc/%s (params: %s)'
+                % (path, data))
+            js = resp.content.decode('utf8')
+        else:
+            js = bytes(loadnpz(resp.streaming_content)['json'])
+        if not js:
+            print(f'Empty json from {path}')
+            return {}
+        try:
+            return json.loads(js)
+        except Exception:
+            print('Invalid JSON, see %s' % gettemp(resp.content, remove=False),
+                  file=sys.stderr)
+            return {}
+
+    @classmethod
+    def wait(cls, job_id):
+        # wait until the calculation stops
+        for _ in range(CALC_RUN_TIMEOUT):
+            time.sleep(1)  # sec
+            # NOTE: is_running is True both for 'submitted' and 'executing'
+            #       job status
+            job_dic = cls.get_json(f'{job_id}/status')
+            if job_dic['status'] in ['complete', 'failed', 'shared',
+                                     'aborted', 'deleted']:
+                # NOTE: some more time is needed in order to wait for the
+                # callback to finish and produce the email notification
+                time.sleep(2)
+                return job_dic
+
+    @classmethod
+    def get_response_content(cls, response):
+        """
+        Extract content from either HttpResponse or FileResponse
+        NOTE: the django test client works differently with respect
+        to requests.Session
+        """
+        if hasattr(response, 'content'):
+            return response.content
+        else:
+            return b''.join(response.streaming_content)
+
+    @classmethod
+    def setUpClass(cls):
+        super().setUpClass()
+        logs.dbcmd('reset_is_running')  # cleanup stuck calculations
+        cls.job_ids = []
+        env = os.environ.copy()
+        env['OQ_DISTRIBUTE'] = 'no'
+        cls.maxDiff = None
+        (cls.webserver, cls.webserver_thread,
+         cls.c) = start_webui()
+
+    def setUp(self):
+        Group = apps.get_model('auth', 'Group')
+        Permission = apps.get_model('auth', 'Permission')
+        ContentType = apps.get_model('contenttypes', 'ContentType')
+        self.user, self.password = get_or_create_user(1)
+        self.users_who_can_view_exposure, _ = Group.objects.get_or_create(
+            name='Users who can view the exposure')
+        content_type = ContentType.objects.get(
+            app_label='auth', model='permission')
+        perm, _ = Permission.objects.get_or_create(
+            codename='can_view_exposure', name='Can view exposure',
+            content_type=content_type)
+        self.users_who_can_view_exposure.permissions.add(perm)
+        self.c.session.cookies.clear()
+        self.c.login(username=self.user.username, password=self.password)
+
+    def tearDown(self):
+        self.user.delete()
+        super().tearDown()
+
+    @classmethod
+    def tearDownClass(cls):
+        stop_webui(cls.webserver, cls.webserver_thread)
+        super().tearDownClass()
+
+    def set_user_level_and_remove_groups(self, level):
+        self.user.profile.level = level
+        self.user.profile.save()
+        self.user.groups.remove(self.users_who_can_view_exposure)
+        self.user.save()
+
+    def impact_run_then_remove(
+            self, endpoint, data, expected_error=None):
+        # NOTE: We make Django filebased.EmailBackend write each email
+        # notification into a separate directory, so afterwards we can
+        # retrieve a single file from it, corresponding to the tested job
+        with tempfile.TemporaryDirectory() as email_dir:
+            # NOTE: we can't use Django override_settings to override
+            #       EMAIL_FILE_PATH, because it would work only in the
+            #       current process (subprocess would use the original
+            #       settings). Instead, we explicitly propagate the
+            #       directory to the child process.
+            data['email_file_path'] = email_dir
+            resp = self.post(endpoint, data=data)
+            if resp.status_code != 200:
+                content = json.loads(resp.content)
+                print(content, file=sys.stderr)
+                self.assertIsNotNone(expected_error)
+                self.assertIn(expected_error, content['error_msg'])
+                return
+            # the job is supposed to start
+            # and, if expected_error is not None, to fail afterwards
+            try:
+                [job_id] = json.loads(resp.content.decode('utf8'))
+            except Exception:
+                raise ValueError(
+                    b'Invalid JSON response: %r' % resp.content) from None
+            job_dic = self.wait(job_id)
+            tb = self.get_json('%s/traceback' % job_id)
+            if job_dic is None:
+                raise TimeoutError()
+            elif job_dic['status'] == 'failed':
+                if expected_error:
+                    if not tb:
+                        raise Exception('Empty traceback')
+                    self.assertIn(expected_error, '\n'.join(tb))
+                else:
+                    raise Exception('\n'.join(tb))
+            email_files = os.listdir(email_dir)
+            self.assertEqual(
+                len(email_files), 1,
+                f'Expected exactly one email, found {len(email_files)}'
+                f' in {email_dir}: {email_files}')
+
+            with open(os.path.join(email_dir, email_files[0])) as f:
+                email_content = f.read()
+            check_email(job_id, email_content, expected_error)
+            if job_dic['status'] == 'failed':
+                return
+            try:
+                results = self.get_json('%s/result/list' % job_id)
+            except AssertionError as exc:
+                print(f'Results for job {job_id} not found yet:')
+                print(exc)
+            if isinstance(results, HttpResponseNotFound):
+                print(f'Results for job {job_id} not found yet...')
+            self.assertGreater(
+                len(results), 0,
+                'The job produced no outputs!')
+        # Check that the Django views to visualize simplified and advanced
+        # outputs pages do not raise any exceptions
+        self.get(f'/engine/{job_id}/outputs', prefix='')
+        self.get(f'/engine/{job_id}/outputs_impact', prefix='')
+        # NOTE: the get_json utility decodes the json and returns a dict
+        ret = self.get_json('%s/impact' % job_id)
+        self.assertEqual(list(ret), ['loss_type_descriptions', 'impact'])
+        ret = self.get_json('%s/exposure_by_mmi' % job_id)
+        self.assertEqual(list(ret), ['column_descriptions', 'exposure_by_mmi'])
+        ret = self.get('%s/download_aggrisk' % job_id)
+        ret = self.get('%s/extract_html_table/aggrisk_tags' % job_id)
+        ret = self.get('%s/extract_html_table/mmi_tags' % job_id)
+        for secondary_peril in ['liquefaction', 'landslide']:
+            ret = self.get(
+                '%s/extract_html_table/exposure_by_lse?secondary_peril=%s'
+                % (job_id, secondary_peril))
+        ret = self.get('%s/extract/losses_by_asset' % job_id)
+        content = self.get_response_content(ret)
+        losses_by_asset_mean = numpy.load(BytesIO(content))['rlz-000']
+        dic = {key: losses_by_asset_mean[key]
+               for key in losses_by_asset_mean.dtype.names}
+        pandas.DataFrame(dic)
+        ret = self.get('%s/extract/losses_by_site' % job_id)
+        content = self.get_response_content(ret)
+        losses_by_site = numpy.load(BytesIO(content))
+        pandas.DataFrame.from_dict(
+            {item: losses_by_site[item] for item in losses_by_site})
+        ret = self.get('%s/extract/losses_by_location' % job_id)
+        content = self.get_response_content(ret)
+        losses_by_location = numpy.load(BytesIO(content))
+        pandas.DataFrame.from_dict(
+            {item: losses_by_location[item] for item in losses_by_location})
+        ret = self.get('%s/extract/exposure_by_location' % job_id)
+        content = self.get_response_content(ret)
+        exposure_by_location = numpy.load(BytesIO(content))
+        pandas.DataFrame.from_dict(
+            {item: exposure_by_location[item]
+             for item in exposure_by_location})
+        for secondary_peril in ['liquefaction', 'landslide']:
+            ret = self.get(
+                '%s/extract/exposure_by_lse?secondary_peril=%s'
+                % (job_id, secondary_peril))
+            content = self.get_response_content(ret)
+            exposure_by_lse = numpy.load(BytesIO(content))
+            pandas.DataFrame.from_dict(
+                {item: exposure_by_lse[item] for item in exposure_by_lse})
+
+        job = logs.dbcmd('get_job', job_id)
+        if 'make_impact_reports' in data:
+            with datastore.read(job.ds_calc_dir + '.hdf5') as ds:
+                impact_iso3_list = list(ds['impact'])
+            self.assertGreater(len(impact_iso3_list), 0)
+            impact_resources = self.get_json(
+                f'{job_id}/impact_resources')
+            country_reports = impact_resources['country_reports']
+            self.assertEqual(set(country_reports), set(impact_iso3_list))
+            for urls in country_reports.values():
+                self.assertIn('format=pdf', urls['pdf'])
+                self.assertIn('format=png', urls['png'])
+                self.assertIn('page=2', urls['png_page2'])
+            self.assertEqual(
+                set(impact_resources),
+                {'avg_gmf_plots', 'assets', 'aggrisk', 'aggrisk_tags',
+                 'exposure_by_mmi', 'exposure_by_lse', 'country_reports'})
+            self.assertIsInstance(impact_resources['avg_gmf_plots'], dict)
+            for imt, url in impact_resources['avg_gmf_plots'].items():
+                self.assertIn(f'avg_gmf-{imt}.png', url)
+            for peril_outputs in impact_resources['exposure_by_lse'].values():
+                if peril_outputs:
+                    self.assertEqual(
+                        set(peril_outputs), {'json', 'table', 'npz'})
+            for iso3 in impact_iso3_list:
+                ret = self.c.get(
+                    f'/v1/calc/{job_id}/impact_report?iso3={iso3}')
+                self.assertEqual(ret.status_code, 200)
+                ret = self.c.get(
+                    f'/v1/calc/{job_id}/impact_report?iso3={iso3}'
+                    f'&format=png')
+                self.assertEqual(ret.status_code, 200)
+                # one PNG per page; the report has exactly two pages
+                ret = self.c.get(
+                    f'/v1/calc/{job_id}/impact_report?iso3={iso3}'
+                    f'&format=png&page=2')
+                self.assertEqual(ret.status_code, 200)
+                self.assertEqual(ret.content[:4], b'\x89PNG')
+                for page in ('3', '0', 'x'):
+                    ret = self.c.get(
+                        f'/v1/calc/{job_id}/impact_report?iso3={iso3}'
+                        f'&format=png&page={page}')
+                    self.assertEqual(ret.status_code, 400)
+
+            # Run the command-line extractor against the datastore generated
+            # by this test.  Hide xdg-open from PATH so the test does not
+            # launch a desktop application on the test machine.
+            script = os.path.abspath(os.path.join(
+                os.path.dirname(__file__), '..', '..', '..', 'bin',
+                'extract_impact_reports.py'))
+            with tempfile.TemporaryDirectory() as output_dir:
+                env = os.environ.copy()
+                env['PATH'] = output_dir
+                subprocess.run(
+                    [sys.executable, script, str(job_id)],
+                    cwd=output_dir, env=env, check=True,
+                    capture_output=True, text=True)
+                for iso3 in impact_iso3_list:
+                    # Check the standard identifying bytes at the beginning
+                    # of each file to confirm its format.
+                    for suffix, signature in (
+                            ('.pdf', b'%PDF'), ('.png', b'\x89PNG'),
+                            ('_page2.png', b'\x89PNG')):
+                        report = os.path.join(
+                            output_dir,
+                            f'impact_report_{job_id}_{iso3}{suffix}')
+                        self.assertTrue(os.path.isfile(report))
+                        with open(report, 'rb') as f:
+                            self.assertEqual(f.read(len(signature)), signature)
+
+        # check that users can download hidden outputs only if their level
+        # is at least 2 or if they have the can_view_exposure permission
+
+        # level 1 users without the can_view_exposure permission
+        # can't see the exposure
+        ret = self.get('%s/results' % job_id)
+        results = json.loads(ret.content.decode('utf8'))
+        exposure_urls = [res['url']
+                         for res in results if res['type'] == 'exposure']
+        self.assertEqual(len(exposure_urls), 0)
+        # ...and without can_view_exposure they can't extract the assetcol
+        ret = self.get(f'{job_id}/extract/assetcol', expected_status_code=403)
+        # Model provenance is restricted to level 2 users.
+        ret = self.get(f'{job_id}/model_provenance',
+                       expected_status_code=403)
+
+        # level 1 users with the can_view_exposure permission can see
+        # the exposure
+        self.user.groups.add(self.users_who_can_view_exposure)
+        ret = self.get(f'{job_id}/results')
+        results = json.loads(ret.content.decode('utf8'))
+        [download_url] = [res['url']
+                          for res in results if res['type'] == 'exposure']
+        download_exposure_url = download_url
+        ret = self.get(download_url, prefix='')
+        # ...and with can_view_exposure they can extract the assetcol
+        ret = self.get(f'/v1/calc/{job_id}/extract/assetcol', prefix='')
+
+        # level 2 users without the show_exposure group can see the exposure
+        self.set_user_level_and_remove_groups(2)
+
+        # try to download the exposure, knowing the corresponding url
+        ret = self.get(download_exposure_url, prefix='')
+        # check if the exposure is shown in the list of downloadable results
+        ret = self.get('%s/results' % job_id)
+        results = json.loads(ret.content.decode('utf8'))
+        [exposure_url] = [res['url']
+                          for res in results if res['type'] == 'exposure']
+        ret = self.get(exposure_url, prefix='')
+        # ...and even without can_view_exposure they can extract the assetcol
+        ret = self.get(f'/v1/calc/{job_id}/extract/assetcol', prefix='')
+        # they can also download the hdf5 datastore and the job.zip
+        ret = self.get(f'/v1/calc/{job_id}/datastore', prefix='')
+        ret = self.get(f'/v1/calc/{job_id}/job_zip', prefix='')
+        ret = self.get(f'{job_id}/model_provenance')
+
+        # level 0 users without the can_view_exposure permission can't
+        # see the exposure
+        self.set_user_level_and_remove_groups(0)
+        # try to download the exposure, knowing the corresponding url
+        ret = self.get(download_exposure_url, prefix='',
+                       expected_status_code=403)
+        # check if the exposure is shown in the list of downloadable results
+        ret = self.get('%s/results' % job_id)
+        results = json.loads(ret.content.decode('utf8'))
+        exposure_urls = [res['url']
+                         for res in results if res['type'] == 'exposure']
+        self.assertEqual(len(exposure_urls), 0)
+        # ...and without can_view_exposure they can't extract the assetcol
+        ret = self.get(f'/v1/calc/{job_id}/extract/assetcol', prefix='',
+                       expected_status_code=403)
+
+        # Level 0 impact users can't download hdf5 datastore nor job.zip
+        ret = self.get(f'/v1/calc/{job_id}/datastore', prefix='',
+                       expected_status_code=403)
+        ret = self.get(f'/v1/calc/{job_id}/job_zip', prefix='',
+                       expected_status_code=403)
+
+        # level 1 users without the can_view_exposure permission can't
+        # see the exposure
+        self.set_user_level_and_remove_groups(1)
+
+        # try to download the exposure, knowing the corresponding url
+        ret = self.get(download_exposure_url, prefix='',
+                       expected_status_code=403)
+        # check if the exposure is shown in the list of downloadable results
+        ret = self.get('%s/results' % job_id)
+        results = json.loads(ret.content.decode('utf8'))
+        exposure_urls = [res['url']
+                         for res in results if res['type'] == 'exposure']
+        self.assertEqual(len(exposure_urls), 0)
+        # ...and without can_view_exposure they can't extract the assetcol
+        ret = self.get(f'/v1/calc/{job_id}/extract/assetcol', prefix='',
+                       expected_status_code=403)
+
+        # Level 1 impact users can't download hdf5 datastore nor job.zip
+        ret = self.get(f'/v1/calc/{job_id}/datastore', prefix='',
+                       expected_status_code=403)
+        ret = self.get(f'/v1/calc/{job_id}/job_zip', prefix='',
+                       expected_status_code=403)
+
+        ret = self.post('%s/remove' % job_id)
+        if ret.status_code != 200:
+            raise RuntimeError(
+                'Unable to remove job %s:\n%s' % (job_id, ret))
+
+    def test_run_by_usgs_id_then_remove_calc_failure(self):
+        self.set_user_level_and_remove_groups(1)
+        shakemap_version = (
+            'urn:usgs-product:us:shakemap:us6000jllz:1675824364065')
+        data = dict(usgs_id='us6000jllz',
+                    approach='use_shakemap_from_usgs',
+                    shakemap_version=shakemap_version,
+                    lon=37.60602, lat=37.6446,
+                    dep=9.0, mag=7.8,
+                    rake=0.0, dip=90, strike=51.88112,
+                    time_event='day',
+                    maximum_distance=100,
+                    mosaic_model='ARB',
+                    trt='TECTONIC_REGION_1',
+                    truncation_level=3,
+                    number_of_ground_motion_fields=2,
+                    asset_hazard_distance=15, ses_seed=42,
+                    maximum_distance_stations='', msr='WC1994',
+                    description=('us6000jllz: M 7.8 - Pazarcik earthquake,'
+                                 ' Kahramanmaras earthquake sequence'))
+        expected_error = "The imts {'SA(0.6)'} are required"
+        self.impact_run_then_remove('impact_run', data, expected_error)
+
+    def test_run_by_usgs_id_then_remove_calc_success(self):
+        # Exercise HDF ShakeMap ingestion and correlated impact GMFs.
+        self.set_user_level_and_remove_groups(1)
+        # NOTE: this case tests the extractor for losses_by_site in the
+        # case discarding sites that do not correspond to any assets,
+        # e.g. for the JRC script that uses
+        # shakemap_id = 'urn:usgs-product:us:shakemap:us6000phrk:1735953132990'
+        # {
+        #     "id": "urn:usgs-product:us:shakemap:us6000phrk:1736792435199",
+        #     "number": "5",
+        #     "utc_date_time": "2025-01-13 18:20:35"
+        # },
+        usgs_id = 'us6000phrk'
+        resp = self.post('impact_get_shakemap_versions',
+                         prefix='/v1/', data={'usgs_id': usgs_id})
+        js = json.loads(resp.content.decode('utf8'))
+        [shakemap_id] = [version['id'] for version in js['shakemap_versions']
+                         if version['number'] == '5']
+        data = dict(usgs_id=usgs_id, shakemap_version=shakemap_id,
+                    maximum_distance='100')
+        self.impact_run_then_remove('impact_run_with_shakemap', data)
+
+    def test_run_by_usgs_id_point_rupture_correlation(self):
+        # the GMFs are computed from the point rupture, not from a ShakeMap,
+        # so the within-event correlation model is really used; level 1
+        # users always get the default models, whatever they request
+        self.set_user_level_and_remove_groups(1)
+        data = dict(usgs_id='us6000phrk', approach='use_pnt_rup_from_usgs',
+                    use_shakemap='false', maximum_distance='100',
+                    calculation_mode='scenario',
+                    time_event='day', truncation_level='3',
+                    number_of_ground_motion_fields='10',
+                    asset_hazard_distance='15', ses_seed='42',
+                    within_event_correlation_model='JayaramBaker2009',
+                    within_event_correlation_params=(
+                        '{"vs30_clustering": False}'))
+        with tempfile.TemporaryDirectory() as email_dir:
+            data['email_file_path'] = email_dir
+            resp = self.post('impact_run', data=data)
+            [job_id] = json.loads(resp.content.decode('utf8'))
+            job_dic = self.wait(job_id)
+            if job_dic is None:
+                raise TimeoutError()
+            if job_dic['status'] == 'failed':
+                tb = self.get_json('%s/traceback' % job_id)
+                raise Exception('\n'.join(tb))
+            self.assertEqual(job_dic['status'], 'complete')
+            page = self.get(f'/engine/{job_id}/outputs_impact', prefix='')
+            self.assertIn(b'LothBaker2013', page.content)
+            self.assertIn(b'AbrahamsonEtAl2014BetweenEvent', page.content)
+            self.assertNotIn(b'JayaramBaker2009', page.content)
+            ret = self.post('%s/remove' % job_id)
+            self.assertEqual(ret.status_code, 200)
+
+    def test_provide_rup_params_correlation_models_then_remove_calc(self):
+        # rupture-only job without ShakeMap, through the form fields
+        self.set_user_level_and_remove_groups(2)
+        data = dict(usgs_id='UserProvided', approach='provide_rup_params',
+                    use_shakemap='false', lon='84.4', lat='27.6',
+                    dep='30', mag='7', rake='90', dip='90', strike='0',
+                    aspect_ratio='2', msr='WC1994', mosaic_model='IND',
+                    maximum_distance='100', time_event='day',
+                    truncation_level='3', ses_seed='42',
+                    number_of_ground_motion_fields='10',
+                    asset_hazard_distance='15',
+                    within_event_correlation_model='DuNing2021Interpolated',
+                    between_event_correlation_model='GodaAtkinson2009')
+        # NOTE: no MMI outputs without a ShakeMap, so the checks done by
+        #       impact_run_then_remove do not apply here
+        with tempfile.TemporaryDirectory() as email_dir:
+            data['email_file_path'] = email_dir
+            resp = self.post('impact_run', data=data)
+            [job_id] = json.loads(resp.content.decode('utf8'))
+            job_dic = self.wait(job_id)
+            if job_dic is None:
+                raise TimeoutError()
+            if job_dic['status'] == 'failed':
+                tb = self.get_json('%s/traceback' % job_id)
+                raise Exception('\n'.join(tb))
+            self.assertEqual(job_dic['status'], 'complete')
+            # the outputs page must say which correlation models were used
+            page = self.get(f'/engine/{job_id}/outputs_impact', prefix='')
+            self.assertIn(b'DuNing2021Interpolated', page.content)
+            self.assertIn(b'GodaAtkinson2009', page.content)
+            ret = self.post('%s/remove' % job_id)
+            self.assertEqual(ret.status_code, 200)
+
+    def test_run_by_usgs_id_then_remove_calc_no_rupture(self):
+        self.set_user_level_and_remove_groups(1)
+        usgs_id = 'us6000phrk'
+        resp = self.post('impact_get_shakemap_versions',
+                         prefix='/v1/', data={'usgs_id': usgs_id})
+        js = json.loads(resp.content.decode('utf8'))
+        [shakemap_id] = [version['id'] for version in js['shakemap_versions']
+                         if version['number'] == '1']
+        data = dict(usgs_id=usgs_id, shakemap_version=shakemap_id,
+                    maximum_distance='100')
+        self.impact_run_then_remove('impact_run_with_shakemap', data)
+
+    def test_run_by_usgs_id_make_impact_report_then_remove_calc(self):
+        self.set_user_level_and_remove_groups(1)
+        usgs_id = 'us6000t7zp'
+        resp = self.post('impact_get_shakemap_versions',
+                         prefix='/v1/', data={'usgs_id': usgs_id})
+        js = json.loads(resp.content.decode('utf8'))
+        [shakemap_id] = [version['id'] for version in js['shakemap_versions']
+                         if version['number'] == '10']
+        data = dict(usgs_id=usgs_id, shakemap_version=shakemap_id,
+                    maximum_distance='100', make_impact_reports=True)
+        self.impact_run_then_remove('impact_run_with_shakemap', data)
+
+    def test_level_1_maximum_distance_too_large(self):
+        self.set_user_level_and_remove_groups(1)
+        data = dict(usgs_id='us6000phrk', maximum_distance='501')
+        resp = self.post('impact_run', data=data)
+        self.assertEqual(resp.status_code, 400)
+        js = json.loads(resp.content.decode('utf8'))
+        self.assertEqual(js['invalid_inputs'], ['maximum_distance'])
+        self.assertIn('cannot exceed 500 km', js['error_msg'])
+
+    # check that the URL 'run' cannot be accessed in IMPACT mode
+    def test_can_not_run_normal_calc(self):
+        self.set_user_level_and_remove_groups(1)
+        with open(os.path.join(self.datadir, 'archive_ok.zip'), 'rb') as a:
+            resp = self.post('run', data=dict(archive=a))
+        self.assertEqual(resp.status_code, 404, resp)
+
+    # check that the URL 'validate_zip' cannot be accessed in IMPACT mode
+    def test_can_not_validate_zip(self):
+        self.set_user_level_and_remove_groups(1)
+        with open(os.path.join(self.datadir, 'archive_err_1.zip'), 'rb') as a:
+            resp = self.post('validate_zip', data=dict(archive=a))
+        self.assertEqual(resp.status_code, 404, resp)
+
+    def test_get_impact_form_defaults(self):
+        self.set_user_level_and_remove_groups(1)
+        resp = self.get('/v1/get_impact_form_defaults', prefix='')
+        resp = json.loads(resp.content.decode('utf8'))
+        expected_list = ['usgs_id', 'rupture_from_usgs', 'rupture_file', 'lon',
+                         'lat', 'dep', 'mag', 'aspect_ratio', 'rake',
+                         'local_timestamp', 'time_event', 'dip', 'strike',
+                         'maximum_distance', 'truncation_level',
+                         'number_of_ground_motion_fields',
+                         'asset_hazard_distance', 'region_grid_spacing',
+                         'ses_seed', 'station_data_file_from_usgs',
+                         'station_data_file', 'maximum_distance_stations',
+                         'msr', 'rupture_was_loaded', 'rupture_file_input',
+                         'station_data_file_input', 'station_data_file_loaded',
+                         'description', 'within_event_correlation_model',
+                         'between_event_correlation_model']
+        self.assertEqual(list(resp), expected_list)
+        self.assertEqual(resp['within_event_correlation_model'],
+                         'LothBaker2013')
+        self.assertEqual(resp['between_event_correlation_model'],
+                         'AbrahamsonEtAl2014BetweenEvent')
+
+    def test_impact_get_shakemap_versions(self):
+        self.set_user_level_and_remove_groups(1)
+        resp = self.c.post('/v1/impact_get_shakemap_versions',
+                           data={'usgs_id': 'us6000jllz'})
+        resp = json.loads(resp.content.decode('utf8'))
+        self.assertIn('shakemap_versions', resp)
+        self.assertIn('usgs_preferred_version', resp)
+        self.assertIsNone(resp['shakemap_versions_issue'])
+
+    def test_impact_get_nodal_planes_and_info(self):
+        self.set_user_level_and_remove_groups(2)
+        resp = self.c.post('/v1/impact_get_nodal_planes_and_info',
+                           data={'usgs_id': 'us6000jllz'})
+        resp = json.loads(resp.content.decode('utf8'))
+        self.assertIn('nodal_planes', resp)
+        self.assertIsNone(resp['nodal_planes_issue'])
+        self.assertIn('info', resp)
+
+    def test_impact_get_stations_from_usgs(self):
+        self.set_user_level_and_remove_groups(2)
+        shakemap_version = (
+            'urn:usgs-product:us:shakemap:us6000jllz:1756920117251')
+        resp = self.c.post('/v1/impact_get_stations_from_usgs',
+                           data={'usgs_id': 'us6000jllz',
+                                 'shakemap_version': shakemap_version})
+        resp = json.loads(resp.content.decode('utf8'))
+        self.assertIn('station_data_file', resp)
+        self.assertIn('n_stations', resp)
+        self.assertIsNone(resp['station_data_issue'])
+
+    def test_impact_get_rupture_data(self):
+        self.set_user_level_and_remove_groups(2)
+
+        # Case covered by a mosaic model
+        rup_params = dict(
+            approach='provide_rup_params', rupture_file='undefined',
+            usgs_id='UserProvided', use_shakemap='false', lon='9', lat='45',
+            dep='100', mag='7.5', rake='-90', dip='30', strike='45',
+            aspect_ratio='2', msr='WC1994')
+        resp = self.c.post('/v1/calc/impact_get_rupture_data',
+                           data=rup_params)
+        self.assertEqual(resp.status_code, 200)
+        self.assertIn('rupture_png', resp.json())
+
+        # apparently all points are covered by the models including oceans
+        """
+        rup_params = dict(
+            approach='provide_rup_params', rupture_file='undefined',
+            usgs_id='UserProvided', use_shakemap='false', lon='-139', lat='35',
+            dep='100', mag='7.5', rake='-90', dip='30', strike='45',
+            aspect_ratio='2', msr='WC1994')
+        resp = self.c.post('/v1/calc/impact_get_rupture_data',
+                           data=rup_params)
+        err = resp.json().get('error_msg',
+                              'The location is not external to the mosaic!')
+        self.assertEqual(
+            err,
+            '(-139.0, 35.0) is farther than 5 deg from any mosaic model!')
+        """

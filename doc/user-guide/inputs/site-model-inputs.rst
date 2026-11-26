@@ -1,0 +1,187 @@
+Site Models
+===========
+
+This section is used to specify where the hazard will be computed. Two options are available:
+
+The first option is to define a polygon (usually a rectangle) and a distance (in km) to be used to discretize the 
+polygon area. The polygon is defined by a list of longitude-latitude tuples.
+
+An example is provided below::
+
+	[geometry]
+	region = 10.0 43.0, 12.0 43.0, 12.0 46.0, 10.0 46.0
+	region_grid_spacing = 10.0
+
+The second option allows the definition of a number of sites where the hazard will be computed. Each site is specified 
+in terms of a longitude, latitude tuple. Optionally, if the user wants to consider the elevation of the sites, a value 
+of depth [km] can also be specified, where positive values indicate below sea level, and negative values indicate above 
+sea level (i.e. the topographic surface). If no value of depth is given for a site, it is assumed to be zero. An example 
+is provided below::
+
+	[geometry]
+	sites = 10.0 43.0, 12.0 43.0, 12.0 46.0, 10.0 46.0
+
+If the list of sites is too long the user can specify the name of a csv file as shown below::
+
+	[geometry]
+	site_model_csv = <name_of_the_csv_file>
+
+The format of the csv file containing the list of sites is a sequence of points (one per row) specified in terms of the 
+longitude, latitude tuple. Depth values are again optional. An example is provided below::
+
+     site_id,lon,lat
+	0,179.0,90.0
+	1,178.0,89.0
+	2,177.0,88.0
+
+The complete list of valid site parameters that can go into a site model .csv file are listed here. Currently, the work
+in documentation to describe this input parameters more explicitly, and to provide short descriptions of each valid site 
+parameter and where they are needed is in progress::
+
+	# dtype of each valid site parameter
+	site_param_dt = {
+	    'sids': numpy.uint32,
+	    'site_id': numpy.uint32,
+	    'lon': numpy.float64,
+	    'lat': numpy.float64,
+	    'depth': numpy.float64,
+	    'vs30': numpy.float64,
+	    'kappa0': numpy.float64,
+	    'vs30measured': bool,
+	    'z1pt0': numpy.float64,
+	    'z2pt5': numpy.float64,
+	    'siteclass': (numpy.string_, 1),
+	    'geohash': (numpy.string_, 6),
+	    'z1pt4': numpy.float64,
+	    'backarc': numpy.uint8,  # 0=forearc,1=backarc,2=alongarc
+	    'xvf': numpy.float64,
+	    'soiltype': numpy.uint32,
+	    'bas': bool,
+	
+	    # Parameters for site amplification
+	    'ampcode': ampcode_dt,
+	    'ec8': (numpy.string_, 1),
+	    'ec8_p18': (numpy.string_, 2),
+	    'h800': numpy.float64,
+	    'geology': (numpy.string_, 20),
+	    'amplfactor': numpy.float64,
+	    'ch_ampl03': numpy.float64,
+	    'ch_ampl06': numpy.float64,
+	    'ch_phis2s03': numpy.float64,
+	    'ch_phis2s06': numpy.float64,
+	    'ch_phiss03': numpy.float64,
+	    'ch_phiss06': numpy.float64,
+	    'fpeak': numpy.float64,
+	    # Fundamental period and and amplitude of HVRSR spectra
+	    'THV': numpy.float64,
+	    'PHV': numpy.float64,
+	
+	    # parameters for secondary perils
+	    'friction_mid': numpy.float64,
+	    'cohesion_mid': numpy.float64,
+	    'saturation': numpy.float64,
+	    'dry_density': numpy.float64,
+	    'Fs': numpy.float64,
+	    'crit_accel': numpy.float64,
+	    'unit': (numpy.string_, 5),
+	    'liq_susc_cat': (numpy.string_, 2),
+	    'dw': numpy.float64,
+	    'yield_acceleration': numpy.float64,
+	    'slope': numpy.float64,
+	    'relief': numpy.float64,
+	    'gwd': numpy.float64,
+	    'cti': numpy.float64,
+	    'dc': numpy.float64,
+	    'dr': numpy.float64,
+	    'dwb': numpy.float64,
+	    'zwb': numpy.float64,
+	    'tri': numpy.float64,
+	    'hwater': numpy.float64,
+	    'precip': numpy.float64,
+	
+	    # parameters for YoudEtAl2002
+	    'freeface_ratio': numpy.float64,
+	    'T_15': numpy.float64,
+	    'D50_15': numpy.float64,
+	    'F_15': numpy.float64,
+	    'T_eq': numpy.float64,
+	
+	    # other parameters
+	    'custom_site_id': (numpy.string_, 8),
+	    'region': numpy.uint32,
+	    'in_cshm': bool  # used in mcverry
+	}
+
+The ``custom_site_id``
+----------------------
+
+Since engine v3.13, it is possible to assign 6-character ASCII strings as unique identifiers for the sites (8-characters 
+since engine v3.15). This can be convenient in various situations, especially when splitting a calculation in geographic 
+regions. The way to enable it is to add a field called ``custom_site_id`` to the site model file, which must be unique 
+for each site.
+
+The hazard curve and ground motion field exporters have been modified to export the ``custom_site_id`` instead of the 
+``site_id`` (if present).
+
+We used this feature to split the ESHM20 model in two parts (Northern Europe and Southern Europe). Then creating the 
+full hazard map was as trivial as joining the generated CSV files. Without the ``custom_site_id`` the site IDs would 
+overlap, thus making impossible to join the outputs.
+
+A geohash string (see https://en.wikipedia.org/wiki/Geohash) makes a good ``custom_site_id`` since it can enable the
+unique identification of all potential sites across the globe.
+
+Amplification logic trees
+-------------------------
+
+Since engine v3.27, ``amplification_file`` in job.ini points at a plain amplification CSV, while
+``ampl_logic_tree_file`` points at a NRML XML file describing an *amplification logic tree*: a set of alternative
+amplification-function CSVs with weights summing to 1, representing epistemic uncertainty on the site-amplification
+function as a logic-tree branchset alongside the SSC and GMM logic trees. The two parameters are mutually exclusive.
+
+The XML has a single branchset with ``uncertaintyType="amplificationModel"``:
+
+.. code-block:: xml
+
+    <?xml version="1.0" encoding="UTF-8"?>
+    <nrml xmlns="http://openquake.org/xmlns/nrml/0.5">
+      <logicTree logicTreeID="lt_ampl">
+        <logicTreeBranchSet uncertaintyType="amplificationModel" branchSetID="bs_ampl">
+          <logicTreeBranch branchID="af_low">
+            <uncertaintyModel>amp_low.csv</uncertaintyModel>
+            <uncertaintyWeight>0.185</uncertaintyWeight>
+          </logicTreeBranch>
+          <logicTreeBranch branchID="af_med">
+            <uncertaintyModel>amp_med.csv</uncertaintyModel>
+            <uncertaintyWeight>0.630</uncertaintyWeight>
+          </logicTreeBranch>
+          <logicTreeBranch branchID="af_high">
+            <uncertaintyModel>amp_high.csv</uncertaintyModel>
+            <uncertaintyWeight>0.185</uncertaintyWeight>
+          </logicTreeBranch>
+        </logicTreeBranchSet>
+      </logicTree>
+    </nrml>
+
+Each branch is validated on its own: every branch must define AFs for all ampcodes used by the site model and for all
+IMTs listed in ``intensity_measure_types_and_levels``. Beyond that, nothing has to match between branches: the numeric
+AF and sigma values, the rock-IML ``level`` grid, the ``from_mag`` and ``from_rrup`` grids, and any extra ampcodes or
+IMT columns may all differ. Branches may therefore represent alternative discretisations and value sets as legitimate
+epistemic choices.
+
+Disaggregation with amplification
+^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+Disaggregation is supported alongside amplification (single CSV or amp-LT). The mag, dist, and lon/lat axes behave as
+usual. The epsilon axis requires two clarifications:
+
+* **Meaning of the epsilon axis.** Under amplification the epsilon axis is the **epsilon of the rock ground motion**,
+  not a soil-scale epsilon. Internally the amplification function is integrated on a fine rock-IML grid (the same grid
+  used by the classical convolution) and each fine-bin contribution is aggregated into the disagg epsilon bin that
+  contains its rock-epsilon. A bar at ``epsilon=+1`` in a 3D disagg plot therefore reads as: "contribution to soil
+  exceedance from cases where the rock ground motion was around 1 sigma above the GMM median, averaged over the
+  amplification model."
+* **``epsilon_star`` is not supported with amplification.** The ``epsilon_star`` mode collapses each rupture's
+  contribution into the single epsilon bin at which its rock ground motion crosses the target IML. Under a stochastic
+  amplification function (any amplification model CSV with a non-zero ``sigma_<IMT>`` column) every rock epsilon contributes with
+  some probability once the amplification is convolved, so no single "epsilon at exceedance" exists per rupture. Setting
+  ``epsilon_star = true`` alongside an amplification model raises an error.

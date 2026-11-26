@@ -1,0 +1,103 @@
+# -*- coding: utf-8 -*-
+# vim: tabstop=4 shiftwidth=4 softtabstop=4
+#
+# Copyright (C) 2016-2026 GEM Foundation
+#
+# OpenQuake is free software: you can redistribute it and/or modify it
+# under the terms of the GNU Affero General Public License as published
+# by the Free Software Foundation, either version 3 of the License, or
+# (at your option) any later version.
+#
+# OpenQuake is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU General Public License for more details.
+#
+# You should have received a copy of the GNU Affero General Public License
+# along with OpenQuake.  If not, see <http://www.gnu.org/licenses/>.
+
+import os
+import importlib
+from django.apps import AppConfig
+from django.conf import settings
+from openquake.baselib import config
+from openquake.commonlib import dbapi
+from openquake.server.db import actions
+
+# optional dependencies needed in IMPACT mode: (module, package, purpose)
+IMPACT_DEPENDENCIES = [
+    ('timezonefinder', 'timezonefinder',
+     'convert the UTC time to the local time of the event'),
+    ('matplotlib_scalebar.scalebar', 'matplotlib-scalebar',
+     'draw the scale bar of the impact reports'),
+    ('reportlab', 'reportlab', 'create the impact reports'),
+    ('fitz', 'PyMuPDF', 'create the impact reports'),  # PyMuPDF
+]
+
+oqdir = os.path.dirname(os.path.dirname(__file__))
+
+
+class ServerConfig(AppConfig):
+    name = 'openquake.server'
+
+    def ready(self):
+        # From Django manual:
+        #     Subclasses can override this method to perform initialization
+        #     tasks such as registering signals. It is called as soon as the
+        #     registry is fully populated.
+        #     Although you can’t import models at the module-level where
+        #     AppConfig classes are defined, you can import them in ready()
+        if settings.TEST:
+            config.directory['mosaic_dir'] = f'{oqdir}/qa_tests_data/mosaic'
+
+        import openquake.server.signals  # NOQA
+        if settings.LOCKDOWN:
+            import openquake.server.user_profile.signals  # NOQA
+
+        # reset any computation left in the 'executing' state;
+        # the database may not exist yet (this happens when building
+        # the docs, since doc/conf.py calls django.setup())
+        if actions.has_job_table(dbapi.db):
+            actions.reset_is_running(dbapi.db)
+
+        if settings.APPLICATION_MODE not in settings.APPLICATION_MODES:
+            raise ValueError(
+                f'Invalid application mode: "{settings.APPLICATION_MODE}".'
+                f' It must be one of {settings.APPLICATION_MODES}')
+        if settings.APPLICATION_MODE == 'IMPACT':
+            for module, package, purpose in IMPACT_DEPENDENCIES:
+                try:
+                    importlib.import_module(module)
+                except ImportError:
+                    raise ImportError(
+                        f'The python package "{package}" is not installed.'
+                        f' It is required in order to {purpose}.')
+        if (settings.LOCKDOWN and 'django_pam.auth.backends.PAMBackend'
+                not in settings.AUTHENTICATION_BACKENDS):
+            # check essential constants are defined
+            if settings.EMAIL_BACKEND is None:
+                raise NameError('If authentication is enabled (without PAM) an'
+                                ' email backend must be defined')
+            if settings.EMAIL_BACKEND == (
+                    'django.core.mail.backends.smtp.EmailBackend'):
+                required_email_settings = (
+                    'EMAIL_HOST', 'EMAIL_PORT', 'EMAIL_USE_TLS',
+                    'EMAIL_HOST_USER', 'EMAIL_HOST_PASSWORD')
+                for email_setting in required_email_settings:
+                    if getattr(settings, email_setting) is None:
+                        raise NameError(
+                            f'If authentication is enabled (without PAM)'
+                            f' all the following settings must be specified:'
+                            f' {required_email_settings}')
+        if settings.APPLICATION_MODE in ('AELO', 'IMPACT'):
+            if not config.directory.mosaic_dir:
+                raise NameError(
+                    f'If APPLICATION_MODE is {settings.APPLICATION_MODE}, '
+                    f'mosaic_dir must be specified in openquake.cfg')
+            if settings.APPLICATION_MODE == 'AELO':
+                # NOTE: this might be needed also for IMPACT
+                aelo_changelog_path = os.path.join(
+                    config.directory.mosaic_dir, 'aelo_changelog.ini')
+                if not os.path.isfile(aelo_changelog_path):
+                    raise FileNotFoundError(
+                        f'{aelo_changelog_path} was not found!')

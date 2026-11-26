@@ -1,0 +1,86 @@
+openquake.server package
+========================
+
+Subpackages
+-----------
+
+.. toctree::
+
+    openquake.server.db
+    openquake.server.webui
+
+Submodules
+----------
+
+openquake.server.manage module
+------------------------------
+
+.. automodule:: openquake.server.manage
+    :members:
+    :undoc-members:
+    :show-inheritance:
+
+openquake.server.middleware module
+----------------------------------
+
+.. automodule:: openquake.server.middleware
+    :members:
+    :undoc-members:
+    :show-inheritance:
+
+openquake.server.settings module
+--------------------------------
+
+.. automodule:: openquake.server.settings
+    :members:
+    :undoc-members:
+    :show-inheritance:
+
+openquake.server.urls module
+----------------------------
+
+.. automodule:: openquake.server.urls
+    :members:
+    :undoc-members:
+    :show-inheritance:
+
+openquake.server.utils module
+-----------------------------
+
+.. automodule:: openquake.server.utils
+    :members:
+    :undoc-members:
+    :show-inheritance:
+
+openquake.server.views module
+-----------------------------
+
+.. automodule:: openquake.server.views
+    :members:
+    :undoc-members:
+    :show-inheritance:
+
+openquake.server.internal_api module
+------------------------------------
+
+.. automodule:: openquake.server.internal_api
+    :members:
+    :undoc-members:
+    :show-inheritance:
+
+openquake.server.services module
+--------------------------------
+
+.. automodule:: openquake.server.services
+    :members:
+    :undoc-members:
+    :show-inheritance:
+
+
+Module contents
+---------------
+
+.. automodule:: openquake.server
+    :members:
+    :undoc-members:
+    :show-inheritance:

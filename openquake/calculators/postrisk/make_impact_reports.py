@@ -1,0 +1,354 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+# vim: tabstop=4 shiftwidth=4 softtabstop=4
+#
+# Copyright (C) 2026 GEM Foundation
+#
+# OpenQuake is free software: you can redistribute it and/or modify it
+# under the terms of the GNU Affero General Public License as published
+# by the Free Software Foundation, either version 3 of the License, or
+# (at your option) any later version.
+#
+# OpenQuake is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU Affero General Public License for more details.
+#
+# You should have received a copy of the GNU Affero General Public License
+# along with OpenQuake. If not, see <http://www.gnu.org/licenses/>.
+
+import os
+import copy
+import pathlib
+import tempfile
+import logging
+import traceback
+import numpy
+import pandas as pd
+from openquake.baselib import config, hdf5, sap
+from openquake.baselib.general import gettemp
+from openquake.calculators.country_impact_report_builder import (
+    CountryImpactReportBuilder)
+from openquake.calculators.extract import extract, _get_data
+from openquake.calculators.country_impact_report_utils import (
+    EventContext, ReportOptions, LOSS_METADATA, get_configured_path,
+    get_fatalities_loss_type, points_to_gdf)
+from openquake.hazardlib.shakemap.parsers import format_event_time
+from openquake.commonlib import logs, datastore
+from openquake.commonlib.readinput import get_close_countries, get_rupture
+
+cd = pathlib.Path(__file__).parent
+
+LOSS_LABELS = [v["label"] for v in LOSS_METADATA.values()]
+
+DISCLAIMER_TXT = '''
+    This is an automatically generated draft. Content has not been verified for
+    accuracy by a human reviewer. The metrics presented were estimated based on
+    ground shaking information from ShakeMap only. Impact assessments are
+    subject to changes as more information becomes available.'''
+
+
+def _get_impact_summary_data(aggrisk_tags, iso3, no_uncertainty, occ_lt):
+    # aggrisk_tags is extract(dstore, 'aggrisk_tags'), the same for all the
+    # countries; occ_lt is the loss type of the fatalities for the selected
+    # time event
+    mapping = {
+        meta["label"]: occ_lt if loss_type == 'occupants' else loss_type
+        for loss_type, meta in LOSS_METADATA.items()
+    }
+    rows = aggrisk_tags.loc[
+        (aggrisk_tags['ID_0'] == iso3) &
+        (aggrisk_tags['loss_type'].isin(mapping.values()))
+    ]
+    if rows.empty:
+        logging.info(
+            f"No losses estimated for country {iso3}. Skipping report")
+        return None
+    loss_threshold = 1
+    has_fatality = rows.loc[
+        rows['loss_type'] == mapping['Fatalities'], 'lossmea'
+    ].ge(loss_threshold).any()
+    if (all(r.lossmea < loss_threshold for _, r in rows.iterrows())
+            and not has_fatality):
+        logging.info(f"Estimated losses for country {iso3} are negligible"
+                     f" (all lossmea < {loss_threshold}). Skipping report.")
+        return None
+    summary_data = {}
+    for label, lt in mapping.items():
+        matching_rows = rows.loc[rows['loss_type'] == lt]
+        if not matching_rows.empty:
+            r = matching_rows.iloc[0]
+            q50 = float(r.get('q50', 0))
+            q05 = float(r.get('q05', 0))
+            q95 = float(r.get('q95', 0))
+            exposed_val = float(r.get('value', 0))
+        else:
+            q50 = q05 = q95 = exposed_val = 0.0
+        if no_uncertainty:
+            # Display only the central value
+            summary_data[label] = str(q50)
+        else:
+            # Display the range
+            summary_data[label] = f"{q05} - {q95}"
+        summary_data[f"{label}_exposed"] = str(exposed_val)
+    return summary_data
+
+
+def make_report_for_country(
+        iso3, adm_level, event, options, losses_df, summary_data,
+        dstore, time_of_calc, oqparam, points_gdf=None):
+    builder = CountryImpactReportBuilder(
+        iso3, adm_level, event, options, losses_df, summary_data,
+        dstore, time_of_calc, oqparam, points_gdf)
+    builder.build()
+
+
+def get_dynamic_threshold(mag):
+    """
+    Returns a search threshold in degrees based on earthquake magnitude.
+    """
+    if mag < 5.0:
+        return 1.0  # ~111 km
+    elif mag < 6.5:
+        return 2.0  # ~222 km
+    elif mag < 7.5:
+        return 3.0  # ~333 km
+    else:
+        return 5.0  # ~555 km
+
+
+def _open_dstore(dstore):
+    """
+    Resolve the dstore argument (path/int from CLI, or an open Datastore),
+    returning (dstore, calc_id).
+    """
+    if isinstance(dstore, (str, int)):
+        # NOTE: called from the command line
+        calc_id = int(dstore)
+        dstore = datastore.read(calc_id, mode='r+')
+    else:
+        calc_id = dstore.calc_id
+    return dstore, calc_id
+
+
+def _get_basemap_path():
+    """Return the basemap configured for impact reports."""
+    return get_configured_path('basemap_file')
+
+
+def _is_no_uncertainty(oqparam):
+    # If the ground motion is fully deterministic, we suppress uncertainty
+    # ranges in the report and show only the central (point) estimate.
+    return (oqparam.number_of_ground_motion_fields == 1
+            and abs(oqparam.truncation_level) < 1e-8)
+
+
+def _get_losses_df(dstore, oqparam):
+    """
+    Use the median (quantile-0.5) as the representative point estimate for
+    the spatial loss maps, consistent with how _get_impact_summary_data
+    displays the central value. Fall back to the mean only if the median is
+    unavailable (e.g. a calculation run without quantile outputs).
+
+    :returns: a DataFrame with the asset coordinates and losses, and the
+        name of the statistic
+    """
+    # the statistics and the coordinates are read directly, as in
+    # extract_avg_losses but without the tags of the assets, which are not
+    # needed and would be slow and memory consuming for many assets
+    _name, values, stats = _get_data(
+        dstore, 'avg_losses-stats', oqparam.ext_loss_types,
+        oqparam.hazard_stats())
+    if 'quantile-0.5' in stats:
+        stat, metric = 'quantile-0.5', 'Median'
+    elif 'mean' in stats:
+        logging.warning(
+            "Median losses not available; falling back to mean for "
+            "loss maps.")
+        stat, metric = 'mean', 'Mean'
+    else:
+        raise RuntimeError(
+            "avg_losses has neither 'quantile' nor 'mean' attribute; "
+            "cannot build losses DataFrame.")
+    assets = dstore['assetcol/array']
+    # rounded as in util.get_assets
+    dic = {coord: numpy.round(assets[coord], 5).astype(numpy.float32)
+           for coord in ('lon', 'lat')}
+    s = stats.index(stat)
+    for li, lt in enumerate(oqparam.ext_loss_types):
+        dic[lt] = values[:, s, li].astype(numpy.float32)
+    return pd.DataFrame(dic), metric
+
+
+def _get_event_name(rupdic):
+    try:
+        return rupdic['description']
+    except KeyError:
+        return rupdic['title']
+
+
+def _get_shakemap_version(rupdic):
+    try:
+        return rupdic['shakemap_desc']
+    except KeyError:
+        return None
+
+
+def _get_rupture(dstore, oqparam):
+    # Return the rupture if a rupture model was given, otherwise None,
+    # so that the epicenter will be displayed in the maps as a fallback
+    fname = oqparam.inputs.get('rupture_model')
+    if fname is None:
+        return None
+    # the rupture model file stored by the calculation is used, since the
+    # original file can be a temporary file removed in the meantime
+    ext = os.path.splitext(fname)[1]
+    key = 'input/rupture_model' + ext
+    try:
+        if key in dstore:
+            oqparam = copy.copy(oqparam)
+            oqparam.inputs = dict(
+                oqparam.inputs, rupture_model=gettemp(
+                    dstore.get_file(key).read(), suffix=ext))
+        return get_rupture(oqparam)
+    except Exception:
+        logging.warning('Could not read the rupture model; the maps will'
+                        ' display the epicenter instead', exc_info=True)
+        return None
+
+
+def _get_threshold_deg(threshold_deg, mag):
+    if threshold_deg is None:
+        threshold_deg = get_dynamic_threshold(mag)
+        logging.info(f"Magnitude {mag} detected. Using dynamic"
+                     f" threshold: {threshold_deg} degrees.")
+        return threshold_deg
+    return float(threshold_deg)
+
+
+def _build_report_contexts(dstore, oqparam, calc_id, threshold_deg):
+    """
+    Gather everything needed to build per-country reports and return
+    (event_ctx, report_opts, losses_df, iso3_codes, time_of_calc).
+    """
+    mag = oqparam.rupture_dict['mag']
+    lon = oqparam.rupture_dict['lon']
+    lat = oqparam.rupture_dict['lat']
+    no_uncertainty = _is_no_uncertainty(oqparam)
+
+    losses_df, loss_metric = _get_losses_df(dstore, oqparam)
+    # the maps display the fatalities for the selected time event
+    losses_df = losses_df.rename(
+        columns={get_fatalities_loss_type(oqparam): 'occupants'})
+
+    rupdic = oqparam.rupture_dict
+    event_name = _get_event_name(rupdic)
+    event_date = format_event_time(oqparam.local_timestamp)
+    shakemap_version = _get_shakemap_version(rupdic)
+
+    job = logs.dbcmd('get_job', calc_id)
+    time_of_calc = job.start_time.strftime('%Y-%m-%d %H:%M:%S') + ' UTC'
+
+    threshold_deg = _get_threshold_deg(threshold_deg, mag)
+    # close countries are ordered by ascending distance
+    iso3_codes = get_close_countries(lon, lat, buffer_radius=threshold_deg)
+    if not iso3_codes:
+        raise RuntimeError(
+            "No country within {threshold_deg} from the hypocenter")
+
+    event_ctx = EventContext(
+        name=event_name, date=event_date, hypocenter=(lon, lat),
+        shakemap_version=shakemap_version,
+        rupture=_get_rupture(dstore, oqparam))
+    report_opts = ReportOptions(
+        disclaimer_txt=DISCLAIMER_TXT,
+        basemap_path=_get_basemap_path(), threshold_deg=threshold_deg,
+        no_uncertainty=no_uncertainty, loss_metric=loss_metric)
+
+    return event_ctx, report_opts, losses_df, iso3_codes, time_of_calc
+
+
+def _log_report_error(message):
+    # Log a report error, including its traceback
+    logging.error("%s\n%s", message, traceback.format_exc())
+
+
+def _add_report_warning(dstore, message):
+    # Add a report warning to the datastore
+    try:
+        warnings = []
+        if 'warnings' in dstore:
+            warnings = [
+                item.decode('utf8') if isinstance(item, bytes) else str(item)
+                for item in dstore['warnings'][:]
+            ]
+        dstore['warnings'] = hdf5.array_of_vstr(warnings + [message])
+    except Exception:
+        logging.error(
+            "Could not save the report warning in the datastore",
+            exc_info=True,
+        )
+
+
+def _generate_reports(dstore, adm_level, threshold_deg, calc_id):
+    """
+    Create an impact report in PDF and PNG formats
+    """
+    try:
+        dstore.close()
+        dstore.open('r+')
+        dstore.export_dir = (
+            config.directory.custom_tmp or tempfile.gettempdir())
+        oqparam = dstore['oqparam']
+        event_ctx, report_opts, losses_df, iso3_codes, time_of_calc = (
+            _build_report_contexts(
+                dstore, oqparam, calc_id, threshold_deg))
+    except Exception:
+        _log_report_error("Error while preparing country impact reports")
+        _add_report_warning(
+            dstore,
+            "Country impact report generation failed during preparation. "
+            "See the job log for details.")
+        return
+
+    points_gdf = aggrisk_tags = None
+    failed_countries = []
+    occ_lt = get_fatalities_loss_type(oqparam)
+    for iso3 in iso3_codes:
+        try:
+            if aggrisk_tags is None:  # the same for all the countries
+                aggrisk_tags = extract(dstore, 'aggrisk_tags')
+            summary_data = _get_impact_summary_data(
+                aggrisk_tags, iso3, report_opts.no_uncertainty, occ_lt)
+            if summary_data is not None:
+                if points_gdf is None:
+                    points_gdf = points_to_gdf(
+                        losses_df, crs='EPSG:4326')
+                make_report_for_country(
+                    iso3, adm_level, event_ctx, report_opts,
+                    losses_df, summary_data, dstore, time_of_calc, oqparam,
+                    points_gdf)
+        except Exception:
+            _log_report_error(
+                f"Error while generating impact report for {iso3}")
+            failed_countries.append(iso3)
+
+    if failed_countries:
+        countries = ', '.join(failed_countries)
+        _add_report_warning(
+            dstore,
+            "Country impact report generation failed for: "
+            f"{countries}. See the job log for details.")
+
+
+def main(dstore, adm_level=1, threshold_deg=None):
+    """
+    Create impact reports while logging to both server and job logs.
+    """
+    dstore, calc_id = _open_dstore(dstore)
+    with logs.init(dict(job_id=calc_id)):
+        _generate_reports(dstore, int(adm_level), threshold_deg, calc_id)
+
+
+if __name__ == '__main__':
+    sap.run(main)

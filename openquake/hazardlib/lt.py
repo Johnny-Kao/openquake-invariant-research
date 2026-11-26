@@ -1,0 +1,1935 @@
+# -*- coding: utf-8 -*-
+# vim: tabstop=4 shiftwidth=4 softtabstop=4
+#
+# Copyright (C) 2020, GEM Foundation
+#
+# OpenQuake is free software: you can redistribute it and/or modify it
+# under the terms of the GNU Affero General Public License as published
+# by the Free Software Foundation, either version 3 of the License, or
+# (at your option) any later version.
+#
+# OpenQuake is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU Affero General Public License for more details.
+#
+# You should have received a copy of the GNU Affero General Public License
+# along with OpenQuake.  If not, see <http://www.gnu.org/licenses/>.
+"""
+Branches, branchsets, uncertainties and the base classes of the logic
+trees. All the logic trees implement the interface of AbstractLogicTree;
+the logic trees made of branchsets derive from BranchSetLogicTree and the
+logic trees which can be the extra logic tree of a FullLogicTree derive
+from ExtraLogicTree. Here is the hierarchy, with the methods defined or
+overridden by each class::
+
+    AbstractLogicTree
+    │   get_realizations, sample, get_num_paths, __toh5__, __fromh5__
+    │   to_node, to_nrml
+    ├── BranchSetLogicTree
+    │   │   __init__, root_branchset, set_num_paths, get_num_paths,
+    │   │   get_realizations, sample, get_all_paths, sample_paths,
+    │   │   apply_all, to_node, h5attrs, __toh5__, __fromh5__
+    │   ├── SourceModelLogicTree
+    │   │       set_num_paths, decompose, reduce, prune, bset_values, h5attrs,
+    │   │       __fromh5__
+    │   └── ExtraLogicTree
+    │       │   get_realizations, shortener
+    │       ├── PFDLogicTree
+    │       │       selections_for, check_r_sigma_conflict
+    │       └── AmplificationLogicTree
+    │               from_xml, is_amp_lt, names, weights, filenames,
+    │               branchset_id, amplify, check, __fromh5__
+    ├── GsimLogicTree
+    │       get_realizations, sample, get_num_paths, to_node, __toh5__,
+    │       __fromh5__
+    └── FullLogicTree
+            get_realizations, get_num_paths, sample, __toh5__, __fromh5__
+
+NRML export is optional: AbstractLogicTree.to_nrml calls to_node, which
+BranchSetLogicTree and GsimLogicTree implement. FullLogicTree combines
+separate trees and inherits the default to_node raising NotImplementedError.
+The uncertainty_to_node helper serializes MFD values and correlated mappings.
+The gsim_lt.read_branchsets helper reads editable branchsets without
+validating branch IDs or loading source files, retaining nested uncertainty
+XML.
+
+The classes are defined in the modules lt, logictree, gsim_lt, pfd_lt and
+amp_lt of openquake.hazardlib.
+"""
+import abc
+import ast
+import copy
+import json
+import math
+import base64
+import pickle
+import itertools
+import operator
+import toml
+import numpy
+
+from openquake.baselib import hdf5
+from openquake.baselib.general import CallableDict, BASE183
+from openquake.baselib.node import Node, striptag
+from openquake.hazardlib import geo, nrml
+from openquake.hazardlib.sourceconverter import (
+    split_coords_2d, split_coords_3d)
+from openquake.hazardlib import valid
+from openquake.hazardlib.mfd.multi_mfd import MultiMFD
+from openquake.hazardlib.sourcewriter import build_multi_mfd
+
+NOAPPLY_UNCERTAINTIES = [
+    'sourceModel', 'extendModel', 'gmpeModel', 'amplificationModel']
+
+
+class LogicTreeError(Exception):
+    """
+    Logic tree file contains a logic error.
+
+    :param node:
+        XML node object that causes fail. Used to determine
+        the affected line number.
+
+    All other constructor parameters are passed to :class:`superclass'
+    <LogicTreeError>` constructor.
+    """
+    def __init__(self, node, filename, message):
+        self.filename = filename
+        self.message = message
+        self.lineno = node if isinstance(node, int) else getattr(
+            node, 'lineno', '?')
+
+    def __str__(self):
+        return "filename '%s', line %s: %s" % (
+            self.filename, self.lineno, self.message)
+
+
+#                           parse_uncertainty                              #
+
+
+def unknown(utype, node, filename):
+    try:
+        return float(node.text)
+    except (TypeError, ValueError):
+        raise LogicTreeError(
+            node, filename, f'{utype}: expected single float value, '
+            f'got "{node.text}"')
+
+
+parse_uncertainty = CallableDict(keymissing=unknown)
+
+
+@parse_uncertainty.add('sourceModel', 'extendModel')
+def smodel(utype, node, filename):
+    return node.text.strip()
+
+
+@parse_uncertainty.add('abGRAbsolute')
+def abGR(utype, node, filename):
+    try:
+        [a, b] = node.text.split()
+        return float(a), float(b)
+    except ValueError:
+        raise LogicTreeError(
+            node, filename, 'expected a pair of floats separated by space')
+
+
+@parse_uncertainty.add('setHypoDepthDistribution')
+def setHypoDepthDistribution(utype, node, filename):
+    try:
+        return [n.attrib for n in node.hypoDepthDist]
+    except ValueError:
+        raise LogicTreeError(
+            node, filename, 'expected a hypoDepthDist')
+
+
+@parse_uncertainty.add('maxMagAndDeltaMagACRelative',
+                       'maxMagAndDeltaMagACRelativeNoMoBalance')
+def maxMagAndDeltaMagAC(utype, node, filename):
+    try:
+        [delta_max_mag, delta_m_AC] = node.text.split()
+        return float(delta_max_mag), float(delta_m_AC)
+    except ValueError:
+        raise LogicTreeError(
+            node, filename, 'expected a pair of floats separated by space')
+
+
+@parse_uncertainty.add('abMaxMagAbsolute')
+def abMMax(utype, node, filename):
+    try:
+        [a, b, c] = node.text.split()
+        return float(a), float(b), float(c)
+    except ValueError:
+        raise LogicTreeError(
+            node, filename, 'expected a triple of floats separated by space')
+
+
+@parse_uncertainty.add('incrementalMFDAbsolute')
+def incMFD(utype, node, filename):
+    min_mag, bin_width = (node.incrementalMFD["minMag"],
+                          node.incrementalMFD["binWidth"])
+    return min_mag,  bin_width, ~node.incrementalMFD.occurRates
+
+
+@parse_uncertainty.add('multiMFDAbsolute')
+def multiMFD(utype, node, filename):
+    # the parameters (kind, size, kwargs) of a MultiMFD replacing the MFDs
+    # of all the points of a multiPointSource; a missing bin_width is
+    # taken from the source when the uncertainty is applied. For instance
+    #   <multiMFD kind="truncGutenbergRichterMFD" size="2">
+    #     <a_val>1.1E-03 1.2E-03</a_val> <b_val>8.0E-01</b_val>
+    #     <max_mag>6.93</max_mag> <min_mag>5.5</min_mag>
+    #   </multiMFD>
+    # gives kind='truncGutenbergRichterMFD', size=2 and kwargs={'min_mag':
+    # [5.5], 'max_mag': [6.93], 'a_val': [0.0011, 0.0012], 'b_val': [0.8]};
+    # an array of length 1 is shared by all the points, an array of length
+    # size has one value per point
+    try:
+        mmfd = MultiMFD.from_node(node.multiMFD, numpy.nan)
+    except Exception as exc:
+        raise LogicTreeError(node, filename, f'{utype}: {exc}')
+    kwargs = dict(mmfd.kwargs)
+    if numpy.isnan(kwargs['bin_width'][0]):
+        del kwargs['bin_width']
+    return mmfd.kind, mmfd.size, kwargs
+
+
+@parse_uncertainty.add('truncatedGRFromSlipAbsolute')
+def trucMFDFromSlip_absolute(utype, node, filename):
+    slip_rate, rigidity = (node.faultActivityData["slipRate"],
+                           node.faultActivityData["rigidity"])
+    const_term = float(node.faultActivityData.get("constant_term", 9.1))
+    return slip_rate, rigidity, const_term
+
+
+@parse_uncertainty.add('setMSRAbsolute')
+def setMSR_absolute(utype, node, filename):
+    return valid.mag_scale_rel(node.text)
+
+
+@parse_uncertainty.add('areaSourceGeometryAbsolute')
+def areaGeom(utype, node, filename):
+    geom = node.areaGeometry
+    usd = ~geom.upperSeismoDepth
+    lsd = ~geom.lowerSeismoDepth
+    coords = split_coords_2d(~geom.Polygon.exterior.LinearRing.posList)
+    return coords, usd, lsd
+
+
+@parse_uncertainty.add('simpleFaultGeometryAbsolute')
+def simpleGeom(utype, node, filename):
+    if hasattr(node, 'simpleFaultGeometry'):
+        node = node.simpleFaultGeometry
+    _validate_simple_fault_geometry(utype, node, filename)
+    spacing = node["spacing"]
+    usd, lsd, dip = (~node.upperSeismoDepth, ~node.lowerSeismoDepth,
+                     ~node.dip)
+    coords = split_coords_2d(~node.LineString.posList)
+    return coords, usd, lsd, dip, spacing
+
+
+@parse_uncertainty.add('complexFaultGeometryAbsolute')
+def complexGeom(utype, node, filename):
+    if hasattr(node, 'complexFaultGeometry'):
+        node = node.complexFaultGeometry
+    _validate_complex_fault_geometry(utype, node, filename)
+    spacing = node["spacing"]
+    all_coords = []
+    for edge_node in node.nodes:
+        all_coords.append(split_coords_3d(~edge_node.LineString.posList))
+    return all_coords, spacing
+
+
+def to_surface(pairs):
+    surfaces = []
+    for i, (tag, extra) in enumerate(pairs):
+        if tag == 'simpleFaultGeometry':
+            coords, usd, lsd, dip, spacing = extra
+            trace = geo.Line([geo.Point(*p) for p in coords])
+            surfaces.append(geo.SimpleFaultSurface.from_fault_data(
+                trace, usd, lsd, dip, spacing))
+        elif tag == 'complexFaultGeometry':
+            all_coords, spacing = extra
+            edges = [geo.Line([geo.Point(*p) for p in coords])
+                     for coords in all_coords]
+            surfaces.append(geo.ComplexFaultSurface.from_fault_data(
+                edges, spacing))
+        elif tag == 'planarSurface':
+            tl, tr, br, bl = extra
+            surface = geo.PlanarSurface.from_corner_points(
+                geo.Point(*tl), geo.Point(*tr), geo.Point(*br), geo.Point(*bl))
+            surface.idx = f'{i}'
+            surfaces.append(surface)
+
+    if len(surfaces) > 1:
+        return geo.MultiSurface(surfaces)
+    else:
+        return surfaces[0]
+
+
+@parse_uncertainty.add('characteristicFaultGeometryAbsolute')
+def charGeom(utype, node, filename):
+    pairs = []  # (tag, extra)
+    for geom_node in node.surface:
+        if "simpleFaultGeometry" in geom_node.tag:
+            _validate_simple_fault_geometry(utype, geom_node, filename)
+            extra = parse_uncertainty(
+                'simpleFaultGeometryAbsolute', geom_node, filename)
+        elif "complexFaultGeometry" in geom_node.tag:
+            _validate_complex_fault_geometry(utype, geom_node, filename)
+            extra = parse_uncertainty(
+                'complexFaultGeometryAbsolute', geom_node, filename)
+        elif "planarSurface" in geom_node.tag:
+            _validate_planar_fault_geometry(utype, geom_node, filename)
+            extra = []
+            for key in ["topLeft", "topRight", "bottomRight", "bottomLeft"]:
+                nd = getattr(geom_node, key)
+                extra.append((nd["lon"], nd["lat"], nd["depth"]))
+        else:
+            raise LogicTreeError(
+                geom_node, filename, "Surface geometry type not recognised")
+        pairs.append((geom_node.tag.split('}')[1], extra))
+    return pairs
+
+
+# BCHydro NVA epistemic uncertainty
+@parse_uncertainty.add('recurSet')
+def recur_set(utype, node, filename):
+    # max_mag is returned as list because use of
+    # valid.positivefloats so we convert to scalar
+    node.row.attrib["max_mag"] = node.row.attrib["max_mag"][0]
+    return node.row.attrib
+
+
+# BCHydro NVA epistemic uncertainty
+@parse_uncertainty.add('recurRow')
+def recur_row(utype, node, filename):
+    return node.row.attrib
+
+
+# BCHydro NVA epistemic uncertainty
+@parse_uncertainty.add('rateSplit')
+def rate_split(utype, node, filename):
+    return node.row.attrib
+
+
+# PFD logic tree: the four model slots and the r_sigma calculation parameter.
+_PFD_MODEL_UTYPES = (
+    'fdhaPrimarySRModel', 'fdhaPrimaryFDModel',
+    'fdhaSecondarySRModel', 'fdhaSecondaryFDModel')
+
+
+@parse_uncertainty.add(*_PFD_MODEL_UTYPES)
+def pfd_model(utype, node, filename):
+    """
+    Parse an PFD ``<uncertaintyModel>``: a bare model class name or an
+    oq-engine style ``[ClassName]`` TOML block of constructor parameters.
+
+    :returns: ``(class_name, params)``
+    """
+    raw = (node.text or "").strip()
+    if not raw:
+        raise LogicTreeError(node, filename, 'empty uncertaintyModel')
+    if raw.startswith('[') and ']' in raw.splitlines()[0]:
+        return _parse_pfd_toml_block(node, filename)
+    if '\n' in raw:
+        # tolerate wrapped text; a bare name is a single token
+        raw = ''.join(line.strip() for line in raw.splitlines()
+                      if line.strip())
+    return raw, {}
+
+
+def _parse_pfd_toml_block(node, filename):
+    # NRML indents the block to the XML nesting depth; toml.loads accepts
+    # leading whitespace, so the block can be parsed as is
+    text = (node.text or '').strip()
+    if not text:
+        raise LogicTreeError(node, filename, 'empty TOML block')
+    try:
+        dic = toml.loads(text)
+    except Exception as exc:
+        raise LogicTreeError(node, filename, str(exc))
+    try:
+        [(class_name, params)] = dic.items()
+    except ValueError:
+        raise LogicTreeError(
+            node, filename,
+            'the TOML block must contain a single [ClassName] section')
+    return class_name, params
+
+
+@parse_uncertainty.add('fdhaCalcRSigma')
+def pfd_r_sigma(utype, node, filename):
+    """
+    Parse an ``fdhaCalcRSigma`` ``<uncertaintyModel>``: the two-sided
+    mapping-accuracy sigma ``r_sigma_km`` -- a finite float ``>= 0`` (zero
+    selects the boxcar ``W_p`` path).
+    """
+    raw = (node.text or "").strip()
+    try:
+        value = float(raw)
+    except (TypeError, ValueError):
+        raise LogicTreeError(
+            node, filename,
+            'expected a single non-negative float (km), got %r' % raw)
+    if not math.isfinite(value) or value < 0.0:
+        raise LogicTreeError(
+            node, filename,
+            'value must be a non-negative finite float (km), got %r' % raw)
+    return value
+
+
+def uncertainty_to_node(utype, value, correlated=False):
+    """
+    Serialize a text value, parsed MFD uncertainty or correlated mapping.
+    Unparsed uncertaintyModel or MFD nodes are also accepted, so editing a
+    tree does not require parsing and reconstructing unrelated geometries.
+    """
+    if isinstance(value, Node):
+        if striptag(value.tag) == 'uncertaintyModel':
+            return value
+        return Node('uncertaintyModel', nodes=[value])
+    if correlated:
+        nodes = []
+        for srcid, val in value.items():
+            node = copy.copy(uncertainty_to_node(utype, val))
+            node.tag = 'correlated'
+            node.attrib = dict(node.attrib, src=srcid)
+            nodes.append(node)
+        return Node('uncertaintyModel', nodes=nodes)
+    if utype == 'incrementalMFDAbsolute':
+        min_mag, bin_width, rates = value
+        mfd = Node('incrementalMFD', dict(minMag=min_mag, binWidth=bin_width),
+                   nodes=[Node('occurRates', text=rates)])
+        return Node('uncertaintyModel', nodes=[mfd])
+    if utype == 'multiMFDAbsolute':
+        kind, size, kwargs = value
+        mfd = build_multi_mfd(MultiMFD(kind, size, **kwargs))
+        # An omitted bin width is inherited from the source, not written NaN.
+        mfd.nodes = [n for n in mfd if striptag(n.tag) != 'bin_width' or
+                     'bin_width' in kwargs]
+        return Node('uncertaintyModel', nodes=[mfd])
+    return Node('uncertaintyModel', text=value)
+
+
+# validations
+
+def _validate_simple_fault_geometry(utype, node, filename):
+    try:
+        coords = split_coords_2d(~node.LineString.posList)
+        trace = geo.Line([geo.Point(*p) for p in coords])
+    except ValueError:
+        # If the geometry cannot be created then use the LogicTreeError
+        # to point the user to the incorrect node. Hence, if trace is
+        # compiled successfully then len(trace) is True, otherwise it is
+        # False
+        trace = []
+    if len(trace):
+        return
+    raise LogicTreeError(
+        node, filename, "'simpleFaultGeometry' node is not valid")
+
+
+def _validate_complex_fault_geometry(utype, node, filename):
+    # NB: if the geometry does not conform to the Aki & Richards convention
+    # this will not be verified here, but will raise an error when the surface
+    # is created
+    valid_edges = []
+    for edge_node in node.nodes:
+        try:
+            coords = split_coords_3d(edge_node.LineString.posList.text)
+            edge = geo.Line([geo.Point(*p) for p in coords])
+        except ValueError:
+            # See use of validation error in simple geometry case
+            # The node is valid if all of the edges compile correctly
+            edge = []
+        if len(edge):
+            valid_edges.append(True)
+        else:
+            valid_edges.append(False)
+    if node["spacing"] and all(valid_edges):
+        return
+    raise LogicTreeError(
+        node, filename, "'complexFaultGeometry' node is not valid")
+
+
+def _validate_planar_fault_geometry(utype, node, filename):
+    valid_spacing = node["spacing"]
+    for key in ["topLeft", "topRight", "bottomLeft", "bottomRight"]:
+        lon = getattr(node, key)["lon"]
+        lat = getattr(node, key)["lat"]
+        depth = getattr(node, key)["depth"]
+        valid_lon = (lon >= -180.0) and (lon <= 180.0)
+        valid_lat = (lat >= -90.0) and (lat <= 90.0)
+        valid_depth = (depth >= 0.0)
+        is_valid = valid_lon and valid_lat and valid_depth
+        if not is_valid or not valid_spacing:
+            raise LogicTreeError(
+                node, filename, "'planarFaultGeometry' node is not valid")
+
+
+#                         apply_uncertainty                                #
+
+apply_uncertainty = CallableDict()
+
+
+@apply_uncertainty.add('areaSourceGeometryAbsolute')
+def _area_source_geom_absolute(utype, source, value):
+    coords, usd, lsd = value
+    poly = geo.Polygon([geo.Point(*p) for p in coords])
+    source.modify('set_geometry', dict(polygon=poly))
+
+
+@apply_uncertainty.add('simpleFaultDipRelative')
+def _simple_fault_dip_relative(utype, source, value):
+    source.modify('adjust_dip', dict(increment=value))
+
+
+@apply_uncertainty.add('simpleFaultDipAbsolute')
+def _simple_fault_dip_absolute(utype, source, value):
+    source.modify('set_dip', dict(dip=value))
+
+
+@apply_uncertainty.add('simpleFaultGeometryAbsolute')
+def _simple_fault_geom_absolute(utype, source, value):
+    coords, usd, lsd, dip, spacing = value
+    trace = geo.Line([geo.Point(*p) for p in coords])
+    source.modify(
+        'set_geometry',
+        dict(fault_trace=trace, upper_seismogenic_depth=usd,
+             lower_seismogenic_depth=lsd, dip=dip, spacing=spacing))
+
+
+@apply_uncertainty.add('complexFaultGeometryAbsolute')
+def _complex_fault_geom_absolute(utype, source, value):
+    all_coords, spacing = value
+    edges = [geo.Line([geo.Point(*p) for p in coords]) for coords in all_coords]
+    source.modify('set_geometry', dict(edges=edges, spacing=spacing))
+
+
+@apply_uncertainty.add('characteristicFaultGeometryAbsolute')
+def _char_fault_geom_absolute(utype, source, value):
+    source.modify('set_geometry', dict(surface=to_surface(value)))
+
+
+def _modify_mfd(source, name, parameters):
+    # NB: a CollapsedPointSource has no mfd, so the modification is
+    # applied to each of its underlying point sources
+    if hasattr(source, 'pointsources'):
+        source.apply_mfd_modification(name, parameters)
+    else:
+        source.mfd.modify(name, parameters)
+
+
+@apply_uncertainty.add('abGRAbsolute')
+def _abGR_absolute(utype, source, value):
+    a, b = value
+    _modify_mfd(source, 'set_ab', dict(a_val=a, b_val=b))
+
+
+@apply_uncertainty.add('abMaxMagAbsolute')
+def _abMMax_absolute(utype, source, value):
+    a, b, mm = value
+    _modify_mfd(source, 'set_ab_max_mag', dict(a_val=a, b_val=b, max_mag=mm))
+
+
+@apply_uncertainty.add('bGRAbsolute')
+def _bGR_absolute(utype, source, value):
+    b_val = float(value)
+    _modify_mfd(source, 'set_bGR', dict(b_val=b_val))
+
+
+@apply_uncertainty.add('bACAbsolute')
+def _bAC_absolute(utype, source, value):
+    b_val = float(value)
+    _modify_mfd(source, 'set_bAC', dict(b_val=b_val))
+
+
+@apply_uncertainty.add('bGRRelative')
+def _abGR_relative(utype, source, value):
+    _modify_mfd(source, 'increment_b', dict(value=value))
+
+
+@apply_uncertainty.add('bACRelative')
+def _bAC_relative(utype, source, value):
+    _modify_mfd(source, 'increment_b_AC', dict(value=value))
+
+
+@apply_uncertainty.add('maxMagGRRelative')
+def _maxmagGR_relative(utype, source, value):
+    _modify_mfd(source, 'increment_max_mag', dict(value=value))
+
+
+@apply_uncertainty.add('maxMagGRRelativeNoMoBalance')
+def _maxmagGRnoMoBalance_relative(utype, source, value):
+    _modify_mfd(source, 'increment_max_mag_no_mo_balance', dict(value=value))
+
+
+@apply_uncertainty.add('maxMagAndDeltaMagACRelative')
+def _maxmagAndDeltaMagAC_relative(utype, source, value):
+    delta_max_mag, delta_m_AC = value
+    _modify_mfd(source, 'increment_max_mag_and_delta_m_AC',
+                      dict(delta_max_mag=delta_max_mag,
+                           delta_m_AC=delta_m_AC))
+
+
+@apply_uncertainty.add('maxMagAndDeltaMagACRelativeNoMoBalance')
+def _maxmagAndDeltaMagACnoMoBalance_relative(utype, source, value):
+    delta_max_mag, delta_m_AC = value
+    _modify_mfd(source, 'increment_max_mag_and_delta_m_AC_no_mo_balance',
+                      dict(delta_max_mag=delta_max_mag,
+                           delta_m_AC=delta_m_AC))
+
+
+@apply_uncertainty.add('maxMagGRAbsolute')
+def _maxmagGR_absolute(utype, source, value):
+    _modify_mfd(source, 'set_max_mag', dict(value=value))
+
+
+@apply_uncertainty.add('minMagGRAbsolute')
+def _minmagGR_absolute(utype, source, value):
+    _modify_mfd(source, 'set_min_mag', dict(value=value))
+
+
+@apply_uncertainty.add('multiMFDAbsolute')
+def _multiMFD_absolute(utype, source, value):
+    kind, size, kwargs = value
+    # a segment ID:i of a split MultiPointSource has the slice of the
+    # MultiMFD of its parent, which has size points (see splitMF)
+    slc = getattr(source, 'mfd_slice', None)
+    if slc is None and size != len(source.mfd):
+        raise ValueError(f'{utype}: {source.source_id} has {len(source.mfd)}'
+                         f' points, got a MultiMFD of size {size}')
+    mfd = MultiMFD(kind, size, source.mfd.width_of_mfd_bin, **dict(kwargs))
+    source.mfd = mfd if slc is None else mfd[slc]
+
+
+@apply_uncertainty.add('incrementalMFDAbsolute')
+def _incMFD_absolute(utype, source, value):
+    min_mag, bin_width, occur_rates = value
+    _modify_mfd(source, 'set_mfd', dict(min_mag=min_mag, bin_width=bin_width,
+                                      occurrence_rates=occur_rates))
+
+
+@apply_uncertainty.add('truncatedGRFromSlipAbsolute')
+def _trucMFDFromSlip_absolute(utype, source, value):
+    slip_rate, rigidity, const_term = value
+    source.modify('adjust_mfd_from_slip', dict(slip_rate=slip_rate,
+                                               rigidity=rigidity,
+                                               constant_term=const_term))
+
+
+@apply_uncertainty.add('setMSRAbsolute')
+def _setMSR(utype, source, value):
+    msr = value
+    source.modify('set_msr', dict(new_msr=msr))
+
+
+@apply_uncertainty.add('setAspectRatioAbsolute')
+def _set_aspect_ratio_absolute(utype, source, value):
+    source.modify('set_aspect_ratio', dict(aspect_ratio=value))
+
+
+@apply_uncertainty.add('setAspectRatioRelative')
+def _set_aspect_ratio_relative(utype, source, value):
+    source.modify('adjust_aspect_ratio', dict(increment=value))
+
+
+@apply_uncertainty.add('recomputeMmax')
+def _recompute_mmax_absolute(utype, source, value):
+    epsilon = value
+    source.modify('recompute_mmax', dict(epsilon=epsilon))
+
+
+@apply_uncertainty.add('setLowerSeismDepthAbsolute')
+def _setLSD(utype, source, value):
+    source.modify('set_lower_seismogenic_depth', dict(lsd=float(value)))
+
+
+@apply_uncertainty.add('setUpperSeismDepthAbsolute')
+def _setUSD(utype, source, value):
+    source.modify('set_upper_seismogenic_depth', dict(usd=float(value)))
+
+
+@apply_uncertainty.add('setLowerSeismDepthRelative')
+def _setLSDRelative(utype, source, value):
+    source.modify('adjust_lower_seismogenic_depth',
+                  dict(increment=float(value)))
+
+
+@apply_uncertainty.add('setUpperSeismDepthRelative')
+def _setUSDRelative(utype, source, value):
+    source.modify('adjust_upper_seismogenic_depth',
+                  dict(increment=float(value)))
+
+
+@apply_uncertainty.add('setHypoDepthDistribution')
+def _set_hypo_depth_dist_absolute(utype, source, value):
+    source.modify('set_hypo_depth_dist', dict(hdd=value))
+
+
+# BCHydro NVA epistemic uncertainty
+@apply_uncertainty.add('recurRow')
+def _set_recurrow(utype, source, value):
+    source.modify('set_recurrow', dict(recurrow=value))
+
+
+# BCHydro NVA epistemic uncertainty
+@apply_uncertainty.add('recurSet')
+def _set_recurset(utype, source, value):
+    # A per-source mmax_offset (parsed from the optional mmaxOffset XML
+    # attribute) shifts the branchset max_mag. The alt3 uses this to enforce
+    # bg_mmax = fault_mmax - 0.5 while still sharing one recurSet branchset
+    source.recur_model = value["recur_model"]
+    source.mmax = float(value["max_mag"]) + getattr(source, 'mmax_offset', 0.0)
+    return
+
+
+# BCHydro NVA epistemic uncertainty
+@apply_uncertainty.add('rateSplit')
+def _set_rate_split(utype, source, value):
+    source.rate_split_bg_frac = float(value["bg_frac"])
+    source.rate_split_fault_frac = float(value["fault_frac"])
+
+
+@apply_uncertainty.add('dummy')  # do nothing
+def _dummy(utype, source, value):
+    pass
+
+
+# uncertainties changing only the MFD or the rates, i.e. keeping the geometry
+# of the ruptures; the others (and the unknown ones) are geometry-changing,
+# see classical.geometry_key.
+GEOMETRY_PRESERVING = frozenset([
+    'abGRAbsolute', 'abMaxMagAbsolute', 'bGRAbsolute', 'bACAbsolute',
+    'bGRRelative', 'bACRelative', 'maxMagGRRelative',
+    'maxMagGRRelativeNoMoBalance', 'maxMagAndDeltaMagACRelative',
+    'maxMagAndDeltaMagACRelativeNoMoBalance', 'maxMagGRAbsolute',
+    'minMagGRAbsolute', 'incrementalMFDAbsolute', 'multiMFDAbsolute',
+    'truncatedGRFromSlipAbsolute',
+    'recurSet', 'recurRow', 'rateSplit', 'dummy'])
+
+
+# ######################### apply_uncertainties ########################### #
+
+def get_bset_value(bset, value, source):
+    """
+    :param bset: a BranchSet instance
+    :param value: the value of the branch
+    :param source: a source instance
+    :returns: a pair (ok, value), where ok tells if the branchset applies
+        to the source and value is the value to apply to it
+
+    NB: the source of a correlated branchset is looked up by ID and by
+    basename, since it can be a fragment of the source in the logic tree
+    (i.e. 'area1.0' for 'area1'); this happens when the uncertainties are
+    applied after the splitting of the sources, as done by classical
+    """
+    if bset.correlated:
+        src_id = valid.corename(source, '!')
+        if src_id in value:
+            return True, value[src_id]
+        bname = valid.basename(src_id)
+        return bname in value, value.get(bname)
+    return bset.filter_source(source), value
+
+
+def get_bset_values(lt_path, source_model_lt):
+    """
+    :param lt_path: the logic tree path of a source model realization
+    :param source_model_lt: a SourceModelLogicTree instance
+    :returns: the list of (branchset, value) pairs whose uncertainties must
+        be applied to the sources, i.e. excluding the extendModel
+        branchsets, which add sources and are handled in gen_groups
+    """
+    # NB: the extendModel and dummy branchsets are skipped wherever they
+    # are, since a modification can precede them (see the MFD chains of
+    # mosaic models)
+    return [(bset, value)
+            for bset, value in source_model_lt.bset_values(lt_path)
+            if bset.uncertainty_type not in ('extendModel', 'dummy')]
+
+
+def _parent_id(srcid):
+    # the ID of the source of which srcid is a segment (ID:i), or srcid
+    # itself; valid.corename keeps the colon, since the IDs in the logic
+    # tree can contain it (e.g. mutex sources)
+    base, sep, num = srcid.rpartition(':')
+    return base if sep and num.isdigit() else srcid
+
+
+def source_ids(sources):
+    """
+    :returns: the IDs and the basenames of the given sources, as written
+              in the logic tree (i.e. without the branch, see corename)
+    """
+    ids = {valid.corename(src, '!') for src in sources}
+    return ids | {valid.basename(srcid) for srcid in ids}
+
+
+def check_correlated(bset_values, srcids):
+    """
+    Check that the sources of the correlated branchsets are in the given
+    set of source IDs, i.e. in the sources of the realization. The sources
+    are also looked up by basename, since they can be fragments of the
+    sources in the logic tree (i.e. 'area1.0' for 'area1')
+
+    :param bset_values: a list of pairs (branchset, value)
+    :param srcids: a set of source IDs and basenames, see source_ids
+    """
+    for bset, value in bset_values:
+        if bset.correlated:
+            for source_id in value:
+                if source_id not in srcids:
+                    raise NameError(
+                        f'The source {source_id} in {bset.uncertainty_type} is'
+                        ' missing, maybe you mispelled the name?')
+
+
+def shallow_unc(bset_values, bset_applications, source):
+    # True if the uncertainties applied to source modify only its MFD
+    # (see GEOMETRY_PRESERVING) or the attributes listed in its
+    # shallow_uncertainties, so the copy can share the rest
+    # NB: bset_applications has a pair (applies, value) per branchset, e.g.
+    #   bset_values = [(bset_dip, 45.0), (bset_other, {'src2': 0.5})]
+    #   bset_applications = [(True, 45.0), (False, None)]
+    #   the first branchset sets the dip of the source to 45.0, the second
+    #   one is correlated to 'src2' and does not apply to the source
+    if hasattr(source, 'pointsources') or not hasattr(source, 'mfd'):
+        return False  # point sources modify their sub-sources in place
+    allowed = GEOMETRY_PRESERVING | source.shallow_uncertainties
+    return all(bset.uncertainty_type in allowed and not bset.collapsed
+               for (bset, _), (ok, _) in zip(bset_values,
+                                             bset_applications) if ok)
+
+
+def _copy_source(source, shallow):
+    if not shallow:
+        return copy.deepcopy(source)
+    # share the geometry with the original, but copy the MFD, which is
+    # modified in place by the uncertainties
+    src = copy.copy(source)
+    src.mfd = copy.deepcopy(source.mfd)
+    return src
+
+
+def apply_uncertainties(bset_values, src_group, check=True):
+    """
+    :param bset_values: a list of pairs (branchset, value)
+    :param src_group:
+        SourceGroup instance
+    :param check:
+        if True, check that the sources of the correlated branchsets exist;
+        set it to False when the group is a fragment of the original one
+        (as it happens applying the uncertainties in the workers)
+    :returns:
+        A copy of the original group with possibly modified sources
+    """
+    sg = copy.copy(src_group)
+    sg.sources = []
+    if check:
+        check_correlated(bset_values, source_ids(src_group))
+    for source in src_group:
+        # NB: the correlated branchsets are resolved here, once per
+        # branchset and source
+        pairs = [get_bset_value(bset, value, source)
+                 for bset, value in bset_values]
+        if any(ok for ok, _ in pairs):  # source not filtered out
+            shallow = shallow_unc(bset_values, pairs, source)
+            src = _copy_source(source, shallow)
+            # the uncertainties can change the number of ruptures, for
+            # instance by truncating the MFD, so a cached value is not
+            # valid anymore
+            src._num_ruptures = 0
+            srcs = []
+            for (bset, _v), (ok, v) in zip(bset_values, pairs):
+                if ok and bset.collapsed:
+                    if src.code == b'N':
+                        raise NotImplementedError(
+                            'Collapsing of the logic tree is not implemented '
+                            'for %s' % src)
+                    for br in bset.branches:
+                        newsrc = copy.deepcopy(src)
+                        newsrc.scaling_rate = br.weight  # used in lt_test.py
+                        apply_uncertainty(
+                            bset.uncertainty_type, newsrc, br.value)
+                        srcs.append(newsrc)
+                elif ok:
+                    if not srcs:  # only the first time
+                        srcs.append(src)
+                    for s in srcs:
+                        # tested in test_mixed_collapsed_apply_uncertainties
+                        apply_uncertainty(bset.uncertainty_type, s, v)
+            sg.sources.extend(srcs)
+        else:
+            # no copy
+            sg.sources.append(source)
+    return sg
+
+
+# ####################### uncertainties and sampling ###################### #
+
+
+def restrict_ts_samples(src, trt_smrs):
+    """
+    :returns: a copy of the source with the ts_samples restricted to
+        trt_smrs, i.e. belonging to a single set of uncertainties
+    """
+    new = copy.copy(src)
+    ts_samples = src.get_ts_samples()
+    new.ts_samples = ts_samples[
+        numpy.isin(ts_samples['trt_smr'], trt_smrs)]
+    return new
+
+
+# ######################### sampling ######################## #
+
+
+def random(size, seed, sampling_method='early_weights'):
+    """
+    :param size: size of the returned array (integer or pair of integers)
+    :param seed: random seed
+    :param sampling_method: 'early_weights', 'early_latin', ...
+    :returns: an array of floats in the range 0..1
+
+    You can compare montecarlo sampling with latin square sampling with
+    the following code:
+
+    .. code-block:
+
+       import matplotlib.pyplot as plt
+       samples, seed = 10, 42
+       x, y = random((samples, 2), seed, 'early_latin').T
+       plt.xlim([0, 1])
+       plt.ylim([0, 1])
+       plt.scatter(x, y, color='green')  # points on a latin square
+       x, y = random((samples, 2), seed, 'early_weights').T
+       plt.scatter(x, y, color='red')  # points NOT on a latin square
+       for x in numpy.arange(0, 1, 1/samples):
+           for y in numpy.arange(0, 1, 1/samples):
+               plt.axvline(x)
+               plt.axhline(y)
+       plt.show()
+    """
+    xs = numpy.random.default_rng(seed).uniform(size=size)
+    if sampling_method.endswith('latin'):
+        # https://zmurchok.github.io/2019/03/15/Latin-Hypercube-Sampling.html
+        try:
+            s, d = size
+        except TypeError:  # cannot unpack non-iterable int object
+            return (numpy.argsort(xs) + xs) / size
+        for i in range(d):
+            xs[:, i] = (numpy.argsort(xs[:, i]) + xs[:, i]) / s
+    return xs
+
+
+def _cdf(weighted_objects):
+    weights = []
+    for obj in weighted_objects:
+        w = obj.weight
+        if isinstance(obj.weight, (float, int)):
+            weights.append(w)
+        else:  # assume array
+            weights.append(w[-1])
+    return numpy.cumsum(weights)
+
+
+def sample(weighted_objects, probabilities, sampling_method='early_weights'):
+    """
+    Take random samples of a sequence of weighted objects
+
+    :param weighted_objects:
+        A finite sequence of N objects with a ``.weight`` attribute.
+        The weights must sum up to 1.
+    :param probabilities:
+        An array of S random numbers in the range 0..1
+    :param sampling_method:
+        Default early_weights, i.e. use the CDF of the weights
+    :return:
+        A list of S objects extracted randomly
+    """
+    if sampling_method.startswith('early'):  # consider the weights different
+        idxs = numpy.searchsorted(_cdf(weighted_objects), probabilities)
+    elif sampling_method.startswith('late'):
+        n = len(weighted_objects)  # consider all weights equal
+        idxs = numpy.searchsorted(numpy.arange(1/n, 1, 1/n), probabilities)
+    # NB: returning an array would break things
+    return [weighted_objects[idx] for idx in idxs]
+
+
+# ######################### branches and branchsets ######################## #
+
+class Branch(object):
+    """
+    Branch object, represents a ``<logicTreeBranch />`` element.
+
+    :param branch_id:
+        String identifier of the branch
+    :param value:
+        The actual uncertainty parameter value. A text node contents
+        of ``<uncertaintyModel />`` child node. Type depends
+        on the branchset's uncertainty type. For serialization, an unparsed
+        ``uncertaintyModel`` or MFD Node can retain nested XML. Correlated
+        uncertainties use a dictionary of source IDs to uncertainty values.
+    :param weight:
+        float value of weight assigned to the branch. A text node contents
+        of ``<uncertaintyWeight />`` child node.
+    :param bs_id:
+        BranchSetID of the branchset to which the branch belongs
+    """
+    def __init__(self, branch_id, value, weight, bs_id=''):
+        self.branch_id = branch_id
+        self.value = value
+        self.weight = weight
+        self.bs_id = bs_id
+        self.bset = None
+
+    def is_dummy(self):
+        """
+        :returns: True with the parent branchset ID starts with 'dummy'
+        """
+        return self.bs_id.startswith('dummy')
+
+    @property
+    def id(self):
+        if self.is_dummy():
+            return '.'
+        return self.branch_id if len(self.branch_id) == 1 else self.short_id
+
+    def is_leaf(self):
+        """
+        :returns: True if the branch has no branchset or has a dummy branchset
+        """
+        return self.bset is None or self.bset.uncertainty_type == 'dummy'
+
+    def to_node(self, uncertainty_type=None, correlated=False):
+        attrib = dict(branchID=self.branch_id)
+        model = uncertainty_to_node(uncertainty_type, self.value, correlated)
+        nodes = [model,
+                 Node('uncertaintyWeight', {}, self.weight)]
+        return Node('logicTreeBranch', attrib, None, nodes)
+
+    def __repr__(self):
+        if self.bset:
+            return '%s%s' % (self.branch_id, self.bset)
+        else:
+            return self.branch_id
+
+
+class BranchSet(object):
+    """
+    Branchset object, represents a ``<logicTreeBranchSet />`` element.
+
+    :param uncertainty_type:
+        String value. According to the spec one of:
+
+        gmpeModel
+            Branches contain references to different GMPEs. Values are parsed
+            as strings and are supposed to be one of supported GMPEs. See list
+            at :class:`GMPELogicTree`.
+        sourceModel
+            Branches contain references to different PSHA source models. Values
+            are treated as file names, relatively to base path.
+        maxMagGRRelative
+            Different values to add to Gutenberg-Richter ("GR") maximum
+            magnitude. Value should be interpretable as float.
+        bGRRelative
+            Values to add to GR "b" value. Parsed as float.
+        maxMagGRAbsolute
+            Values to replace GR maximum magnitude. Values expected to be
+            lists of floats separated by space, one float for each GR MFD
+            in a target source in order of appearance.
+        minMagGRAbsolute
+            Values to replace GR minimum magnitude. Value should be
+            interpretable as float.
+        abGRAbsolute
+            Values to replace "a" and "b" values of GR MFD. Lists of pairs
+            of floats, one pair for one GR MFD in a target source.
+        incrementalMFDAbsolute
+            Replaces an evenly discretized MFD with the values provided
+        multiMFDAbsolute
+            Replaces the MultiMFD of a multiPointSource (i.e. the MFDs of
+            all its points) with the multiMFD provided
+        simpleFaultDipRelative
+            Increases or decreases the angle of fault dip from that given
+            in the original source model
+        simpleFaultDipAbsolute
+            Replaces the fault dip in the specified source(s)
+        simpleFaultGeometryAbsolute
+            Replaces the simple fault geometry (trace, upper seismogenic depth
+            lower seismogenic depth and dip) of a given source with the values
+            provided
+        complexFaultGeometryAbsolute
+            Replaces the complex fault geometry edges of a given source with
+            the values provided
+        characteristicFaultGeometryAbsolute
+            Replaces the complex fault geometry surface of a given source with
+            the values provided
+        truncatedGRFromSlipAbsolute
+            Updates a TruncatedGR using a slip rate and a rigidity
+        maxMagAndDeltaMagACRelative
+            Different values to add to maximum magnitude and delta_m_AC.
+            Value should be a pair of floats separated by space.
+        maxMagAndDeltaMagACRelativeNoMoBalance
+            Same as maxMagAndDeltaMagACRelative but without rebalancing
+            the total rate to preserve total moment rate.
+
+    :param filters:
+        Dictionary, a set of filters to specify which sources should
+        the uncertainty be applied to. Represented as branchset element's
+        attributes in xml:
+
+        applyToSources
+            The uncertainty should be applied only to specific sources.
+            This filter is required for absolute uncertainties (also
+            only one source can be used for those). Value should be the list
+            of source ids. Can be used only in source model logic tree.
+        applyToTectonicRegionType
+            Can be used in both the source model and GMPE logic trees. Allows
+            to specify to which tectonic region type (Active Shallow Crust,
+            Stable Shallow Crust, etc.) the uncertainty applies to. This
+            filter is required for all branchsets in GMPE logic tree.
+    """
+    applied = None  # to be replaced by a string in hazardlib.logictree
+
+    def __init__(self, uncertainty_type, filters=None, ordinal=0,
+                 collapsed=False):
+        self.uncertainty_type = uncertainty_type
+        if (uncertainty_type not in NOAPPLY_UNCERTAINTIES and
+                uncertainty_type not in apply_uncertainty):
+            raise NotImplementedError(
+                f'apply_uncertainty: missing {uncertainty_type}')
+        self.filters = filters or {}
+        self.ordinal = ordinal
+        self.collapsed = collapsed
+        self.branches = []
+
+    @property
+    def correlated(self):
+        """
+        The branchset is applied to correlated sources
+        """
+        return self.filters.get('applyToSources') == ['*']
+
+    def sample(self, probabilities, sampling_method):
+        """
+        :param num_samples: the number of samples
+        :param probabilities: (Ns, Nb) random numbers in the range 0..1
+        :param sampling_method: the sampling method used
+        :returns: a list of num_samples lists of branches
+        """
+        out = []
+        for probs in probabilities:  # probs has a value for each branchset
+            branchset = self
+            branches = []
+            while branchset is not None:
+                if branchset.collapsed:
+                    branch = branchset.branches[0]
+                else:
+                    x = probs[branchset.ordinal]
+                    [branch] = sample(branchset.branches, [x], sampling_method)
+                branches.append(branch)
+                branchset = branch.bset
+            out.append(branches)
+        return out
+
+    def enumerate_paths(self):
+        """
+        Generate all possible paths starting from this branch set.
+
+        :returns:
+            Generator of two-item tuples. Each tuple contains weight
+            of the path (calculated as a product of the weights of all path's
+            branches) and list of path's :class:`Branch` objects. Total sum
+            of all paths' weights is 1.0
+        """
+        for path_branch in self._enumerate_paths([]):
+            flat_path = []
+            weight = 1.0
+            while path_branch:
+                path_branch, branch = path_branch
+                weight *= branch.weight
+                flat_path.append(branch)
+            yield weight, flat_path[::-1]
+
+    def _enumerate_paths(self, prefix_path):
+        """
+        Recursive (private) part of :func:`enumerate_paths`. Returns generator
+        of recursive lists of two items, where second item is the branch object
+        and first one is itself list of two items.
+        """
+        if self.collapsed:
+            b0 = copy.copy(self.branches[0])
+            # b0.branch_id = '.'
+            b0.weight = 1.0
+            branches = [b0]
+        else:
+            branches = self.branches
+        for branch in branches:
+            path_branch = [prefix_path, branch]
+            if branch.bset is not None:  # dummies can be branchpoints
+                yield from branch.bset._enumerate_paths(path_branch)
+            else:
+                # here is an example of path_branch[1].value:
+                # [('simpleFaultGeometry', ([(-64.5, -0.3822), (-64.5, 0.3822)],
+                #                             2.0, 15.0, 90.0, 2.0))]
+                yield path_branch
+
+    def __getitem__(self, branch_id):
+        """
+        Return :class:`Branch` object belonging to this branchset with id
+        equal to ``branch_id``.
+        """
+        for branch in self.branches:
+            if branch.branch_id == branch_id:
+                return branch
+        raise KeyError(branch_id)
+
+    def filter_source(self, source):
+        """
+        Apply filters to ``source`` and return ``True`` if uncertainty should
+        be applied to it.
+        """
+        for key, value in self.filters.items():
+            if key == 'applyToTectonicRegionType':
+                if value != source.tectonic_region_type:
+                    return False
+            elif key == 'applyToSources':
+                if source:
+                    # the segments ID:i of a split source must get the
+                    # uncertainties of ID, see source_reader.splitMF
+                    cid = valid.corename(source, '!')
+                    if cid not in value and _parent_id(cid) not in value:
+                        return False
+            elif key == 'applyToBranches':
+                pass
+            else:
+                raise AssertionError("unknown filter '%s'" % key)
+
+        # all filters pass (or no filters), keep the source
+        return True
+
+    def get_bset_values(self, ltpath):
+        """
+        :param ltpath:
+            String of chars
+        :returns:
+            A list of pairs [(bset, value), ...]
+        """
+        pairs = []
+        bset = self
+        while ltpath:
+            brid, ltpath = ltpath[0], ltpath[1:]
+            br = bset[brid]
+            pairs.append((bset, br.value))
+            if br.is_leaf():
+                break
+            else:
+                bset = br.bset
+        return pairs
+
+    def collapse(self):
+        """
+        Collapse to the first branch (with side effects)
+        """
+        self.collapsed = True
+        b0 = self.branches[0]
+        b0.branch_id = '.'
+        b0.weight = 1.
+        self.branches = [b0]
+
+    def to_list(self):
+        """
+        :returns: a literal list describing the branchset
+        """
+        atb = self.filters.get("applyToBranches", [])
+        lst = [self.uncertainty_type, atb]
+        for br in self.branches:
+            lst.append([br.branch_id, '...', br.weight])
+        return lst
+
+    def check_duplicates(self, filename=''):
+        """
+        Check if the underlying branches are duplicated
+        """
+        values = [pickle.dumps(br.value, protocol=4) for br in self.branches]
+        if len(set(values)) < len(values):
+            bs_id = self.branches[0].bs_id
+            brvalues = '\n'.join(f'{br.branch_id}: value={br.value}'
+                                 for br in self.branches)
+            raise ValueError(
+                f'{filename}: duplicated branches in {bs_id}:\n{brvalues}')
+
+    def check_weights(self):
+        """
+        The branch weights must sum up to 1.
+        """
+        tot = 0
+        for br in self.branches:
+            if not (0 <= br.weight <= 1):
+                raise ValueError(
+                    f'Invalid weight {br.weight} for branch {br.branch_id}')
+            tot += br.weight
+        if abs(tot - 1.) >= 5E-6:
+            raise ValueError(
+                f'Branch weights sum to {tot}, expected 1.0 '
+                f'([{[br.weight for br in self.branches]}])')
+
+    def __len__(self):
+        return len(self.branches)
+
+    def __str__(self):
+        return repr(self.branches)
+
+    def __repr__(self):
+        kvs = ', '.join(f'{k}={fmtlist(v)}' for k, v in self.filters.items())
+        if kvs:
+            kvs = ', ' + kvs
+        return '<%s(%d%s)>' % (self.uncertainty_type, len(self), kvs)
+
+
+def fmtlist(lst):
+    """
+    Format a list of strings for display purposes.
+    """
+    if not isinstance(lst, list):
+        return lst
+    if len(lst) <= 3:
+        return  ' '.join(lst)
+    return '%s..%s' % (lst[0],lst[-1])
+
+
+def count_paths(branches):
+    """
+    :param branches: a list of branches or a logic tree
+    :returns: the total number of paths including sub-branches
+    """
+    if hasattr(branches, 'branchsets'):  # a LogicTree
+        branches = branches.branchsets[0].branches
+    # Count shared subtrees once, without recursion or expanding complete
+    # paths: trees like South Africa (ZAF) can have enormous path counts.
+    counts = {None: 1}  # a terminal branch has one path
+    stack = [(br.bset, False) for br in branches]
+    while stack:
+        bset, visited = stack.pop()
+        if bset in counts:
+            continue
+        if visited:
+            counts[bset] = sum(counts[br.bset] for br in bset.branches)
+        else:
+            # Push sub-branches first, then add their cached counts.
+            stack.append((bset, True))
+            stack.extend((br.bset, False) for br in bset.branches)
+    return sum(counts[br.bset] for br in branches)
+
+
+dummy_counter = itertools.count(1)
+
+
+def dummy_branchset(branch_id):
+    """
+    :returns: a dummy BranchSet with a single branch
+    """
+    br = Branch(branch_id, None, 1, f'dummy{next(dummy_counter)}')
+    br.short_id = '.'
+    bset = BranchSet('dummy')
+    bset.branches = [br]
+    return bset
+
+
+def print_tree(bob, prefix="", is_last=True, _seen=None):
+    """
+    Recursively prints a tree structure using ASCII art.
+
+    :param bob: a tree, a branchset or a branch
+    :param prefix: The visual padding/lines accumulated from parent levels.
+    :param is_last: Boolean indicating if this node is the last child
+    :param _seen: internal mapping of branchsets already expanded
+    """
+    if _seen is None:
+        _seen = {}
+    if hasattr(bob, 'branchsets'):  # a tree
+        bob = bob.branchsets[0]
+    try:
+        id = bob.branch_id  # if branch
+    except AttributeError:
+        try:
+            id = bob.id  # if branchset
+        except AttributeError:
+            id = 'root'
+    print(f"{prefix}{'└── ' if is_last else '├── '}{id}")
+
+    # Update the prefix for the children.
+    # If this node is the last child, its vertical line ends here (add spaces).
+    # Otherwise, extend the vertical line downwards.
+    new_prefix = prefix + ("    " if is_last else "│   ")
+   
+    # Recursively print all branches
+    if hasattr(bob, 'bset') and bob.bset:
+        bset = bob.bset
+    elif hasattr(bob, 'branches'):
+        bset = bob
+    else:
+        return
+    # Shared subtrees are expanded once; later links name the first parent.
+    if bset in _seen:
+        print(f'{new_prefix}└── children of {_seen[bset]} (shared)')
+        return
+    _seen[bset] = id
+    branches = bset.branches
+    if len(branches) > 3:
+        br1 = copy.copy(branches[1])
+        br1.branch_id = '...'
+        branches = [branches[0], br1, branches[-1]]
+    count = len(branches)
+    for i, branch in enumerate(branches, 1):
+        print_tree(branch, new_prefix, is_last=(i == count), _seen=_seen)
+
+
+class Realization(object):
+    """
+    Generic Realization object with attributes value, weight, ordinal, lt_path,
+    samples.
+    """
+    __slots__ = ['value', 'weight', 'ordinal', 'lt_path', 'samples']
+
+    def __init__(self, value, weight, ordinal, lt_path, samples=1):
+        self.value = value
+        self.weight = weight
+        self.ordinal = ordinal
+        self.lt_path = lt_path
+        self.samples = samples
+
+    @property
+    def pid(self):
+        return '~'.join(self.lt_path)  # path ID
+
+    def __repr__(self):
+        samples = ', samples=%d' % self.samples if self.samples > 1 else ''
+        return '<%s #%d %s, path=%s, weight=%s%s>' % (
+            self.__class__.__name__, self.ordinal, self.value,
+            '~'.join(self.lt_path), self.weight, samples)
+
+
+# ############################ serialization ############################# #
+
+branch_dt = numpy.dtype([
+    ('branchset', hdf5.vstr),
+    ('branch', hdf5.vstr),
+    ('utype', hdf5.vstr),
+    ('uvalue', hdf5.vstr),
+    ('weight', float),
+])
+
+# the filters whose value is a list of IDs
+LIST_FILTERS = ('applyToSources', 'applyToBranches')
+
+
+def fix_bytes(record):
+    # convert a record with bytes fields into a dictionary of strings
+    dic = {}
+    for n in record.dtype.names:
+        v = record[n]
+        dic[n] = v.decode('utf-8') if isinstance(v, bytes) else v
+    return dic
+
+
+def parse_filters(attrs, sort=False):
+    """
+    :param attrs: the attributes of a branchset, as read from the XML file
+        or from the datastore (where the lists of IDs can be JSON lists)
+    :param sort: if True, sort the lists of IDs
+    :returns: the filters, i.e. the attributes starting with "applyTo",
+        with the lists of IDs split
+    """
+    filters = {}
+    for key, val in attrs.items():
+        if not key.startswith('applyTo') or val is None:
+            continue
+        if key in LIST_FILTERS:
+            ids = val.split() if isinstance(val, str) else list(val)
+            val = sorted(ids) if sort else ids
+        filters[key] = val
+    return filters
+
+
+def branches_to_h5(branches, bsetdict):
+    """
+    Build the ``(branch_dt array, attrs)`` pair shared by the logic-tree
+    classes, so their ``__toh5__`` methods do not duplicate the layout.
+
+    :param branches:
+        iterable of ``(branchset_id, branch_id, uncertainty_type, value,
+        weight)``
+    :param bsetdict:
+        mapping ``branchset_id -> attribute dict``
+    """
+    tbl = [(bsid, bid, utype, repr(value), float(weight))
+           for bsid, bid, utype, value, weight in branches]
+    # NB: the string column above contains repr(value), which is not
+    # reversible, so the parsed values (i.e. the objects returned by
+    # parse_uncertainty) are pickled in an attribute; this is required
+    # by the readers applying the uncertainties from the datastore,
+    # i.e. the classical workers
+    parsed = base64.b64encode(pickle.dumps(
+        {(bsid, bid): value
+         for bsid, bid, _ut, value, _w in branches},
+        protocol=pickle.HIGHEST_PROTOCOL)).decode('ascii')
+    attrs = dict(bsetdict=json.dumps(bsetdict), parsed_values=parsed)
+    return numpy.array(tbl, branch_dt), attrs
+
+
+def h5_to_branches(array):
+    """
+    Decode a ``branch_dt`` array into the shared ``(utypes, rows)`` form.
+
+    :returns:
+        ``utypes`` maps ``branchset_id -> uncertainty_type`` and ``rows``
+        maps ``branchset_id -> [(branch_id, value, weight), ...]`` in file
+        order
+    """
+    utypes = {}
+    rows = {}
+    for rec in array:
+        rec = fix_bytes(rec)
+        bsid = rec['branchset']
+        utypes[bsid] = rec['utype']
+        try:
+            value = ast.literal_eval(rec['uvalue'])
+        except (SyntaxError, ValueError):
+            value = rec['uvalue']  # not really deserializable :-(
+        rows.setdefault(bsid, []).append(
+            (rec['branch'], value, float(rec['weight'])))
+    return utypes, rows
+
+
+class AbstractLogicTree(abc.ABC):
+    """
+    Common interface of the logic trees. The subclasses must define
+    get_num_paths, get_realizations and the serialization methods
+    __toh5__ and __fromh5__; sample can be overridden, by default it
+    samples the realizations by weight. Subclasses supporting NRML export
+    override to_node and inherit to_nrml.
+    """
+    @abc.abstractmethod
+    def get_num_paths(self):
+        """
+        :returns: the number of paths in the logic tree
+        """
+
+    @abc.abstractmethod
+    def get_realizations(self):
+        """
+        :returns: the list of the realizations of the logic tree
+        """
+
+    @abc.abstractmethod
+    def __toh5__(self):
+        """
+        :returns: a pair (array or dictionary, attributes) to be stored in
+                  the datastore, see openquake.baselib.hdf5
+        """
+
+    @abc.abstractmethod
+    def __fromh5__(self, data, attrs):
+        """
+        Restore the logic tree from the data and the attributes returned
+        by __toh5__ and stored in the datastore
+        """
+
+    def to_node(self):
+        """Return an XML node, when this tree supports NRML export."""
+        raise NotImplementedError(
+            f'{type(self).__name__} does not support NRML export')
+
+    def to_nrml(self, fmt='%.7E'):
+        """
+        Converts the logic tree into a string in NRML format.
+
+        :param fmt: format for floating-point values
+        """
+        return nrml.to_string(self.to_node(), fmt)
+
+    def sample(self, n, seed, sampling_method='early_weights'):
+        """
+        :param n: number of samples
+        :param seed: random seed
+        :param sampling_method: by default 'early_weights'
+        :returns: n realizations sampled with probability equal to their
+                  weight (they may repeat or be absent)
+        """
+        probs = random(n, seed, sampling_method)
+        return sample(self.get_realizations(), probs, sampling_method)
+
+
+def set_short_id(branches, short_ids):
+    for branch, short_id in zip(branches, short_ids):
+        branch.short_id = short_id
+
+
+def attach_branches(ltree, override=False):
+    """
+    Attach branchsets to branches depending on `applyToBranches`, plus
+    attach dummy branchsets to dummy branches.
+    """
+    fname = getattr(ltree, 'filename', '?')
+    # example branchsets [<abGRAbsolute(2)>, <maxMagGRAbsolute(2)]
+    set_short_id(ltree.branchsets[0].branches, BASE183)
+    branchdic = {br.branch_id: br for br in ltree.branchsets[0].branches}
+    previous_branches = list(branchdic.values())
+    brno = 0  # for legacy instead of the more correct len(branchdic)
+    for bset in ltree.branchsets[1:]:
+        # build4: abGRAbsolute(ssm1), abGRAbsolute(ssm2), maxMagGRAbsolute
+        for br in bset.branches:
+            if br.branch_id in branchdic:
+                raise NameError(f'The branch ID {br.branch_id} is duplicated')
+            branchdic[br.branch_id] = br
+
+        prev_ids = [pb.branch_id for pb in previous_branches]
+        atb = bset.filters.get('applyToBranches', [])
+        app2brs = [brid for brid in atb if brid in branchdic]
+        dummies = []
+        next_previous = []
+        if atb and not app2brs:
+            # None of the branches in applyToBranches survived, which can
+            # happen only in a logic tree reduced to a single source (see
+            # SourceModelLogicTree.reduce). The branchset does not apply
+            # to the surviving branches, so a dummy branchset is attached
+            # to each of them, exactly as for a partial match below; this
+            # also keeps them leaves, so that the branchsets applied later
+            # on can be attached to them
+            for br in previous_branches:
+                br.bset = dummy = dummy_branchset(br.branch_id)
+                dummies.append(dummy.branches[0])
+        elif app2brs and app2brs != prev_ids:
+            bset.applied = app2brs
+            target_bs_ids = {
+                branchdic[brid].bs_id for brid in app2brs
+                if brid in branchdic
+            }  # bs00 for build4
+            for branch_id in app2brs:
+                br = branchdic[branch_id]  # the branch_ids are checked before
+                if not br.is_leaf() and not override:
+                    raise LogicTreeError(
+                        fname, '?',
+                        f"branch {br.branch_id!r} already has child "
+                        f"branchset")
+                br.bset = bset
+            for br in previous_branches:
+                if br.branch_id not in app2brs:
+                    if br.bs_id in target_bs_ids:
+                        # attach dummy branchset only at the current level
+                        br.bset = dummy = dummy_branchset(br.branch_id)
+                        dummies.append(dummy.branches[0])
+                    else:
+                        next_previous.append(br)
+        else:
+            # no applyToBranches, i.e. the branchset becomes the child of
+            # all the branches of the previous level
+            for br in previous_branches:
+                br.bset = bset
+        set_short_id(bset.branches, BASE183[brno:])
+        brno += len(bset)
+        previous_branches = bset.branches + dummies + next_previous
+
+
+def smlt_path(branches):
+    """
+    :returns: a tuple with the branch IDs (dots for dummy branches)
+    """
+    path = []
+    for br in branches:
+        if br.is_dummy():
+            path.append('.')
+        else:
+            path.append(br.branch_id)
+    return tuple(path)
+
+
+class BranchSetLogicTree(AbstractLogicTree):
+    """
+    Logic tree made of branchsets, each one attached to branches of the
+    previous ones (see attach_branches). It can be built directly from a
+    list of branchsets with ``__init__`` (used by compose and decompose)
+    or subclassed; the subclasses can set the attributes `branchsets`,
+    `num_samples`, `seed` and `sampling_method` and call set_num_paths
+    (or set `num_paths`). To be stored in the datastore, the branchsets
+    must have an `id` and the tree must set `filename` and the dictionary
+    `bsetdict` branchset ID -> attributes of the branchset (including the
+    filters).
+    """
+    num_samples = 0
+    seed = 42
+    sampling_method = 'early_weights'
+
+    def __init__(self, branchsets=(), seed=42, num_samples=0,
+                 sampling_method='early_weights'):
+        self.branchsets = list(branchsets)
+        self.seed = seed
+        self.num_samples = num_samples
+        self.sampling_method = sampling_method
+        for i, bset in enumerate(self.branchsets):
+            bset.ordinal = i
+            bset.check_duplicates()
+            bset.check_weights()
+        if self.branchsets:
+            attach_branches(self, override=True)
+            self.set_num_paths()
+
+    @property
+    def root_branchset(self):
+        """
+        The first branchset, or None if there are no branchsets
+        """
+        return self.branchsets[0] if self.branchsets else None
+
+    def h5attrs(self):
+        """
+        :returns: the attributes of the logic tree stored by __toh5__;
+                  the subclasses can extend them
+        """
+        return dict(filename=self.filename, seed=self.seed,
+                    num_samples=self.num_samples,
+                    sampling_method=self.sampling_method,
+                    num_paths=self.num_paths)
+
+    def __toh5__(self):
+        branches = [(bset.id, br.branch_id, bset.uncertainty_type,
+                     br.value, br.weight)
+                    for bset in self.branchsets for br in bset.branches]
+        array, attrs = branches_to_h5(branches, self.bsetdict)
+        attrs.update(self.h5attrs())
+        return array, attrs
+
+    def __fromh5__(self, array, attrs):
+        self.filename = attrs['filename']
+        # NB: converting the seed into an integer is needed on Windows
+        self.seed = int(attrs['seed'])
+        self.num_samples = int(attrs['num_samples'])
+        self.sampling_method = str(attrs['sampling_method'])
+        self.bsetdict = json.loads(attrs['bsetdict'])
+        # restore the parsed values, which cannot be recovered from the
+        # repr strings (see branches_to_h5); NB: datastores generated by
+        # older versions of the engine do not have the attribute
+        parsed = attrs.get('parsed_values')
+        values = pickle.loads(base64.b64decode(parsed)) if parsed else {}
+        utypes, rows = h5_to_branches(array)
+        self.branchsets = []
+        for ordinal, (bsid, brows) in enumerate(rows.items()):
+            filters = parse_filters(self.bsetdict[bsid], sort=True)
+            bset = BranchSet(utypes[bsid], filters, ordinal)
+            bset.id = bsid
+            for brid, value, weight in brows:
+                bset.branches.append(Branch(
+                    brid, values.get((bsid, brid), value), weight, bsid))
+            self.branchsets.append(bset)
+        if self.branchsets:
+            attach_branches(self, override=True)
+        if 'num_paths' in attrs:  # missing in old PFD datastores
+            self.num_paths = int(attrs['num_paths'])
+        else:
+            self.set_num_paths()
+
+    def set_num_paths(self):
+        """
+        Set the attribute num_paths, i.e. the number of end branches
+        """
+        self.num_paths = (count_paths(self.branchsets[0].branches)
+                          if self.branchsets else 0)
+
+    def get_num_paths(self):
+        """
+        :returns: the number of paths in the logic tree
+        """
+        return self.num_samples if self.num_samples else self.num_paths
+
+    def _realization(self, branches, weight, ordinal):
+        # Build a realization from the branches selected along a path.
+        value = [br.value for br in branches]
+        return Realization(value, weight, ordinal, smlt_path(branches))
+
+    def _full_realizations(self):
+        # Enumerate in branch traversal order, independently of num_samples.
+        # Subclasses customize their values via _realization.
+        return [self._realization(branches, weight, ordinal)
+                for ordinal, (weight, branches) in enumerate(
+                    self.root_branchset.enumerate_paths())]
+
+    def get_realizations(self):
+        """
+        :returns: the list of the realizations, sampled if num_samples is
+            set, otherwise all of them; notice that the weight is homogeneous
+            with early sampling, since it is accounted for in the sampling
+            procedure
+        """
+        if self.num_samples:
+            return self.sample(
+                self.num_samples, self.seed, self.sampling_method)
+        rlzs = self._full_realizations()
+        rlzs.sort(key=operator.attrgetter('pid'))
+        for r, rlz in enumerate(rlzs):
+            rlz.ordinal = r
+        return rlzs
+
+    def sample(self, n, seed, sampling_method='early_weights'):
+        """
+        Sample the logic tree branchset by branchset. Notice that the weight
+        is homogeneous with early sampling, since it is accounted for in
+        the sampling procedure. Late sampling uses importance weights p/q,
+        correcting for uniform choices at each visited branchset. These
+        weights are unnormalized; FullLogicTree normalizes combined weights.
+
+        :param n: number of samples
+        :param seed: random seed
+        :param sampling_method: by default 'early_weights'
+        :returns: n Realization objects
+        """
+        probs = random((n, len(self.branchsets)), seed, sampling_method)
+        rlzs = []
+        for ordinal, branches in enumerate(
+                self.branchsets[0].sample(probs, sampling_method)):
+            if sampling_method.startswith('early_'):
+                weight = 1. / n  # already accounted
+            elif sampling_method.startswith('late_'):
+                # Uniform branch choices give q(path) = product(1 / size).
+                # Conditional paths can visit different branchset sizes.
+                bsets = [self.root_branchset] + [
+                    br.bset for br in branches[:-1]]
+                weight = numpy.prod([
+                    1. if bs.collapsed else br.weight * len(bs.branches)
+                    for bs, br in zip(bsets, branches)])
+            else:
+                raise NotImplementedError(sampling_method)
+            rlzs.append(self._realization(branches, weight, ordinal))
+        return rlzs
+
+    def get_all_paths(self):
+        """
+        :returns: the paths of the logic tree as strings, padded with dots
+        """
+        out = []
+        nb = len(self.branchsets)
+        for weight, branches in self.branchsets[0].enumerate_paths():
+            lt_path = ''.join(br.id for br in branches)
+            out.append(lt_path.ljust(nb, '.'))
+        return out
+
+    def sample_paths(self, num_samples, seed=42,
+                     sampling_method='early_weights'):
+        """
+        :returns: a list of sampled paths as strings, one per sample
+        """
+        nbs = len(self.branchsets)
+        probs = random((num_samples, nbs), seed, sampling_method)
+        out = []
+        for branches in self.branchsets[0].sample(probs, sampling_method):
+            out.append(''.join(br.id for br in branches))
+        return out
+
+    def apply_all(self, src):
+        """
+        Apply all uncertainties for each realization.
+
+        :param src: source object
+        :returns: R modified sources
+        """
+        srcs = []
+        bs0 = self.branchsets[0]
+        n = len(self.branchsets)
+        for rlz in self.get_realizations():
+            if len(rlz.lt_path) != n:
+                raise ValueError("The branch IDs must be one-character long")
+            bset_values = bs0.get_bset_values(rlz.lt_path)
+            new = copy.deepcopy(src)
+            for bset, value in bset_values:
+                apply_uncertainty(bset.uncertainty_type, new, value)
+            srcs.append(new)
+        for i, new in enumerate(srcs):
+            new.id = i
+        return srcs
+
+    def to_node(self):
+        """
+        Converts the underlying branchsets, with their filters, into a node
+        that can be serialized into XML with nrml.write([node], outfile);
+        the branchsets keep their IDs, if any
+        """
+        out = Node('logicTree', dict(logicTreeID="lt"))
+        for bset in self.branchsets:
+            attrib = dict(uncertaintyType=bset.uncertainty_type,
+                          branchSetID=getattr(bset, 'id', '') or
+                          f'bs{bset.ordinal}')
+            # empty filters are not written
+            attrib.update((key, val) for key, val in bset.filters.items()
+                          if val)
+            n = Node('logicTreeBranchSet', attrib, None,
+                     [br.to_node(bset.uncertainty_type, bset.correlated)
+                      for br in bset.branches])
+            out.nodes.append(n)
+        return out
+
+
+class ExtraLogicTree(BranchSetLogicTree):
+    """
+    Logic tree which can be the extra logic tree of a FullLogicTree, like
+    PFDLogicTree and AmplificationLogicTree: the realizations are the end
+    branches, with value and path given by the branch IDs. Sampling is
+    inherited from BranchSetLogicTree and walks branchsets without
+    enumerating complete paths. Late sampling chooses uniformly at each
+    branchset, so conditional paths need not have equal selection chances.
+    get_realizations always enumerates the tree; FullLogicTree controls
+    when to request samples instead.
+    """
+    def _realization(self, branches, weight, ordinal):
+        # Extra-tree values identify the path, excluding dummy branches.
+        chosen = tuple(br.branch_id for br in branches if not br.is_dummy())
+        return Realization('~'.join(chosen), weight, ordinal, chosen)
+
+    def get_realizations(self):
+        """Return all end branches in traversal order, without sampling."""
+        return self._full_realizations()
+
+    @property
+    def shortener(self):
+        """
+        :returns: dict realization path -> two-char abbreviation, matching
+            the format of the source model and GSIM shorteners
+        """
+        return {rlz.pid: BASE183[rlz.ordinal] + '0'
+                for rlz in self._full_realizations()}
+
+
+def build(*bslists, applyToSources=''):
+    """
+    :param bslists:
+        a list of lists describing branchsets
+    :param applyToSources:
+        source ID (used on Absolute uncertainties)
+    :returns: a `BranchSetLogicTree` instance
+
+    >>> lt = build(['sourceModel', '',
+    ...              ['A', 'common1', 0.6],
+    ...              ['B', 'common2', 0.4]],
+    ...           ['extendModel', '',
+    ...              ['C', 'extra1', 0.6],
+    ...              ['D', 'extra2', 0.2],
+    ...              ['E', 'extra3', 0.2]])
+    >>> lt.get_all_paths()
+    ['AC', 'AD', 'AE', 'BC', 'BD', 'BE']
+    """
+    bsets = []
+    for i, (utype, applyto, *brlists) in enumerate(bslists):
+        bsid = 'bs%02d' % i
+        branches = []
+        first = brlists[0]
+        assert len(first) == 3, 'Expected (brid, value, weight) got %s' % first
+        for brid, value, weight in brlists:
+            branches.append(Branch(brid, value, weight, bsid))
+        bset = BranchSet(utype, dict(applyToBranches=applyto))
+        if applyToSources and utype.endswith('Absolute'):
+            bset.filters['applyToSources'] = applyToSources.split()
+        bset.branches = branches
+        bsets.append(bset)
+    return BranchSetLogicTree(bsets)
+

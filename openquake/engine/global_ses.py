@@ -1,0 +1,96 @@
+#!/bin/env python
+# -*- coding: utf-8 -*-
+# vim: tabstop=4 shiftwidth=4 softtabstop=4
+#
+# Copyright (C) 2024-2025, GEM Foundation
+#
+# OpenQuake is free software: you can redistribute it and/or modify it
+# under the terms of the GNU Affero General Public License as published
+# by the Free Software Foundation, either version 3 of the License, or
+# (at your option) any later version.
+#
+# OpenQuake is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU Affero General Public License for more details.
+#
+# You should have received a copy of the GNU Affero General Public License
+# along with OpenQuake.  If not, see <http://www.gnu.org/licenses/>.
+"""This first version of the global_ses script, available from engine-3.22, is
+able to generate the Global Stochastic Event Set for the entire world
+from the GEM mosaic of hazard models. The workflow is a follows:
+
+1. clone the mosaic repositories and set the right branch/commit on each repo
+2. run this script with the right python, for instance on cole
+
+$ /opt/openquake/venv/bin/python -m openquake.engine.global_ses
+
+3. the script accepts five arguments:
+
+- the directory where the mosaic is stored (i.e. /home/hazard/mosaic)
+- the name of the generated output file (i.e. ruptures.hdf5);
+- the number_of_logic_tree_samples
+- the ses_per_logic_tree_path and
+- minimum_magnitude
+
+4. by default the script samples 2000 realizations with 50 SES per
+   logic tree path, with an investigation time of 1, i.e. 100,000 years
+   with a minimum magnitude of 5.  Such parameters are currently
+   hard-coded by easily changeable in the script itself.
+
+After the file ruptures.hdf5 has been generated, it can be used in
+event based calculations by simply setting in the job.ini
+
+rupture_model_file = ruptures.hdf5
+
+The GMFs will then be generated starting from the global ruptures on the
+sites specified in the job.ini file. Currently the sites can be specified
+in a CSV with longitude and latitudes, or as a region in the job.ini.
+The site parameters are inferreded from the site parameters in the mosaic
+via an association with the closest site in the site model;
+the GSIMs to use are also inferred from the GSIMs in the mosaic via an
+association table (model, trt_smr) -> rlzs_by_gsim.
+
+Note 1: for JPN and KOR instead of using 50 ses x 1 year,
+        we use 1 ses x 50 years, since the models require so.
+Note 2: ruptures.hdf5 will contain a global site model with all the
+        available site parameters merged together, with zeros for missing
+        parameters (i.e. xvf will be zero for most models).
+
+"""
+import os
+from unittest.mock import patch
+from openquake.baselib import sap, config
+from openquake.qa_tests_data.mosaic import genworkflow
+from openquake.engine import workflow
+
+def main(mosaic_dir, out, models='ALL', toml:bool=False, *,
+         number_of_logic_tree_samples:int=2000,
+         ses_per_logic_tree_path:int=50, minimum_magnitude:float=5,
+         cache:str='false'):
+    """
+    Storing global SES
+    """
+    ses_toml = genworkflow.ses(mosaic_dir, out, models.split(','),
+                               number_of_logic_tree_samples,
+                               ses_per_logic_tree_path,
+                               minimum_magnitude, toml)
+    if toml:
+        print(ses_toml)
+        return
+    with patch.dict(config.directory, {'mosaic_dir': mosaic_dir}):
+        calc_id = workflow.run_workflow(ses_toml, {'cache': cache})
+    os.remove(ses_toml)
+    return calc_id
+
+main.mosaic_dir = 'Directory containing the hazard mosaic'
+main.out = 'Output file'
+main.models = 'Models to consider (comma-separated)'
+main.number_of_logic_tree_samples = 'Number of samples'
+main.ses_per_logic_tree_path = 'Number of SES'
+main.minimum_magnitude = 'Discard ruptures below this magnitude'
+main.cache = 'Use the cache to avoid repeating correct calculations'
+main.toml = 'Just print the TOML code'
+
+if __name__ == '__main__':
+    sap.run(main)

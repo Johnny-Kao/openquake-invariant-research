@@ -1,0 +1,385 @@
+# -*- coding: utf-8 -*-
+# vim: tabstop=4 shiftwidth=4 softtabstop=4
+#
+# Copyright (C) 2026 GEM Foundation
+#
+# OpenQuake is free software: you can redistribute it and/or modify it
+# under the terms of the GNU Affero General Public License as published
+# by the Free Software Foundation, either version 3 of the License, or
+# (at your option) any later version.
+#
+# OpenQuake is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU Affero General Public License for more details.
+#
+# You should have received a copy of the GNU Affero General Public License
+# along with OpenQuake. If not, see <http://www.gnu.org/licenses/>.
+
+# NB: run these tests with OQ_APPLICATION_MODE=IMPACT,
+import pytest
+from openquake.server.tests.pages.login_page import LoginPage
+from openquake.server.tests.pages.cookie_bar import CookieBar
+from openquake.server.tests.pages.impact_page import (
+    ImpactPageLevel0, ImpactPageLevel1, ImpactPageLevel2)
+from playwright.sync_api import expect
+
+
+@pytest.mark.parametrize("user", [0], indirect=True)
+@pytest.mark.parametrize("application_mode", ["IMPACT"], indirect=True)
+@pytest.mark.parametrize("default_usgs_id", [""], indirect=True)
+def test_impact_ui_level_0(
+        application_mode, authenticated_page, user, default_usgs_id):
+    page = ImpactPageLevel0(authenticated_page)
+    expect(page.no_uncertainty_ckb()).to_have_count(0)
+    # TODO: check that:
+    #       * there is no input form
+    #       * only shared calculations are visible
+
+
+# TODO (for all workflows):
+# make sure that the correct elements of the UI are shown/hidden at each stage
+
+
+@pytest.mark.parametrize("user", [1], indirect=True)
+@pytest.mark.parametrize("application_mode", ["IMPACT"], indirect=True)
+@pytest.mark.parametrize("default_usgs_id", [""], indirect=True)
+def test_impact_ui_level_1(
+        application_mode, authenticated_page, user, default_usgs_id,
+        should_remove_job):
+    page = ImpactPageLevel1(authenticated_page)
+    # level 1 users see the correlation models, which they cannot change
+    for field, model in [
+            ('within_event_correlation_model', 'LothBaker2013'),
+            ('between_event_correlation_model',
+             'AbrahamsonEtAl2014BetweenEvent')]:
+        select = authenticated_page.locator(f'select#{field}')
+        expect(select).to_be_visible()
+        expect(select).to_be_disabled()
+        expect(select).to_have_value(model)
+    page.set_rupture_identifier('us6000t7zp')
+    expect(page.maximum_distance()).not_to_be_visible()
+    page.select_shakemap_version(
+        value='urn:usgs-product:us:shakemap:us6000t7zp:1783206003077')
+    page.retrieve_data()
+    expect(page.intensity_map()).to_be_visible(timeout=50_000)
+    expect(page.pga_map()).to_be_visible(timeout=30_000)
+    expect(page.local_timestamp()).to_be_visible(timeout=30_000)
+    expect(page.local_timestamp()).not_to_be_editable()
+    # the default maximum distance depends on the magnitude
+    expect(page.maximum_distance()).to_be_visible()
+    expect(page.maximum_distance()).to_have_value('250')
+    expect(page.maximum_distance()).to_be_editable()
+    expect(page.run_impact_calc_btn()).to_be_enabled()
+    page.set_time_of_the_event('Night')
+    expect(page.no_uncertainty_ckb()).to_have_count(0)
+    # The smaller area still produces a Venezuela report.
+    page.maximum_distance().fill('100')
+    page.set_make_impact_reports()
+    page.run_impact_calc()
+    job_id = page.get_job_id_from_new_job()
+    # Wait for submission to finish before checking that selecting another
+    # ShakeMap version invalidates the retrieved data.
+    expect(page.run_impact_calc_btn()).to_be_enabled()
+    page.select_another_shakemap_version()
+    for elem in (page.intensity_map(), page.pga_map(), page.local_timestamp(),
+                 page.maximum_distance(), page.description()):
+        expect(elem).not_to_be_visible()
+    expect(page.run_impact_calc_btn()).to_be_disabled()
+    page.wait_for_job_completion(job_id)
+    page.to_outputs(job_id)
+    with page.page.context.expect_page() as report_page_info:
+        page.to_report()
+    report_tab = report_page_info.value
+    # networkidle is needed to avoid breaking in headless mode
+    report_tab.wait_for_load_state('networkidle')
+    report_tab.wait_for_timeout(500)  # let any trailing response writes complete
+    # report_tab.close()
+    page.page.bring_to_front()
+    page.to_calculations()
+    if should_remove_job:
+        page.remove_job(job_id)
+
+
+@pytest.mark.parametrize("user", [2], indirect=True)
+@pytest.mark.parametrize("application_mode", ["IMPACT"], indirect=True)
+@pytest.mark.parametrize("default_usgs_id", [""], indirect=True)
+def test_impact_ui_level_2_use_shakemap(
+        application_mode, authenticated_page, user, default_usgs_id,
+        should_remove_job):
+    page = ImpactPageLevel2(authenticated_page)
+    page.set_approach('Use ShakeMap from the USGS')
+    expect(page.rupture_identifier()).to_be_visible()
+    page.set_rupture_identifier('us6000t7zp')
+    page.select_shakemap_version(
+        value='urn:usgs-product:us:shakemap:us6000t7zp:1783206003077')
+    page.retrieve_data()
+    page.confirm_relocated_hypocenter_warning()
+    expect(page.intensity_map()).to_be_visible(timeout=50_000)
+    expect(page.pga_map()).to_be_visible(timeout=30_000)
+    expect(page.local_timestamp()).to_be_visible(timeout=30_000)
+    expect(page.local_timestamp()).not_to_be_editable()
+    page.set_time_of_the_event('Night')
+    page.set_no_uncertainty()
+    page.run_impact_calc()
+    job_id = page.get_job_id_from_new_job()
+    page.wait_for_job_completion(job_id)
+    page.to_outputs(job_id)
+    page.download_datastore()
+    page.to_calculations()
+    if should_remove_job:
+        page.remove_job(job_id)
+
+
+@pytest.mark.parametrize("user", [2], indirect=True)
+@pytest.mark.parametrize("application_mode", ["IMPACT"], indirect=True)
+@pytest.mark.parametrize("default_usgs_id", [""], indirect=True)
+def test_impact_ui_level_2_use_point_rupture(
+        application_mode, authenticated_page, user, default_usgs_id,
+        should_abort_job, should_remove_job):
+    page = ImpactPageLevel2(authenticated_page)
+    page.set_approach('Use point rupture from the USGS')
+    expect(page.rupture_identifier()).to_be_visible()
+    page.set_rupture_identifier('us6000jllz')
+    page.select_shakemap_version(
+        value='urn:usgs-product:us:shakemap:us6000jllz:1756921940993')
+    page.retrieve_stations_from_usgs()
+    page.retrieve_data()
+    expect(page.rupture_map()).to_be_visible(timeout=50_000)
+    expect(page.local_timestamp()).to_be_visible(timeout=30_000)
+    expect(page.local_timestamp()).not_to_be_editable()
+    page.set_time_of_the_event('Night')
+    # M 7.8: the defaults depending on the magnitude
+    expect(page.maximum_distance()).to_have_value('300')
+    expect(page.truncation_level()).to_have_value('3')
+    # unchecking "No uncertainty" restores the default truncation level
+    page.no_uncertainty_ckb().check()
+    page.no_uncertainty_ckb().uncheck()
+    expect(page.truncation_level()).to_have_value('3')
+    page.set_no_uncertainty()
+    page.run_impact_calc()
+    if should_abort_job or should_remove_job:
+        job_id = page.get_job_id_from_new_job()
+        if should_abort_job:
+            page.abort_job(job_id)
+        if should_remove_job:
+            page.remove_job(job_id)
+
+
+@pytest.mark.parametrize("user", [2], indirect=True)
+@pytest.mark.parametrize("application_mode", ["IMPACT"], indirect=True)
+@pytest.mark.parametrize("default_usgs_id", [""], indirect=True)
+def test_impact_ui_level_2_build_rupture(
+        application_mode, authenticated_page, user, default_usgs_id,
+        should_abort_job, should_remove_job):
+    page = ImpactPageLevel2(authenticated_page)
+    page.set_approach('Build rupture from USGS nodal plane solutions')
+    within = authenticated_page.locator(
+        'select#within_event_correlation_model')
+    between = authenticated_page.locator(
+        'select#between_event_correlation_model')
+    # the jobs without ShakeMap can use the models supporting circulant
+    # embedding, LothBaker2013 by default
+    expect(within).to_have_value('LothBaker2013')
+    expect(within.locator('option')).to_have_count(3)
+    within.select_option('DuNing2021Interpolated')
+    expect(between).to_have_value('AbrahamsonEtAl2014BetweenEvent')
+    between.select_option('GodaAtkinson2009')
+    expect(page.rupture_identifier()).to_be_visible()
+    expect(authenticated_page.locator(
+        'div#shakemap_version_grp')).to_be_visible()
+    page.set_rupture_identifier('usp0001ccb')
+    page.select_shakemap_version(
+        value='urn:usgs-product:atlas:shakemap:usp0001ccb:1594164792087')
+    page.retrieve_stations_from_usgs()
+    page.select_nodal_plane()
+    page.retrieve_data()
+    expect(page.rupture_map()).to_be_visible(timeout=50_000)
+    expect(page.local_timestamp()).to_be_visible(timeout=30_000)
+    expect(page.local_timestamp()).not_to_be_editable()
+    page.set_time_of_the_event('Night')
+    page.set_no_uncertainty()
+    authenticated_page.locator('select#nodal_plane').select_option('NP2')
+    with authenticated_page.expect_request(
+            lambda req: req.url.endswith('/v1/calc/impact_run')) as request:
+        page.run_impact_calc()
+    assert 'name="nodal_plane"' in request.value.post_data
+    assert 'NP2' in request.value.post_data
+    assert 'DuNing2021Interpolated' in request.value.post_data
+    assert 'GodaAtkinson2009' in request.value.post_data
+    if should_abort_job or should_remove_job:
+        job_id = page.get_job_id_from_new_job()
+        if should_abort_job:
+            page.abort_job(job_id)
+        if should_remove_job:
+            page.remove_job(job_id)
+
+
+@pytest.mark.parametrize("user", [2], indirect=True)
+@pytest.mark.parametrize("application_mode", ["IMPACT"], indirect=True)
+@pytest.mark.parametrize("default_usgs_id", [""], indirect=True)
+def test_impact_ui_level_2_use_shakemap_fault_rupture(
+        application_mode, authenticated_page, user, default_usgs_id,
+        should_abort_job, should_remove_job):
+    page = ImpactPageLevel2(authenticated_page)
+    page.set_approach('Use ShakeMap fault rupture from the USGS')
+    expect(page.rupture_identifier()).to_be_visible()
+    page.set_rupture_identifier('us6000phrk')
+    page.select_shakemap_version(
+        value='urn:usgs-product:us:shakemap:us6000phrk:1738891320927')
+    page.retrieve_stations_from_usgs(expect_no_seismic_stations=True)
+    page.retrieve_data()
+    expect(page.rupture_map()).to_be_visible(timeout=50_000)
+    expect(page.local_timestamp()).to_be_visible(timeout=30_000)
+    expect(page.local_timestamp()).not_to_be_editable()
+    page.set_time_of_the_event('Night')
+    page.set_no_uncertainty()
+    page.run_impact_calc()
+    if should_abort_job or should_remove_job:
+        job_id = page.get_job_id_from_new_job()
+        if should_abort_job:
+            page.abort_job(job_id)
+        if should_remove_job:
+            page.remove_job(job_id)
+
+
+@pytest.mark.parametrize("user", [2], indirect=True)
+@pytest.mark.parametrize("application_mode", ["IMPACT"], indirect=True)
+@pytest.mark.parametrize("default_usgs_id", [""], indirect=True)
+def test_impact_ui_level_2_use_finite_fault(
+        application_mode, authenticated_page, user, default_usgs_id,
+        should_abort_job, should_remove_job):
+    page = ImpactPageLevel2(authenticated_page)
+    page.set_approach('Use finite fault model from the USGS')
+    expect(page.rupture_identifier()).to_be_visible()
+    page.set_rupture_identifier('us6000jllz')
+    page.select_shakemap_version(
+        value='urn:usgs-product:us:shakemap:us6000jllz:1756921940993')
+    page.retrieve_stations_from_usgs()
+    page.retrieve_data()
+    expect(page.rupture_map()).to_be_visible(timeout=50_000)
+    expect(page.local_timestamp()).to_be_visible(timeout=30_000)
+    expect(page.local_timestamp()).not_to_be_editable()
+    page.set_time_of_the_event('Night')
+    page.set_no_uncertainty()
+    page.run_impact_calc()
+    if should_abort_job or should_remove_job:
+        job_id = page.get_job_id_from_new_job()
+        if should_abort_job:
+            page.abort_job(job_id)
+        if should_remove_job:
+            page.remove_job(job_id)
+
+
+@pytest.mark.parametrize("user", [2], indirect=True)
+@pytest.mark.parametrize("application_mode", ["IMPACT"], indirect=True)
+@pytest.mark.parametrize("default_usgs_id", [""], indirect=True)
+def test_impact_ui_level_2_provide_rupture_nrml(
+        application_mode, authenticated_page, user, default_usgs_id,
+        should_abort_job, should_remove_job):
+    page = ImpactPageLevel2(authenticated_page)
+    page.set_approach('Provide earthquake rupture in OpenQuake NRML format')
+    page.choose_rupture_model()
+    page.retrieve_data()
+    expect(page.rupture_map()).to_be_visible(timeout=50_000)
+    page.confirm_relocated_hypocenter_warning()
+    # expect(page.local_timestamp()).not_to_be_visible(timeout=30_000)
+    page.set_no_uncertainty()
+    page.run_impact_calc()
+    if should_abort_job or should_remove_job:
+        job_id = page.get_job_id_from_new_job()
+        if should_abort_job:
+            page.abort_job(job_id)
+        if should_remove_job:
+            page.remove_job(job_id)
+
+
+@pytest.mark.parametrize("user", [2], indirect=True)
+@pytest.mark.parametrize("application_mode", ["IMPACT"], indirect=True)
+@pytest.mark.parametrize("default_usgs_id", [""], indirect=True)
+def test_impact_ui_level_2_provide_rupture_nrml_correlation_models(
+        application_mode, authenticated_page, user, default_usgs_id,
+        should_abort_job, should_remove_job):
+    page = ImpactPageLevel2(authenticated_page)
+    # the ShakeMap jobs can use the same models supporting circulant
+    # embedding as the other jobs
+    within = authenticated_page.locator(
+        'select#within_event_correlation_model')
+    expect(within.locator('option')).to_have_count(3)
+    page.set_approach('Provide earthquake rupture in OpenQuake NRML format')
+    page.choose_rupture_model()
+    expect(within).to_be_visible()
+    within.select_option('MonteiroEtAl2026')
+    page.retrieve_data()
+    expect(page.rupture_map()).to_be_visible(timeout=50_000)
+    page.confirm_relocated_hypocenter_warning()
+    page.set_no_uncertainty()
+    # the body of a request with an uploaded file is not visible to
+    # Playwright, so check the value the form will submit
+    expect(within).to_have_value('MonteiroEtAl2026')
+    page.run_impact_calc()
+    if should_abort_job or should_remove_job:
+        job_id = page.get_job_id_from_new_job()
+        if should_abort_job:
+            page.abort_job(job_id)
+        if should_remove_job:
+            page.remove_job(job_id)
+
+
+@pytest.mark.parametrize("user", [2], indirect=True)
+@pytest.mark.parametrize("application_mode", ["IMPACT"], indirect=True)
+@pytest.mark.parametrize("default_usgs_id", [""], indirect=True)
+def test_impact_ui_level_2_provide_rupture_params(
+        application_mode, authenticated_page, user, default_usgs_id,
+        should_abort_job, should_remove_job):
+    page = ImpactPageLevel2(authenticated_page)
+    page.set_approach('Provide earthquake rupture parameters')
+    page.set_longitude(37.6)
+    page.set_latitude(37.6)
+    page.set_depth(20.0)
+    page.set_magnitude(7.8)
+    page.set_aspect_ratio(2)
+    page.set_rake(0.0)
+    page.set_dip(90)
+    page.set_strike(51.9)
+    page.retrieve_data()
+    expect(page.rupture_map()).to_be_visible(timeout=50_000)
+    page.set_time_of_the_event('Night')
+    page.set_no_uncertainty()
+    page.run_impact_calc()
+    if should_abort_job or should_remove_job:
+        job_id = page.get_job_id_from_new_job()
+        if should_abort_job:
+            page.abort_job(job_id)
+        if should_remove_job:
+            page.remove_job(job_id)
+
+
+@pytest.mark.parametrize("application_mode", ["IMPACT"], indirect=True)
+def test_cookie_bar(page, live_server, essential_cookie_groups,
+                    application_mode):
+    # a new visitor accepts the essential cookies from the cookie bar
+    CookieBar(page, live_server.url).check_accept_essential_cookies()
+
+
+@pytest.mark.parametrize("application_mode", ["IMPACT"], indirect=True)
+def test_cookies_info_page(page, live_server, essential_cookie_groups,
+                           application_mode):
+    CookieBar(page, live_server.url).check_cookies_info_page()
+
+
+@pytest.mark.parametrize("user", [1], indirect=True)
+@pytest.mark.parametrize("application_mode", ["IMPACT"], indirect=True)
+def test_login_logout(page, live_server, user, test_credentials,
+                      application_mode):
+    # log in and out by clicking on the buttons of the web interface
+    LoginPage(page, live_server.url).check_login_and_logout(
+        test_credentials['username'], test_credentials['password'])
+
+
+@pytest.mark.parametrize("user", [1], indirect=True)
+@pytest.mark.parametrize("application_mode", ["IMPACT"], indirect=True)
+def test_login_wrong_password(page, live_server, user, test_credentials,
+                              application_mode):
+    LoginPage(page, live_server.url).check_wrong_password(
+        test_credentials['username'])

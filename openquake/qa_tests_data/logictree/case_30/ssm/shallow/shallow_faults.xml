@@ -1,0 +1,213 @@
+<?xml version="1.0" encoding="utf-8"?>
+<nrml
+xmlns="http://openquake.org/xmlns/nrml/0.5"
+xmlns:gml="http://www.opengis.net/gml"
+>
+    <sourceModel
+    name="Model %s"
+    >
+        <sourceGroup
+        rup_interdep="indep"
+        src_interdep="indep"
+        srcs_weights="1.0 1.0 1.0 1.0 1.0"
+        tectonicRegion="Active Shallow Crust"
+        >
+
+            <simpleFaultSource
+            id="sf_81"
+            name=" | "
+            tectonicRegion="Active Shallow Crust"
+            >
+                <simpleFaultGeometry>
+                    <gml:LineString>
+                        <gml:posList>
+                            -179.393 -30.997 -179.381491 -30.953036 -179.369992 -30.909071 -179.358504 -30.865105 -179.347026 -30.821137 -179.335559 -30.777168 -179.324102 -30.733198 -179.312656 -30.689226 -179.30122 -30.645254 -179.289794 -30.601279 -179.278379 -30.557304 -179.266974 -30.513327 -179.255579 -30.469349 -179.244194 -30.42537 -179.23282 -30.381389 -179.226 -30.355
+                        </gml:posList>
+                    </gml:LineString>
+                    <dip>
+                        60.0
+                    </dip>
+                    <upperSeismoDepth>
+                        0.0
+                    </upperSeismoDepth>
+                    <lowerSeismoDepth>
+                        29.996381082059276
+                    </lowerSeismoDepth>
+                </simpleFaultGeometry>
+                <magScaleRel>
+                    WC1994
+                </magScaleRel>
+                <ruptAspectRatio>
+                    2.0
+                </ruptAspectRatio>
+                <incrementalMFD
+                binWidth="0.1"
+                minMag="6.55"
+                >
+                    <occurRates>
+                        0.00198774269704 0.00153601896445 0.00118695154189 0.000917211307546 0.00070877079055 0.000547699346273 0.000423232133586 0.000327050671356 0.000252726891808 0.000195293535335 0.000150912175079 0.000116616684459 9.01150028956e-05 6.96359511895e-05 5.38108588166e-05
+                    </occurRates>
+                </incrementalMFD>
+                <rake>
+                    -90
+                </rake>
+            </simpleFaultSource>
+            <simpleFaultSource
+            id="sf_82"
+            name=" | "
+            tectonicRegion="Active Shallow Crust"
+            >
+                <simpleFaultGeometry>
+                    <gml:LineString>
+                        <gml:posList>
+                            -179.515 -31.333 -179.499703 -31.291007 -179.484419 -31.249013 -179.469149 -31.207016 -179.453892 -31.165017 -179.438649 -31.123016 -179.423419 -31.081012 -179.408203 -31.039007 -179.393 -30.997
+                        </gml:posList>
+                    </gml:LineString>
+                    <dip>
+                        60.0
+                    </dip>
+                    <upperSeismoDepth>
+                        0.0
+                    </upperSeismoDepth>
+                    <lowerSeismoDepth>
+                        20.528024462925735
+                    </lowerSeismoDepth>
+                </simpleFaultGeometry>
+                <magScaleRel>
+                    WC1994
+                </magScaleRel>
+                <ruptAspectRatio>
+                    2.0
+                </ruptAspectRatio>
+                <incrementalMFD
+                binWidth="0.1"
+                minMag="6.55"
+                >
+                    <occurRates>
+                        0.00126443297285 0.000977084724527 0.000755037696265 0.000583451883415 0.000450859741102 0.000348399777128 0.000269224314431 0.000208041842272 0.000160763370231 0.000124229149894
+                    </occurRates>
+                </incrementalMFD>
+                <rake>
+                    -90
+                </rake>
+            </simpleFaultSource>
+            <simpleFaultSource
+            id="sf_83"
+            name=" | "
+            tectonicRegion="Active Shallow Crust"
+            >
+                <simpleFaultGeometry>
+                    <gml:LineString>
+                        <gml:posList>
+                            -179.74 -31.751 -179.718278 -31.710826 -179.696575 -31.670648 -179.67489 -31.630467 -179.653224 -31.590281 -179.631577 -31.550091 -179.609948 -31.509898 -179.588337 -31.4697 -179.566745 -31.429499 -179.545172 -31.389294 -179.523617 -31.349085 -179.515 -31.333
+                        </gml:posList>
+                    </gml:LineString>
+                    <dip>
+                        60.0
+                    </dip>
+                    <upperSeismoDepth>
+                        0.0
+                    </upperSeismoDepth>
+                    <lowerSeismoDepth>
+                        24.14527428425824
+                    </lowerSeismoDepth>
+                </simpleFaultGeometry>
+                <magScaleRel>
+                    WC1994
+                </magScaleRel>
+                <ruptAspectRatio>
+                    2.0
+                </ruptAspectRatio>
+                <incrementalMFD
+                binWidth="0.1"
+                minMag="6.55"
+                >
+                    <occurRates>
+                        0.00140587007184 0.00108637958781 0.000839494795754 0.000648715715947 0.000501292065472 0.000387371122247 0.000299339240906 0.000231313012251 0.00017874605907 0.000138125189422 0.000106735600506 8.24794410272e-05
+                    </occurRates>
+                </incrementalMFD>
+                <rake>
+                    -90
+                </rake>
+            </simpleFaultSource>
+            <simpleFaultSource
+            id="sf_84"
+            name=" | "
+            tectonicRegion="Active Shallow Crust"
+            >
+                <simpleFaultGeometry>
+                    <gml:LineString>
+                        <gml:posList>
+                            -180.0 -32.304705 -179.980893 -32.264263 -179.961366 -32.222889 -179.941857 -32.181512 -179.922366 -32.140132 -179.902892 -32.098749 -179.883435 -32.057362 -179.863997 -32.015972 -179.844575 -31.974579 -179.825171 -31.933183 -179.805785 -31.891783 -179.786416 -31.85038 -179.767064 -31.808974 -179.747729 -31.767565 -179.74 -31.751
+                        </gml:posList>
+                    </gml:LineString>
+                    <dip>
+                        60.0
+                    </dip>
+                    <upperSeismoDepth>
+                        0.0
+                    </upperSeismoDepth>
+                    <lowerSeismoDepth>
+                        28.252543813771165
+                    </lowerSeismoDepth>
+                </simpleFaultGeometry>
+                <magScaleRel>
+                    WC1994
+                </magScaleRel>
+                <ruptAspectRatio>
+                    2.0
+                </ruptAspectRatio>
+                <incrementalMFD
+                binWidth="0.1"
+                minMag="6.55"
+                >
+                    <occurRates>
+                        0.00160592376699 0.00124097015434 0.000958953940173 0.000741027216614 0.000572625350143 0.000442493587651 0.00034193487079 0.000264228587996 0.000204181417803 0.000157780245099 0.000121923953763 9.42161706735e-05 7.28051095985e-05 5.62598113016e-05
+                    </occurRates>
+                </incrementalMFD>
+                <rake>
+                    -90
+                </rake>
+            </simpleFaultSource>
+            <simpleFaultSource
+            id="sf_85"
+            name=" | "
+            tectonicRegion="Active Shallow Crust"
+            >
+                <simpleFaultGeometry>
+                    <gml:LineString>
+                        <gml:posList>
+                            -179.393 -30.997 -179.381491 -30.953036 -179.369992 -30.909071 -179.358504 -30.865105 -179.347026 -30.821137 -179.335559 -30.777168 -179.324102 -30.733198 -179.312656 -30.689226 -179.30122 -30.645254 -179.289794 -30.601279 -179.278379 -30.557304 -179.266974 -30.513327 -179.255579 -30.469349 -179.244194 -30.42537 -179.23282 -30.381389 -179.226 -30.355
+                        </gml:posList>
+                    </gml:LineString>
+                    <dip>
+                        60.0
+                    </dip>
+                    <upperSeismoDepth>
+                        0.0
+                    </upperSeismoDepth>
+                    <lowerSeismoDepth>
+                        29.996381082059276
+                    </lowerSeismoDepth>
+                </simpleFaultGeometry>
+                <magScaleRel>
+                    WC1994
+                </magScaleRel>
+                <ruptAspectRatio>
+                    2.0
+                </ruptAspectRatio>
+                <incrementalMFD
+                binWidth="0.1"
+                minMag="6.55"
+                >
+                    <occurRates>
+                        0.00198774269704 0.00153601896445 0.00118695154189 0.000917211307546 0.00070877079055 0.000547699346273 0.000423232133586 0.000327050671356 0.000252726891808 0.000195293535335 0.000150912175079 0.000116616684459 9.01150028956e-05 6.96359511895e-05 5.38108588166e-05
+                    </occurRates>
+                </incrementalMFD>
+                <rake>
+                    -90
+                </rake>
+            </simpleFaultSource>
+          </sourceGroup>
+    </sourceModel>
+</nrml>

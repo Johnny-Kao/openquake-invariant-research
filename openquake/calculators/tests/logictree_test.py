@@ -1,0 +1,997 @@
+# -*- coding: utf-8 -*-
+# vim: tabstop=4 shiftwidth=4 softtabstop=4
+#
+# Copyright (C) 2015-2026 GEM Foundation
+#
+# OpenQuake is free software: you can redistribute it and/or modify it
+# under the terms of the GNU Affero General Public License as published
+# by the Free Software Foundation, either version 3 of the License, or
+# (at your option) any later version.
+#
+# OpenQuake is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU Affero General Public License for more details.
+#
+# You should have received a copy of the GNU Affero General Public License
+# along with OpenQuake. If not, see <http://www.gnu.org/licenses/>.
+
+import sys
+import pickle
+import unittest
+from unittest import mock
+import numpy
+from openquake.baselib import general, config
+from openquake.baselib.general import decode
+from openquake.hazardlib import (
+    source_group, source_reader, InvalidFile, rmap_maker)
+from openquake.hazardlib.calc.mean_rates import (
+    to_rates, to_probs)
+from openquake.commonlib import readinput
+from openquake.calculators.views import view, text_table
+from openquake.calculators.export import export
+from openquake.calculators.extract import extract
+from openquake.calculators.classical import bysrc_results
+from openquake.hazardlib.rmap_maker import read_unc_ts_sets
+from openquake.calculators.tests import CalculatorTestCase, strip_calc_id
+from openquake.qa_tests_data.logictree import (
+    case_01, case_02, case_03, case_04, case_05, case_06, case_07, case_08,
+    case_09, case_10, case_11, case_12, case_13, case_14, case_15, case_16,
+    case_17, case_18, case_19, case_20, case_21, case_22, case_23, case_25,
+    case_26, case_27, case_28, case_29, case_30, case_31, case_32, case_33,
+    case_36, case_39, case_45, case_46, case_52, case_56, case_58, case_59,
+    case_67, case_68, case_71, case_73, case_79, case_80, case_83, case_84)
+
+ae = numpy.testing.assert_equal
+aac = numpy.testing.assert_allclose
+
+
+class LogictreeTestCase(CalculatorTestCase):
+
+    def assert_curves_ok(self, expected, test_dir, delta=None, **kw):
+        kind = kw.pop('kind', '')
+        self.run_calc(test_dir, 'job.ini', **kw)
+        ds = self.calc.datastore
+        got = (export(('hcurves/' + kind, 'csv'), ds) +
+               export(('hmaps/' + kind, 'csv'), ds) +
+               export(('uhs/' + kind, 'csv'), ds))
+        self.assertEqual(len(expected), len(got), str(got))
+        for fname, actual in zip(expected, got):
+            self.assertEqualFiles('expected/%s' % fname, actual,
+                                  delta=delta)
+        return got
+
+    def tearDown(self):
+        if not hasattr(self, 'calc'):  # some test broke
+            return
+        if 'hcurves-stats' not in self.calc.datastore:  # not produced
+            return
+        csm = self.calc.csm
+        csm_read = source_group.read_csm(self.calc.datastore)
+        # make sure the csm read from the datastore is the same as the original
+        for sg_orig, sg in zip(csm.src_groups, csm_read.src_groups):
+            if len(sg_orig) != len(sg):
+                raise RuntimeError(f'Inconsistent {sg=}, {sg_orig=}')
+        # NB: the sources in the datastore are not modified by the
+        # uncertainties (they are modified in the classical workers), so
+        # the mean rates cannot be recomputed here
+
+    def test_case_01(self):
+        # same source in two source models
+        self.assert_curves_ok(['curve-mean.csv'], case_01.__file__)
+
+        # check event_based_mfd
+        self.run_calc(case_01.__file__, 'rup.ini')
+        [f] = export(('event_based_mfd', 'csv'), self.calc.datastore)
+        self.assertEqualFiles('expected/mfd.csv', f, delta=1E-6)
+
+        # check that the occurrence rates are the expected ones
+        [src] = self.calc.csm.get_sources()
+        occrates = src.mfd.occurrence_rates
+        aac(occrates, [1.6, 1.5, 1.4, 1.3, 1.2, 1.1, 1.0])
+        df = self.calc.datastore.read_df('ruptures', 'id')[
+            ['mag', 'occurrence_rate']]
+        gb = df.groupby('mag').sum()
+        aac(gb.occurrence_rate / src.multiplicity, occrates, atol=2E-7)
+
+    def test_case_02(self):
+        self.run_calc(case_02.__file__, 'job.ini')
+
+        # check view inputs
+        lines = text_table(view('inputs', self.calc.datastore)).splitlines()
+        self.assertEqual(len(lines), 13)  # rst table with 13 rows
+
+        [fname] = export(('hcurves', 'csv'), self.calc.datastore)
+        self.assertEqualFiles('expected/hcurve.csv', fname)
+
+    def test_case_03(self):
+        # ab_max_mag uncertainty
+        self.assert_curves_ok(['curve-mean.csv'], case_03.__file__)
+
+    def test_case_04(self):
+        # KOR model
+        self.run_calc(case_04.__file__, 'job.ini',
+                      calculation_mode='preclassical')
+        hc_id = str(self.calc.datastore.calc_id)
+        self.run_calc(case_04.__file__, 'job.ini', hazard_calculation_id=hc_id)
+
+        [fname] = export(('hcurves', 'csv'), self.calc.datastore)
+        self.assertEqualFiles('expected/curve-mean.csv', fname)
+
+        # check disagg_by_src
+        src_ids = decode(self.calc.datastore['mean_rates_by_src/src_id'][:])
+        self.assertEqual(src_ids, ['SSC-AS-001'])
+
+    # NB: this test is sensitive to the lower cutoff for the rates
+    # it produces a huge rate 103.6 for the minimum level, cut off at 19.5
+    def test_case_05(self):
+        # use_rates, two sources, two uncertainties per source, full_enum
+        self.assert_curves_ok(['curve-mean.csv'], case_05.__file__)
+
+        # test mean_disagg_by_src
+        [fname] = export(('mean_disagg_by_src', 'csv'), self.calc.datastore)
+        self.assertEqualFiles('expected/mean_disagg_by_src.csv', fname)
+
+    def test_case_05_bis(self):
+        # use_rates, two sources, two uncertainties per source, sampling
+        self.run_calc(case_05.__file__, 'job_bis.ini')
+        [fname] = export(('hcurves', 'csv'), self.calc.datastore)
+        self.assertEqualFiles('expected/curve-mean-bis.csv', fname)
+
+    def test_case_06(self):
+        # two source models, use_rates and disagg_by_src
+        self.assert_curves_ok(
+            ['curve-mean.csv', 'curve-rlz0.csv', 'curve-rlz1.csv'],
+            case_06.__file__)
+
+    def test_case_07(self):
+        # this is a case with 3 source models and a source ("1") belonging
+        # both to source_model_1 and source_model_2
+        # we are checking use_rates and disagg_by_src
+        self.assert_curves_ok(
+            ['hazard_curve-mean.csv',
+             'hazard_curve-smltp_b1-gsimltp_b1.csv',
+             'hazard_curve-smltp_b2-gsimltp_b1.csv',
+             'hazard_curve-smltp_b3-gsimltp_b1.csv'],
+            case_07.__file__)
+
+        # testing view_relevant_sources
+        arr = view('relevant_sources:PGA', self.calc.datastore)
+        self.assertEqual(decode(arr['src_id']), ['1', '2'])
+
+    def test_case_07_bis(self):
+        # same as 07 but with sampling
+        self.run_calc(case_07.__file__, 'sampling.ini')
+        fnames = export(('hcurves', 'csv'), self.calc.datastore)
+        for fname in fnames:
+            self.assertEqualFiles('expected/' + strip_calc_id(fname), fname,
+                                  delta=1E-5)
+
+        # test csm.get_sources; there are 3 source model realizations
+        fname = general.gettemp(view('sm_rlzs', self.calc.datastore))
+        self.assertEqualFiles('expected/sm_rlzs.org', fname)
+
+        csm = source_group.read_csm(self.calc.datastore)
+        source_ids = [src.source_id for src in csm.get_sources(0)]
+        assert source_ids == ['2', '1']
+        source_ids = [src.source_id for src in csm.get_sources(1)]
+        assert source_ids == ['1']
+        source_ids = [src.source_id for src in csm.get_sources(2)]
+        assert source_ids == ['3']
+        # NB: the same source '1' appears in two sm_rlzs
+
+    def test_case_08(self):
+        self.assert_curves_ok(
+            ['hazard_curve-smltp_b1_b2-gsimltp_b1.csv',
+             'hazard_curve-smltp_b1_b3-gsimltp_b1.csv',
+             'hazard_curve-smltp_b1_b4-gsimltp_b1.csv'],
+            case_08.__file__)
+
+    def test_case_09(self):
+        # NB: the tight delta is needed to detect the case of the
+        # maxMagGRAbsolute uncertainty not being applied: the two curves
+        # differ by 6.8e-6, while the reproduction error is 1.6e-8
+        self.assert_curves_ok(
+            ['hazard_curve-smltp_b1_b2-gsimltp_b1.csv',
+             'hazard_curve-smltp_b1_b3-gsimltp_b1.csv'],
+            case_09.__file__, delta=1e-6)
+
+    def test_case_10(self):
+        self.assert_curves_ok(
+            ['hazard_curve-smltp_b1_b2-gsimltp_b1.csv',
+             'hazard_curve-smltp_b1_b3-gsimltp_b1.csv'],
+            case_10.__file__)
+
+        # test extract/hcurves/rlz-0
+        haz = vars(extract(self.calc.datastore, 'hcurves?kind=rlz-1'))
+        self.assertEqual(sorted(haz),
+                         ['extra', 'k', 'kind', 'rlz-001', 'rlzs'])
+        self.assertEqual(haz['rlz-001'].shape, (1, 1, 4))  # (N, M, L1)
+
+    def test_case_11(self):
+        self.assert_curves_ok(
+            ['hazard_curve-mean.csv',
+             'hazard_curve-smltp_b1_b2-gsimltp_b1.csv',
+             'hazard_curve-smltp_b1_b3-gsimltp_b1.csv',
+             'hazard_curve-smltp_b1_b4-gsimltp_b1.csv',
+             'quantile_curve-0.1.csv',
+             'quantile_curve-0.9.csv'],
+            case_11.__file__)
+
+    def test_case_12(self):
+        # akin to NAF model
+        self.assert_curves_ok(['mean_rates.csv'], case_12.__file__)
+        # the bval branchset has applyToBranches=smooth_collapsed, i.e. it
+        # applies to the source SC_10:124 only and not to BG_10
+        fname = general.gettemp(view('usignatures', self.calc.datastore))
+        self.assertEqualFiles('expected/unc_signatures.org', fname)
+
+    def test_case_12_bis(self):
+        # test reduction with empty branches
+        self.run_calc(case_12.__file__, 'job_bis.ini')
+        rlzs = self.calc.datastore['full_lt'].rlzs
+        fname = general.gettemp(text_table(rlzs, ext='org'))
+        self.assertEqualFiles('expected/realizations.org', fname)
+
+    def test_case_13(self):
+        self.assert_curves_ok(
+            ['hazard_curve-mean_PGA.csv', 'hazard_curve-mean_SA(0.2).csv',
+             'hazard_map-mean.csv'], case_13.__file__, delta=1E-5)
+
+        # test recomputing the hazard maps
+        self.run_calc(
+            case_13.__file__, 'job.ini', exports='csv',
+            hazard_calculation_id=str(self.calc.datastore.calc_id),
+            gsim_logic_tree_file='', source_model_logic_tree_file='')
+        [fname] = export(('hmaps', 'csv'), self.calc.datastore)
+        self.assertEqualFiles('expected/hazard_map-mean.csv', fname,
+                              delta=1E-5)
+
+        csv = general.gettemp(
+            text_table(view('extreme_sites', self.calc.datastore)))
+        self.assertEqualFiles('expected/extreme_sites.rst', csv)
+
+        # test extract/hcurves/mean, used by the npz exports
+        haz = vars(extract(self.calc.datastore, 'hcurves'))
+        self.assertEqual(sorted(haz), ['all', 'extra', 'investigation_time'])
+        self.assertEqual(
+            haz['all'].dtype.names, ('lon', 'lat', 'depth', 'mean'))
+        array = haz['all']['mean']
+        self.assertEqual(array.dtype.names, ('PGA', 'SA(0.2)'))
+        self.assertEqual(array['PGA'].dtype.names,
+                         ('0.005', '0.007', '0.0098', '0.0137', '0.0192',
+                          '0.0269', '0.0376', '0.0527', '0.0738', '0.103',
+                          '0.145', '0.203', '0.284'))
+
+        # checking sources_branches
+        tbl = general.gettemp(
+            text_table(view('sources_branches', self.calc.datastore),
+                       ext='org'))
+        self.assertEqualFiles('expected/source_branches.org', tbl)
+
+    def test_case_14(self):
+        # test classical with 2 gsims and 1 sample
+        self.assert_curves_ok(['hazard_curve-rlz-000_PGA.csv'],
+                              case_14.__file__)
+
+    def test_case_15(self):
+        # this is a case with both splittable and unsplittable sources
+        self.assert_curves_ok('''\
+hazard_curve-max-PGA.csv,
+hazard_curve-mean-PGA.csv
+hazard_curve-std-PGA.csv
+hazard_uhs-max.csv
+hazard_uhs-mean.csv
+hazard_uhs-std.csv
+'''.split(), case_15.__file__, delta=1E-6)
+
+        # npz exports
+        [fname] = export(('hmaps', 'npz'), self.calc.datastore)
+        arr = numpy.load(fname)['all']
+        self.assertEqual(arr['mean'].dtype.names, ('PGA',))
+        [fname] = export(('uhs', 'npz'), self.calc.datastore)
+        arr = numpy.load(fname)['all']
+        self.assertEqual(arr['mean'].dtype.names,
+                         ('0.010000', '0.100000', '0.200000'))
+
+        # check ordering by rm_rlz.pid
+        smlt = self.calc.datastore['full_lt/source_model_lt']
+        r0, r1, r2 = smlt.get_realizations()
+        self.assertEqual(repr(r0),
+                         "<Realization #0 ['source_model_1.xml', None], "
+                         "path=SM1~., weight=0.5>")
+        self.assertEqual(repr(r1), "<Realization #1 ['source_model_2.xml', "
+                         "(3.0, 1.0)], path=SM2~a3b1, "
+                         "weight=0.25>")
+        self.assertEqual(repr(r2), "<Realization #2 ['source_model_2.xml', "
+                         "(3.2, 0.8)], path=SM2~a3pt2b0pt8, weight=0.25>")
+
+    def test_case_16(self):   # sampling
+        with unittest.mock.patch.dict(config.memory, limit=240):
+            self.assert_curves_ok(
+                ['hazard_curve-mean.csv',
+                 'quantile_curve-0.1.csv',
+                 'quantile_curve-0.9.csv'],
+                case_16.__file__)
+
+        # test that the single realization export fails because
+        # individual_rlzs was false
+        with self.assertRaises(KeyError) as ctx:
+            export(('hcurves/rlz-3', 'csv'), self.calc.datastore)
+        self.assertIn('hcurves-rlzs', str(ctx.exception))
+
+    def test_case_17(self):  # oversampling
+        # this is a test with 4 sources A and B with the same ID
+        # sources A's are actually different, while the B's are identical
+        self.assert_curves_ok(
+            ['hazard_curve-smltp_b1-gsimltp_b1-ltr_0.csv',
+             'hazard_curve-smltp_b2-gsimltp_b1-ltr_1.csv',
+             'hazard_curve-smltp_b2-gsimltp_b1-ltr_2.csv',
+             'hazard_curve-smltp_b2-gsimltp_b1-ltr_3.csv',
+             'hazard_curve-smltp_b2-gsimltp_b1-ltr_4.csv'],
+            case_17.__file__)
+        ids = decode(self.calc.datastore['source_info']['source_id'])
+        numpy.testing.assert_equal(ids, ['A!b1', 'A!b2', 'B'])
+
+    def test_case_18(self):
+        # test classical with 1 gsim and 5 samples
+        self.assert_curves_ok(['hazard_curve-mean.csv'],
+                              case_18.__file__)
+
+    def test_case_18_bis(self):
+        # test classical with 1 gsim and full enumeration
+        self.run_calc(case_18.__file__, 'job_bis.ini')
+        [fname] = export(('realizations', 'csv'), self.calc.datastore)
+        self.assertEqualFiles('expected/realizations_bis.csv', fname)
+        [fname] = export(('hcurves/mean', 'csv'), self.calc.datastore)
+        self.assertEqualFiles('expected/hazard_curve-mean_bis.csv', fname)
+
+        # the cfactor counts the contexts once, also for the MFD variants
+        # computed together by make_results (it was 225 = 9 x 25); the 9
+        # variants of a depth are computed together, since their magnitudes
+        # are nested, so there are 6 + 9 contexts, the ones of the variants
+        # with maxMag 7.6 at the two depths
+        nctxs = self.calc.datastore.read_df('source_data').nctxs.sum()
+        self.assertEqual(nctxs, 15)
+        self.assertEqual(self.calc.cfactor[0], nctxs)
+
+        # without the variant sources optimization each variant would
+        # generate its contexts: at the first depth 4 for the 6 variants
+        # with magnitudes 5.5, 6.5 and 6 for the 3 variants with maxMag 7.6,
+        # i.e. 42, and at the second depth 6 x 6 + 3 x 9 = 63
+        est = self.calc.datastore['nctxs'][0]
+        self.assertEqual(est['collapsed'], 15)
+        self.assertEqual(est['separate'], 105)
+        tbl = view('context_reduction', self.calc.datastore)
+        self.assertIn('| variants factor | 7.00', tbl)
+
+    def test_gids_numbering(self):
+        # Task routing uses core gids; context makers keep local GSIM
+        # columns even when the group spans several uncertainty sets.
+        self.run_calc(case_18.__file__, 'job_bis.ini')
+        ds = self.calc.datastore
+        unc_ts_sets = read_unc_ts_sets(ds)
+        full_lt = ds['full_lt'].init()
+        global_ts2gids = dict(zip(unc_ts_sets,
+                                  full_lt.get_gids(unc_ts_sets)))
+        cmakers = self.calc.cmdict['Default'].to_array()
+        for grp, cm in zip(self.calc.csm.src_groups, cmakers):
+            sources = list(grp)
+            task_ts2gids = {ts: global_ts2gids[ts] for src in sources
+                            for ts in src.get_ts_sets()}
+            numpy.testing.assert_equal(cm.gsim_idx, range(len(cm.gsims)))
+            for src in grp:
+                for ts in src.get_ts_sets():
+                    numpy.testing.assert_equal(task_ts2gids[ts],
+                                               global_ts2gids[ts])
+
+    def test_case_19(self):
+        # test for nontrivial GMPE logictree and AvgGMPE
+        self.assert_curves_ok([
+            'hazard_curve-mean_PGA.csv',
+            'hazard_curve-mean_SA(0.1).csv',
+            'hazard_curve-mean_SA(0.15).csv',
+        ], case_19.__file__, delta=1E-5)
+
+        # checking the mean rates
+        mean_poes = self.calc.datastore['hcurves-stats'][0, 0]  # shape (M, L1)
+        window = self.calc.datastore['oqparam'].investigation_time
+        mean_rates = to_rates(mean_poes, window)
+        rates_by_source = self.calc.datastore[
+            'mean_rates_by_src'][0]  # (M, L1, Ns)
+        aac(mean_rates, rates_by_source.sum(axis=2), atol=5E-7)
+
+    def test_case_20(self):
+        # Source geometry enumeration, apply_to_sources
+        self.assert_curves_ok([
+            'hazard_curve-mean-PGA.csv',
+            'hazard_curve-00.csv',
+            'hazard_curve-01.csv',
+            'hazard_curve-02.csv',
+            'hazard_curve-03.csv',
+            'hazard_curve-04.csv',
+            'hazard_curve-05.csv',
+            'hazard_curve-06.csv',
+            'hazard_curve-07.csv',
+            'hazard_curve-08.csv',
+            'hazard_curve-09.csv',
+            'hazard_curve-10.csv',
+            'hazard_curve-11.csv'],
+            case_20.__file__)
+        # there are 3 sources x 12 sm_rlzs
+        sgs = self.calc.csm.src_groups
+        # there is a single group with the full trt_smrs, instead of 7
+        # groups with 1 source each
+        self.assertEqual(len(sgs), 1)
+        self.assertEqual([src.source_id for src in sgs[0]],
+                         ['CHAR1', 'COMFLT1', 'SFLT1'])
+        dupl = sum(len(src.trt_smrs) - 1 for src in sgs[0])
+        self.assertEqual(dupl, 33)  # 3 sources x 12 sm_rlzs
+
+        # another way to look at the duplicated sources; protects against
+        # future refactorings breaking the pandas readability of source_info
+        df = self.calc.datastore.read_df('source_info', 'source_id')
+        # there is one row per base source, without the ';' suffix added
+        # to the copies with different uncertainties
+        numpy.testing.assert_equal(
+            decode(list(df.index)), ['CHAR1', 'COMFLT1', 'SFLT1'])
+
+        # check pandas readability of hcurves-rlzs and hcurves-stats
+        df = self.calc.datastore.read_df('hcurves-rlzs', 'lvl')
+        self.assertEqual(list(df.columns),
+                         ['site_id', 'rlz_id', 'imt', 'value'])
+        df = self.calc.datastore.read_df('hcurves-stats', 'lvl')
+        self.assertEqual(list(df.columns),
+                         ['site_id', 'stat', 'imt', 'value'])
+
+        # check the realizations contains only literals
+        smlt = self.calc.datastore['full_lt'].source_model_lt
+        got = [dict(zip(rlz.lt_path, rlz.value))
+               for rlz in smlt.get_realizations()]
+        self._check(got)
+
+    def _check(self, got):
+        exp0 = {'char_complex': [('complexFaultGeometry',
+                                  ([[(-64.5, -0.38221, 2.0),
+                                     (-64.5, 0.38221, 4.0)],
+                                    [(-64.5, -0.38221, 16.0),
+                                     (-64.5, 0.38221, 14.0)]],
+                                   2.0))],
+                'cog1': ([[(-64.7, -0.38221, 0.0), (-64.7, 0.38221, 0.0)],
+                          [(-64.7, -0.38221, 12.0), (-64.7, 0.38221, 12.0)]],
+                         2.0),
+                'sg1': ([(-65.0, -0.38221), (-65.0, 0.38221)],
+                        0.0, 12.0, 90.0, 2.0),
+                'sm1': 'source_model.xml'}
+        exp1 = {'char_plane': [('planarSurface',
+                                [(-64.5, -0.38221, 1.0),
+                                 (-64.5, 0.0, 1.0),
+                                 (-64.5, 0.0, 14.0),
+                                 (-64.5, -0.38221, 14.0)]),
+                               ('planarSurface',
+                                [(-64.5, 0.0, 2.0),
+                                 (-64.5, 0.38221, 2.0),
+                                 (-64.5, 0.38221, 16.0),
+                                 (-64.5, 0.0, 16.0)])],
+                'cog1': ([[(-64.7, -0.38221, 0.0), (-64.7, 0.38221, 0.0)],
+                          [(-64.7, -0.38221, 12.0), (-64.7, 0.38221, 12.0)]],
+                         2.0),
+                'sg1': ([(-65.0, -0.38221), (-65.0, 0.38221)],
+                        0.0, 12.0, 90.0, 2.0),
+                'sm1': 'source_model.xml'}
+        exp2 = {'char_simple': [('simpleFaultGeometry',
+                                 ([(-64.5, -0.38221), (-64.5, 0.38221)],
+                                  2.0,
+                                  15.0,
+                                  90.0,
+                                  2.0))],
+                'cog1': ([[(-64.7, -0.38221, 0.0), (-64.7, 0.38221, 0.0)],
+                          [(-64.7, -0.38221, 12.0), (-64.7, 0.38221, 12.0)]],
+                         2.0),
+                'sg1': ([(-65.0, -0.38221), (-65.0, 0.38221)],
+                        0.0, 12.0, 90.0, 2.0),
+                'sm1': 'source_model.xml'}
+        assert got[0] == exp0
+        assert got[1] == exp1
+        assert got[2] == exp2
+
+    def test_case_20_bis(self):
+        # mean_rates_by_src
+        self.run_calc(case_20.__file__, 'job_bis.ini')
+        dbs = self.calc.datastore['mean_rates_by_src']
+        ae(dbs.shape_descr, ['site_id', 'imt', 'lvl', 'src_id'])
+        ae(dbs.site_id, [0])
+        ae(dbs.imt, ['PGA', 'SA(1.0)'])
+        ae(dbs.lvl, [0, 1, 2, 3])
+        ae(dbs.src_id, ['CHAR1', 'COMFLT1', 'SFLT1'])
+
+        # testing extract_mean_rates_by_src
+        aw = extract(self.calc.datastore, 'mean_rates_by_src?imt=PGA&iml=1E-2')
+        self.assertEqual(aw.site_id, 0)
+        self.assertEqual(aw.imt, 'PGA')
+        self.assertEqual(aw.iml, .01)
+        # the numbers are quite different on macOS
+        aac(aw.array['rate'], [0.02 , 0.015, 0.015], atol=1E-6)
+
+    def test_case_21(self):
+        # Simple fault dip and MFD enumeration
+        self.assert_curves_ok([
+            'hc00.csv', 'hc01.csv', 'hc02.csv',
+            'hc03.csv', 'hc04.csv', 'hc05.csv',
+            'hc06.csv', 'hc07.csv', 'hc08.csv',
+            'hc09.csv', 'hc10.csv', 'hc11.csv',
+            'hc12.csv', 'hc13.csv', 'hc14.csv',
+            'hc15.csv', 'hc15.csv', 'hc17.csv',
+            'hc18.csv', 'hc19.csv', 'hc20.csv',
+            'hc21.csv', 'hc22.csv', 'hc23.csv',
+            'hc24.csv', 'hc25.csv', 'hc26.csv'], case_21.__file__, delta=2E-05)
+
+    def test_case_22(self):
+        # sigma_model_alatik2015
+        self.assert_curves_ok(["hazard_curve-mean-SA06.csv"], case_22.__file__)
+
+    def test_case_23(self):
+        # arctic region (and IDL)
+        # few tasks, otherwise the 16 gsims are called on tiny contexts
+        self.assert_curves_ok(["hazard_curve-mean-PGA.csv",  # slim.csv
+                               "hazard_map-mean-PGA.csv"], case_23.__file__,
+                              concurrent_tasks='2')
+        nc = self.calc.datastore['source_info'][:]['num_ctxs'].sum()
+
+        # running a calculation with more sites must give more contexts
+        self.run_calc(case_23.__file__, 'job.ini', concurrent_tasks='2',
+                      site_model_file='fat.csv slim.csv')
+        nc2 = self.calc.datastore['source_info'][:]['num_ctxs'].sum()
+        assert nc2 >= nc
+
+    def test_case_23_bis(self):
+        # correlated uncertainties
+        # few tasks, otherwise the 16 gsims are called on tiny contexts
+        self.run_calc(case_23.__file__, 'correlated.ini',
+                      concurrent_tasks='2')
+        [fname] = export(('hmaps/mean', 'csv'), self.calc.datastore)
+        self.assertEqualFiles('expected/hazard_map-corr-PGA.csv', fname)
+
+    def test_case_23_strided(self):
+        # the striding must be disabled with correlated uncertainties,
+        # since check_correlated needs the full groups
+        with mock.patch.object(source_reader, 'BIG_FILE', 0):
+            self.test_case_23_bis()
+        ns = len(self.calc.datastore['source_info'])
+        # with the uncertainties applied in the workers there is one row
+        # per base source and no ';i' suffix for the 7 sources modified by
+        # the correlated uncertainties
+        assert ns == 19
+
+    def test_case_25(self):
+        # BCHydro-style correlated uncertainties (alt1 + alt2 + alt3)
+        # sampled to keep the calc fast (highly simplified version)
+        self.run_calc(case_25.__file__, 'job.ini', exports='csv',
+                      concurrent_tasks='4')
+        [got] = export(('hcurves', 'csv'), self.calc.datastore)
+        self.assertEqualFiles(
+            'expected/hazard_curve-mean-PGA.csv', got, delta=5E-4)
+        self.assertEqual(len(self.calc.full_lt.get_realizations()), 50)
+
+        # Moving every output column must leave the computed rates
+        # unchanged, including the overlapping sets {15}, {15, 16}, {16}.
+        ds = self.calc.datastore
+        unc_ts_sets = read_unc_ts_sets(ds)
+        self.assertEqual(len(unc_ts_sets), 27)
+        expected = numpy.zeros((27, self.calc.oqparam.imtls.size))
+        numpy.add.at(expected, (ds['_rates/gid'][:], ds['_rates/lid'][:]),
+                     ds['_rates/rate'][:])
+        # 26 is the last of the 27 original gids (0..26); 100 shifts
+        # them outside that range, reversing their order to 126..100.
+        ts2gids = {ts: numpy.array([100 + 26 - i])
+                   for i, ts in enumerate(unc_ts_sets)}
+        actual = numpy.zeros_like(expected)
+        cmakers = self.calc.cmdict['Default'].to_array()
+        for grp, cm in zip(self.calc.csm.src_groups, cmakers):
+            # Exercise the same serialization used by distributed tasks.
+            sources = list(grp)
+            task_ts2gids = {ts: ts2gids[ts] for src in sources
+                            for ts in src.get_ts_sets()}
+            bset_values = source_reader.prepare_bset_values(
+                self.calc.full_lt, sources)
+            cm, task_ts2gids, bset_values = pickle.loads(pickle.dumps(
+                (cm, task_ts2gids, bset_values)))
+            self.assertFalse(hasattr(cm, 'trt_smrs'))
+            for program in bset_values.values():
+                for bset, _ in program:
+                    self.assertEqual(bset.branches, [])
+            for dic in bysrc_results([grp], self.calc.sitecol, cm,
+                                     task_ts2gids, bset_values, False):
+                rmap = dic['rmap']
+                original = 126 - rmap.gid
+                actual[original] += rmap.array[0].T
+        aac(actual, expected, rtol=1e-6, atol=1e-12)
+
+    def test_case_26(self):
+        # 3-branch amp LT, classical, full enumeration and sampling
+        for kwargs, prefix, nrlz in [
+                ({}, '', 3),
+                ({'number_of_logic_tree_samples': '2'}, 'sampling_', 2)]:
+            self.run_calc(case_26.__file__, 'job.ini', **kwargs)
+            self.assertEqual(len(self.calc.full_lt.rlzs), nrlz)
+            got = export(('hcurves', 'csv'), self.calc.datastore)
+            expected = [
+                '%shazard_curve-mean-PGA.csv' % prefix,
+                '%shazard_curve-mean-SA(0.2).csv' % prefix,
+            ] + ['%shazard_curve-rlz-%03d-%s.csv' % (prefix, r, imt)
+                 for r in range(nrlz) for imt in ('PGA', 'SA(0.2)')]
+            self.assertEqual(len(expected), len(got), str(got))
+            for fname, actual in zip(expected, got):
+                self.assertEqualFiles('expected/%s' % fname, actual)
+
+        # With more samples than amplification branches, sample ordinals
+        # cannot be used as indices into the amplification functions.
+        self.run_calc(case_26.__file__, 'job.ini',
+                      number_of_logic_tree_samples='10')
+        names = self.calc.amplifier.names
+        expected = [names.index(r.extra_rlz.lt_path[0])
+                    for r in self.calc.full_lt.get_realizations()]
+        ae(self.calc.amplifier.rlz_ampl_ord, expected)
+
+    def test_case_27(self):
+        # 3-branch amp LT, disaggregation, full enum + sampling
+        hcurves_full_enum = None
+        for kwargs, prefix, nrlz in [
+                ({}, '', 3), # Full enumeration: 1 SSC x 1 GMM x 3 amp
+                ({'number_of_logic_tree_samples': '2'}, 'sampling_', 2)]:
+            self.run_calc(case_27.__file__, 'job.ini', **kwargs)
+            self.assertEqual(len(self.calc.full_lt.rlzs), nrlz)
+            got = export(('disagg-rlzs', 'csv'), self.calc.datastore)
+            got += export(('disagg-stats', 'csv'), self.calc.datastore)
+            for fname in got:
+                self.assertEqualFiles(
+                    'expected/%s%s' % (prefix, strip_calc_id(fname)), fname)
+
+            # Sanity check on the invariant: for each (site, IMT, PoE-target,
+            # rlz), summing the disagg matrix over Ma/D/E and converting rates
+            # back to probability must reproduce poe4 (which is the classical
+            # soil-hcurve PoE at the hmap3 IML)
+            # N  = num sites
+            # M  = num IMTs
+            # P  = num poes_disagg targets
+            # Z  = num rlzs kept for disagg output
+            # Ma = num magnitde bins
+            # D  = num distance bins
+            # E  = num epsilon bins
+            ds = self.calc.datastore
+            poe4 = ds['poe4'][:] # (N, M, P, Z)
+            mat = ds['disagg-rlzs/Mag_Dist_Eps'][:] # (N, Ma, D, E, M, P, Z)
+            poes_summed = to_probs(mat.sum(axis=(1, 2, 3)))  # (N, M, P, Z)
+            aac(poes_summed, poe4, rtol=1e-3)
+
+            if prefix == '':  # Retain full enum disagg for case_26 comp below
+                hcurves_full_enum = ds['hcurves-stats'][:, 0].copy()
+
+        # Full-enum hcurves must match case_26 (classical vs disagg)
+        self.run_calc(case_26.__file__, 'job.ini')
+        expected = self.calc.datastore['hcurves-stats'][:, 0]
+        aac(hcurves_full_enum, expected, rtol=1e-6)
+
+    def test_case_28(self):  # North Africa
+        # MultiPointSource with modify MFD logic tree
+        out = self.run_calc(case_28.__file__, 'job.ini', exports='csv')
+        for f in out['uhs', 'csv']:
+            self.assertEqualFiles('expected/' + strip_calc_id(f), f,
+                                  delta=4E-5)
+
+        # checking that source_info is stored correctly
+        info = self.calc.datastore['source_info'][:]
+        # the uncertainties are applied in the workers, so there is one row
+        # per base source and no ';i' suffix
+        srcids = [b'21', b'22']
+        ae(info['source_id'], srcids)
+        ae(info['grp_id'], list(range(len(srcids))))
+        ae(info['weight'] > 0, [True] * len(srcids))
+
+        # check collapse_gsim_logic_tree
+        aw = extract(self.calc.datastore, 'realizations')
+        tbl = general.gettemp(text_table(aw.array, ext='org'))
+        self.assertEqualFiles('expected/realizations.org', tbl)
+
+    def test_case_28_multimfd(self):
+        # multiMFDAbsolute is equivalent to abGRAbsolute when the MFDs of
+        # all the points of the MultiPointSource are the same, also in
+        # combination with the relative uncertainties
+        self.run_calc(case_28.__file__, 'job.ini',
+                      source_model_logic_tree_file=
+                      'source_model_logic_tree_ab.xml')
+        expected = self.calc.datastore['hcurves-stats'][:, 0]
+        self.run_calc(case_28.__file__, 'job.ini',
+                      source_model_logic_tree_file=
+                      'source_model_logic_tree_multimfd.xml')
+        got = self.calc.datastore['hcurves-stats'][:, 0]
+        aac(got, expected, rtol=1e-6)
+        # the uncertainties are not trivial
+        self.assertGreater(len(self.calc.datastore['full_lt'].rlzs), 4)
+
+    def test_case_28_bis(self):
+        # missing z1pt0
+        with self.assertRaises(InvalidFile) as ctx:
+            self.run_calc(case_28.__file__, 'job_wrong.ini')
+        self.assertIn('reference_depth_to_1pt0km_per_sec not specified',
+                      str(ctx.exception))
+
+    def test_case_29(self):
+        # Simple fault source and area source with epistemic uncertainty
+        # on hypoDepthDist
+        self.assert_curves_ok(['hazard_curve-mean-PGA.csv'],
+                              case_29.__file__)
+
+    def test_case_30(self):
+        # point on the international data line
+        # this is also a test with IMT-dependent weights
+        # Source grids and fault traces are trimmed to reduce runtime.
+        if sys.platform != 'darwin':  # broken on macOS
+            self.assert_curves_ok(['hazard_curve-PGA.csv',
+                                   'hazard_curve-SA(1.0).csv'],
+                                  case_30.__file__)
+
+        # IMT-dependent weights with sampling is valid
+        self.run_calc(case_30.__file__, 'job.ini',
+                      number_of_logic_tree_samples='10')
+
+    def test_case_31(self):
+        # source specific logic tree
+        self.assert_curves_ok(['hazard_curve-mean-PGA.csv',
+                               'hazard_curve-std-PGA.csv'], case_31.__file__)
+
+    def test_case_32(self):
+        # Test aspect ratio epistemic uncertainties
+        self.assert_curves_ok(
+            ['hazard_curve-mean-PGA.csv'], 
+             case_32.__file__)                            
+
+    def test_case_33(self):
+        # Test seismogenic depth epistemic uncertainties
+        self.assert_curves_ok(
+            ['hazard_curve-mean-PGA.csv'], 
+             case_33.__file__)    
+
+    def test_case_36(self):
+        # test with advanced applyToSources and disordered gsim_logic_tree
+        # testing also split_by_gsim
+        self.run_calc(case_36.__file__, 'job.ini')
+        hc_id = str(self.calc.datastore.calc_id)
+        self.run_calc(case_36.__file__, 'job.ini', hazard_calculation_id=hc_id,
+                      calculation_mode='classical')
+        self.assertEqual(self.calc.R, 9)  # there are 9 realizations
+        dstore = self.calc.datastore
+
+        # test `oq show rlz:`
+        tbl = general.gettemp(text_table(view('rlz:8', dstore)))
+        self.assertEqualFiles('expected/show-rlz8.org', tbl)
+
+        # test `oq show branchsets`
+        tbl = general.gettemp(view('branchsets', dstore))
+        self.assertEqualFiles('expected/branchsets.org', tbl)
+
+    def test_case_39(self):
+        # 0-IMT-weights
+        self.assert_curves_ok([
+            'hazard_curve-mean-PGA.csv', 'hazard_curve-mean-SA(0.1).csv',
+            'hazard_curve-mean-SA(0.5).csv', 'hazard_curve-mean-SA(2.0).csv',
+            'hazard_map-mean.csv'], case_39.__file__, delta=2E-5)
+
+        # check realizations
+        aw = extract(self.calc.datastore, 'realizations')
+        tbl = general.gettemp(text_table(aw.array, ext='org'))
+        self.assertEqualFiles('expected/realizations.org', tbl)
+
+    def test_case_45(self):
+        # this is a test for MMI with disagg_by_src and sampling
+        self.assert_curves_ok(["hazard_curve-mean-MMI.csv"], case_45.__file__)
+
+    def test_case_46(self):
+        # SMLT with applyToBranches
+        self.assert_curves_ok(["hazard_curve-mean.csv"], case_46.__file__,
+                              delta=1E-6)
+        # the branchset B has applyToBranches=a2 and the branchset C has
+        # applyToBranches="b1 b2", i.e. C applies only to two of the three
+        # branches of B, so the source 2 has 7 signatures and not 9
+        fname = general.gettemp(view('usignatures', self.calc.datastore))
+        self.assertEqualFiles('expected/unc_signatures.org', fname)
+
+    def test_case_52(self):
+        # case with 2 GSIM realizations b1 (w=.9) and b2 (w=.1), 10 samples
+
+        # late_weights
+        self.run_calc(case_52.__file__, 'job.ini')
+        haz = self.calc.datastore['hcurves-stats'][0, 0, 0, 6]
+        aac(haz, 0.563831, rtol=1E-6)
+        ws = extract(self.calc.datastore, 'weights')
+        # sampled 8 times b1 and 2 times b2
+        aac(ws, [0.029412, 0.029412, 0.264706, 0.029412, 0.264706, 0.264706,
+                 0.029412, 0.029412, 0.029412, 0.029412], atol=1e-5)
+
+        # early_weights
+        self.run_calc(case_52.__file__, 'job.ini',
+                      sampling_method='early_weights')
+        haz = self.calc.datastore['hcurves-stats'][0, 0, 0, 6]
+        aac(haz, 0.558779, rtol=1E-6)
+        ws = extract(self.calc.datastore, 'weights')
+        aac(ws, [0.1] * 10)  # all equal
+
+        # full enum, rlz-0: 0.554007, rlz-1: 0.601722
+        self.run_calc(case_52.__file__, 'job.ini',
+                      number_of_logic_tree_samples='0')
+        haz = self.calc.datastore['hcurves-stats'][0, 0, 0, 6]
+        aac(haz, 0.558779, rtol=1E-6)
+        ws = extract(self.calc.datastore, 'weights')
+        aac(ws, [0.9, 0.1])
+
+    def test_case_52_bis(self):
+        self.run_calc(case_52.__file__, 'job.ini',
+                      sampling_method='late_latin')
+        haz = self.calc.datastore['hcurves-stats'][0, 0, 0, 6]
+        aac(haz, 0.558779, rtol=1E-6)
+        ws = extract(self.calc.datastore, 'weights')
+        # sampled 5 times b1 and 5 times b2
+        aac(ws, [0.02, 0.18, 0.18, 0.18, 0.18, 0.02, 0.02, 0.02, 0.18, 0.02])
+
+        self.run_calc(case_52.__file__, 'job.ini',
+                      sampling_method='early_latin')
+        haz = self.calc.datastore['hcurves-stats'][0, 0, 0, 6]
+        aac(haz, 0.558779, rtol=1E-6)
+        ws = extract(self.calc.datastore, 'weights')
+        aac(ws, [0.1] * 10)  # equal weights
+
+    def test_case_56(self):
+        # test with a discardable source model (#2)
+        self.run_calc(case_56.__file__, 'job.ini', concurrent_tasks='0')
+        [fname] = export(('uhs/mean', 'csv'), self.calc.datastore)
+        self.assertEqualFiles('expected/uhs.csv', fname)
+
+    def test_case_58(self):
+        # Logic tree with SimpleFault uncertainty on geometry and MFD (from
+        # slip)
+
+        # First calculation
+        self.run_calc(case_58.__file__, 'job.ini')
+        f01, _f02 = export(('hcurves/rlz-000', 'csv'), self.calc.datastore)
+        f03, _f04 = export(('hcurves/rlz-003', 'csv'), self.calc.datastore)
+
+        # Second calculation. Same LT structure for case 1 but with only one
+        # branch for each branch set
+        self.run_calc(case_58.__file__, 'job_case01.ini')
+        f11, _f12 = export(('hcurves/', 'csv'), self.calc.datastore)
+
+        # Third calculation. In this case we use a source model containing one
+        # source with the geometry of branch b22 and slip rate of branch b32
+        self.run_calc(case_58.__file__, 'job_case02.ini')
+        f21, _f22 = export(('hcurves/', 'csv'), self.calc.datastore)
+
+        # First test
+        self.assertEqualFiles(f01, f11)
+
+        # Second test
+        self.assertEqualFiles(f03, f21)
+
+    def test_case_59(self):
+        # test NRCan15SiteTerm
+        self.run_calc(case_59.__file__, 'job.ini')
+        [f] = export(('hcurves/mean', 'csv'), self.calc.datastore)
+        self.assertEqualFiles('expected/hcurve-mean.csv', f)
+
+    def test_case_67(self):
+        # source specific logic tree with the following structure:
+        # | source_id | grp_id | code | num_ctxs |num_ruptures |mul |
+        # |-----------+--------+------|----------|-------------|----|
+        # | 10        | 0      | A    | 76       |260_352      |144 |
+        # | 11        | 0      | A    | 335      |13_920       |144 |
+        # | 16        | 0      | P    | 89       |252_000      |144 |
+        # | ACC       | 1      | A    | 131      |17_280       |144 |
+        # | ALS       | 1      | A    | 392      |16_128       |144 |
+        # | BMS       | 1      | A    | 50       |55_680       |144 |
+        # there are 2x2x3x2x3x4=288 realizations and 2 groups
+        self.run_calc(case_67.__file__, 'job.ini')
+        [f1] = export(('hcurves/mean', 'csv'), self.calc.datastore)
+        self.assertEqualFiles('expected/hcurve-mean.csv', f1)
+
+    def test_case_68(self):
+        # extendModel feature
+        self.run_calc(case_68.__file__, 'job.ini')
+        [f1] = export(('hcurves/mean', 'csv'), self.calc.datastore)
+        self.assertEqualFiles('expected/hcurve-mean.csv', f1)
+
+        # checking reducing the logic tree to a single branch
+        oq = self.calc.oqparam
+        oq.smlt_branch = 'b01'
+        csm = readinput.get_composite_source_model(oq)
+        assert len(csm.src_groups) == 1
+        assert len(self.calc.csm.src_groups) == 4
+
+        # checking `oq show rlz:2`, 2 being the rlz without extendModel
+        assert len(self.calc.datastore['weights']) == 3
+        dic = dict(view('rlz:2', self.calc.datastore))
+        assert str(dic) == ("{'sourceModel': 'common2.xml', "
+                            "'dummy': '', "
+                            "'active shallow crust': [SadighEtAl1997]}")
+
+    def test_case_68_bis(self):
+        # extendModel with sampling and reduction to single source
+        self.run_calc(case_68.__file__, 'job1.ini')
+
+        # check the reduction from 10 to 2 realizations
+        rlzs = extract(self.calc.datastore, 'realizations').array
+        exp = [b'AA~A', b'AA~A', b'AA~A', b'AA~A', b'AA~A',
+               b'B.~A', b'B.~A', b'B.~A', b'B.~A', b'B.~A']
+        ae(rlzs['branch_path'], exp)
+        aac(rlzs['weight'], [0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1])
+
+        # check the hazard curves
+        fnames = export(('hcurves', 'csv'), self.calc.datastore)
+        for f in fnames:
+            self.assertEqualFiles('expected/' + strip_calc_id(f), f)
+
+    def test_case_71(self):
+        # test with oversampling
+        # there are 6 potential paths 1A 1B 1C 2A 2B 2C
+        # 10 rlzs are being sampled: 1C 1A 1B 1A 1C 1A 2B 2A 2B 2A
+        # trt_rlzs is 135 2 04, 79 68 i.e. 1A*3 1B*1 1C*1, 2A*2 2B*2
+        self.run_calc(case_71.__file__, 'job.ini', concurrent_tasks='0')
+        self.assertEqual(len(self.calc.full_lt.get_realizations()), 10)
+        [fname] = export(('hcurves/mean', 'csv'), self.calc.datastore)
+        self.assertEqualFiles('expected/hcurves.csv', fname)
+
+        cmakers = rmap_maker.read_cmakers(self.calc.datastore)
+        ae(list(cmakers[0].gsims.values()), [[1, 2, 3, 4], [0, 5], []])
+        ae(list(cmakers[1].gsims.values()), [[6], [9], [7, 8]])
+
+    def test_case_73(self):
+        # test LT
+        self.run_calc(case_73.__file__, 'job.ini')
+        [f1] = export(('hcurves/mean', 'csv'), self.calc.datastore)
+        self.assertEqualFiles('expected/hcurve-mean.csv', f1)
+
+    def test_case_79(self):
+        # disagg_by_src with semicolon sources
+        self.run_calc(case_79.__file__, 'job.ini')
+
+    def test_case_80(self):
+        # test areaSourceGeometryAbsolute
+        self.run_calc(case_80.__file__, 'job.ini')
+        f1 = export(('hcurves/mean', 'csv'), self.calc.datastore)
+        self.assertEqualFiles('expected/hazard_curve-mean-PGA.csv', f1[0])
+
+    def test_case_83(self):
+        # two mps, only one should be collapsed and use reqv
+        self.run_calc(case_83.__file__, 'job_extendModel.ini')
+        [fname_em] = export(('hcurves/mean', 'csv'), self.calc.datastore)
+        self.run_calc(case_83.__file__, 'job_expanded_LT.ini')
+        [fname_ex] = export(('hcurves/mean', 'csv'), self.calc.datastore)
+        self.assertEqualFiles(fname_em, fname_ex)
+
+    def test_case_83_eb(self):
+        # event based sampling with double extendModel
+        self.run_calc(case_83.__file__, 'job_eb.ini')
+        
+        [f] = export(('ruptures', 'csv'), self.calc.datastore)
+        self.assertEqualFiles('expected/ruptures.csv', f)
+        
+        [fname] = export(('avg_gmf', 'csv'), self.calc.datastore)
+        self.assertEqualFiles('expected/avg_gmf.csv', fname)
+
+        fname = general.gettemp(str(view(
+            'occ_by_trt_smr', self.calc.datastore)))
+        self.assertEqualFiles('expected/occ_by_trt_smr', fname)
+        
+        fname = general.gettemp(str(view(
+            'event_based_mfd', self.calc.datastore)))
+        self.assertEqualFiles('expected/event_based_mfd', fname)
+
+    def test_case_84(self):
+        # test maxMagGRRelativeNoMoBalance
+        self.run_calc(case_84.__file__, 'job.ini')
+        [f1] = export(('hcurves/mean', 'csv'), self.calc.datastore)
+        self.assertEqualFiles('expected/hazard_curve-mean-PGA.csv', f1)
+        [f] = export(('trt_gsim', 'csv'), self.calc.datastore)
+        # the uncertainties are applied in the workers, so there is a single
+        # group and not one per set of uncertainties
+        lines = open(f).readlines()
+        self.assertEqual(len(lines), 3)  # comment, header, one group
+        self.assertIn('0,Active Shallow Crust,[BooreAtkinson2008]', lines[2])

@@ -1,0 +1,1255 @@
+# -*- coding: utf-8 -*-
+# vim: tabstop=4 shiftwidth=4 softtabstop=4
+#
+# Copyright (C) 2019, GEM Foundation
+#
+# OpenQuake is free software: you can redistribute it and/or modify it
+# under the terms of the GNU Affero General Public License as published
+# by the Free Software Foundation, either version 3 of the License, or
+# (at your option) any later version.
+#
+# OpenQuake is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU Affero General Public License for more details.
+#
+# You should have received a copy of the GNU Affero General Public License
+# along with OpenQuake.  If not, see <http://www.gnu.org/licenses/>.
+
+import time
+import copy
+import hashlib
+import json
+import os.path
+import pickle
+import operator
+import logging
+import numpy
+
+from openquake.baselib import parallel, performance, general, hdf5
+from openquake.hazardlib import (
+    geo, nrml, source, sourceconverter, valid, InvalidFile, calc)
+from openquake.hazardlib.source_group import (
+    CompositeSourceModel, SourceGroup, get_unique)
+from openquake.hazardlib.source.multi_fault import save_and_split
+from openquake.hazardlib.source.base import ts_samples_dt
+from openquake.hazardlib.lt import (
+    apply_uncertainties, check_correlated, source_ids, get_bset_value,
+    restrict_ts_samples, BranchSet, Branch)
+from openquake.hazardlib.rmap_maker import get_unique_inverse
+from openquake.hazardlib.valid import basename
+
+TWO24 = 2**24
+TWO32 = 2**32
+
+CLASSICAL_MODES = ('classical', 'classical_risk', 'classical_damage',
+                   'classical_bcr', 'disaggregation', 'preclassical')
+U16 = numpy.uint16
+U32 = numpy.uint32
+F32 = numpy.float32
+bybranch = operator.attrgetter('branch')
+checksum = operator.attrgetter('checksum')
+
+# in classical calculations the source model files bigger than BIG_FILE
+# are read by STRIDE tasks, each one keeping one source over STRIDE: the
+# order of the sources changes, which is irrelevant for classical
+BIG_FILE = 2**20
+STRIDE = 5
+
+source_info_dt = numpy.dtype([
+    ('source_id', hdf5.vstr),          # 0
+    ('grp_id', U16),                   # 1
+    ('code', (numpy.bytes_, 1)),       # 2
+    ('calc_time', F32),                # 3
+    ('num_ctxs', numpy.uint64),        # 4
+    ('est_ctxs', numpy.uint64),        # 5
+    ('num_ruptures', U32),             # 6
+    ('weight', F32),                   # 7
+    ('mul', U16),                      # 8
+])
+
+
+def ts_samples(samples, trt_smr):
+    """
+    :returns: a structured array (trt_smr, samples) of length 1
+    """
+    return numpy.array([(trt_smr, samples, 0)], ts_samples_dt)
+
+
+def _copy_uncertainty_attrs(src, segment):
+    # the segments of a split source must keep the ts_samples and the
+    # flag bysrc_unc, otherwise the uncertainties are applied to the
+    # base realization only, see get_ts_sets
+    segment.ts_samples = src.ts_samples
+    segment.bysrc_unc = src.bysrc_unc
+
+
+# NB: blocksize is chosen so that event_based/case_35 works
+def splitMF(sources, disagg_by_src, blocksize=1000):
+    """
+    Split the MultiPointSources to avoid oceanic sources with 160M ruptures
+    hanging during rupture sampling
+    """    
+    splits = []
+    for src in sources:
+        if src.code == b'M' and len(src) > blocksize:
+            for i, slc in enumerate(general.gen_slices(0, len(src), blocksize)):
+                segment = source.MultiPointSource(
+                    source_id=f'{src.source_id}:{i}',
+                    name=src.name,
+                    tectonic_region_type=src.tectonic_region_type,
+                    mfd=src.mfd[slc],
+                    rupture_mesh_spacing=src.rupture_mesh_spacing,
+                    magnitude_scaling_relationship=(
+                        src.magnitude_scaling_relationship),
+                    rupture_aspect_ratio=src.rupture_aspect_ratio,
+                    temporal_occurrence_model=src.temporal_occurrence_model,
+                    upper_seismogenic_depth=src.upper_seismogenic_depth,
+                    lower_seismogenic_depth=src.lower_seismogenic_depth,
+                    nodal_plane_distribution=src.nodal_plane_distribution,
+                    hypocenter_distribution=src.hypocenter_distribution,
+                    mesh=geo.Mesh(src.mesh.lons[slc], src.mesh.lats[slc]))
+                _copy_uncertainty_attrs(src, segment)
+                # the uncertainties of the MultiMFD of src must be sliced
+                # like its MFD, see lt._multiMFD_absolute
+                segment.mfd_slice = slc
+                splits.append(segment)
+        elif src.code == b'F' and not disagg_by_src:
+            # use the colon convention only in absence of kendra-splitting
+            for segment in src:
+                _copy_uncertainty_attrs(src, segment)
+                splits.append(segment)
+        else:
+            splits.append(src)
+    sources[:] = splits
+
+
+def check_unique(ids, msg='', strict=True):
+    """
+    Raise a DuplicatedID exception if there are duplicated IDs
+    """
+    if isinstance(ids, dict):  # ids by key
+        all_ids = sum(ids.values(), [])
+        unique, counts = numpy.unique(all_ids, return_counts=True)
+        for dupl in unique[counts > 1]:
+            keys = [k for k in ids if dupl in ids[k]]
+            if keys:
+                errmsg = '%r appears in %s %s' % (dupl, keys, msg)
+                if strict:
+                    raise nrml.DuplicatedID(errmsg)
+                else:
+                    logging.info('*' * 60 + ' DuplicatedID:\n' + errmsg)
+        return
+    unique, counts = numpy.unique(ids, return_counts=True)
+    for u, c in zip(unique, counts):
+        if c > 1:
+            errmsg = '%r appears %d times %s' % (u, c, msg)
+            if strict:
+                raise nrml.DuplicatedID(errmsg)
+            else:
+                logging.info('*' * 60 + ' DuplicatedID:\n' + errmsg)
+
+
+def create_source_info(csm, h5):
+    """
+    Creates source_info, trt_smrs, toms
+    """
+    csm.source_info = csm.get_source_info()
+    num_srcs = len(csm.source_info)
+    # avoid hdf5 damned bug by creating source_info in advance
+    h5.create_dataset('source_info', (num_srcs,), source_info_dt)
+
+
+def trt_smrs(src):
+    return tuple(src.trt_smrs)
+
+
+def _sample_atomic_groups(src_groups, sample, applied):
+    # Atomic groups are sampled as units; applied sources are always retained.
+    atomic = [sg for sg in src_groups if sg.atomic]
+    if not atomic:
+        return src_groups
+    selected = general.random_filter(atomic, float(sample))
+    selected.extend(sg for sg in atomic if any(
+        src.source_id in applied for src in sg))
+    if not selected:
+        selected = [atomic[0]]
+    selected_ids = {id(sg) for sg in selected}
+    return [sg for sg in src_groups
+            if not sg.atomic or id(sg) in selected_ids]
+
+
+def read_source_model(fname, branch, converter, applied, sample, stride,
+                      monitor):
+    """
+    :param fname: path to a source model XML file
+    :param branch: source model logic tree branch ID
+    :param converter: SourceConverter
+    :param applied: list of source IDs within applyToSources
+    :param sample: a string with the sampling factor (if any)
+    :param stride: None or a pair (k, n) to keep only the k-th source over n
+    :param monitor: a Monitor instance
+    :returns: a dictionary (fname, k) -> SourceModel
+    """
+    t0 = time.time()
+    [sm] = nrml.read_source_models([fname], converter, stride)
+    sm.branch = branch
+    if sample:
+        sm.src_groups = _sample_atomic_groups(sm.src_groups, sample, applied)
+    for sg in sm.src_groups:
+        if sample and not sg.atomic:
+            srcs = []
+            for src in sg:
+                if src.source_id in applied:
+                    srcs.append(src)
+                else:
+                    srcs.extend(calc.filters.split_source(src))
+            if srcs:
+                kept = [src for src in srcs if src.source_id in applied]
+                rand = general.random_filter(srcs, float(sample))
+                sg.sources = (kept + rand) or [srcs[0]]
+            else:
+                sg.sources = []
+    # compute the content hashes here, in parallel, since they are needed
+    # by add_bangs and check_same_sources (40 seconds in AUS)
+    for sg in sm.src_groups:
+        for src in sg:
+            src.checksum = content_hash(src)
+    sm.rtime = time.time() - t0  # save the read time
+    return {(fname, stride[0] if stride else 0): sm}
+
+
+# merge the source models of the same file read with different strides,
+# i.e. convert a dictionary (fname, k) -> sm into a dictionary fname -> sm;
+# the groups are simply concatenated, since they are rebuilt anyway by
+# build_groups; sorting by k makes the order independent from the order
+# in which the tasks finish
+def _merge_strides(dic):
+    out = {}
+    for (fname, _k), sm in sorted(dic.items()):
+        if fname not in out:
+            out[fname] = sm
+        else:
+            out[fname].src_groups.extend(sm.src_groups)
+            out[fname].rtime += sm.rtime
+    return out
+
+
+# NB:this is called after reduce_sources, so ";" is not added
+# if the same source appears multiple times, i.e. len(srcs) == 1
+def add_semicolons(src_groups):
+    """
+    Add semicolons to differentiate different sources with the same source_id
+    and then sort the sources in each group by extended source_id
+    """
+    sources = general.AccumDict(accum=[])
+    for sg in src_groups:
+        for src in sg:
+            sources[src.source_id].append(src)
+    for src_id, srcs in sources.items():
+        srcs = get_unique(srcs)
+        if len(srcs) > 1:
+            # happens in logictree/case_01/rup.ini
+            for i, src in enumerate(srcs):
+                src.source_id = '%s;%d' % (src.source_id, i)
+    for sg in src_groups:
+        sg.sources.sort(key=operator.attrgetter('source_id'))
+    # tested in logictree/case_05 with 9 variations of
+    # AreaSource 1 and SimpleFaultSource 2
+
+
+def check_branchID(branchID):
+    """
+    Forbids invalid characters .:; used in fragmentno
+    """
+    if '.' in branchID:
+        raise InvalidFile('branchID %r contains an invalid "."' % branchID)
+    elif ':' in branchID:
+        raise InvalidFile('branchID %r contains an invalid ":"' % branchID)
+    elif ';' in branchID:
+        raise InvalidFile('branchID %r contains an invalid ";"' % branchID)
+
+
+def check_duplicates(smdict, strict):
+    # check_duplicates in the same file
+    for sm in smdict.values():
+        srcids = []
+        for sg in sm.src_groups:
+            srcids.extend(src.source_id for src in sg)
+            if sg.src_interdep == 'mutex':
+                # mutex sources in the same group must have all the same
+                # basename, i.e. the colon convention must be used
+                basenames = set(map(basename, sg))
+                assert len(basenames) == 1, basenames
+        check_unique(srcids, 'in ' + sm.fname, strict)
+
+    # check duplicates in different files but in the same branch
+    # the problem was discovered in the DOM model
+    for branch, sms in general.groupby(smdict.values(), bybranch).items():
+        srcids = general.AccumDict(accum=[])
+        fnames = []
+        for sm in sms:
+            if isinstance(sm, nrml.GeometryModel):
+                # the section IDs are not checked since they not count
+                # as real sources
+                continue
+            for sg in sm.src_groups:
+                srcids[sm.fname].extend(src.source_id for src in sg)
+            fnames.append(sm.fname)
+        check_unique(srcids, 'in branch %s' % branch, strict=strict)
+
+
+def save_read_times(dstore, source_models):
+    """
+    Store how many seconds it took to read each source model file
+    in a table (fname, rtime)
+    """
+    dt = [('fname', hdf5.vstr), ('rtime', float)]
+    arr = numpy.array([(sm.fname, sm.rtime) for sm in source_models], dt)
+    dstore.create_dset('source_model_read_times', arr)
+
+
+def get_csm(oq, full_lt, dstore=None):
+    """
+    Build a CompositeSourceModel without applying the uncertainties,
+    that are applied in the workers, see modified_groups.
+    """
+    converter = sourceconverter.SourceConverter(
+        oq.investigation_time, oq.rupture_mesh_spacing,
+        oq.complex_fault_mesh_spacing, oq.width_of_mfd_bin,
+        oq.area_source_discretization, oq.minimum_magnitude,
+        oq.source_id,
+        discard_trts=[s.strip() for s in oq.discard_trts.split(',')],
+        floating_x_step=oq.floating_x_step,
+        floating_y_step=oq.floating_y_step,
+        source_nodes=oq.source_nodes,
+        infer_occur_rates=oq.infer_occur_rates,
+        filter_sourcecodes=oq.filter_sourcecodes,
+        dip_spacing=oq.dip_spacing)
+    full_lt.ses_seed = oq.ses_seed
+
+    # NB: the source models file must be in the shared directory
+    # NB: dstore is None in logictree_test.py
+    allargs = []
+    sdata = full_lt.source_model_lt.source_data
+    allpaths = set(full_lt.source_model_lt.info.smpaths)
+    dic = general.group_array(sdata, 'fname')
+    smpaths = []
+    ss = os.environ.get('OQ_SAMPLE_SOURCES')
+    applied = set()
+    for srcs in full_lt.source_model_lt.info.applytosources.values():
+        applied.update(srcs)
+    # striding is disabled for event based, where the order of the sources
+    # matters, and for correlated branchsets, since check_correlated needs
+    # the full groups
+    correlated = any(bset.correlated
+                     for bset in full_lt.source_model_lt.branchsets)
+    strided = (oq.calculation_mode in CLASSICAL_MODES and not ss and
+               not correlated)
+    for fname, rows in dic.items():
+        path = os.path.abspath(
+            os.path.join(full_lt.source_model_lt.basepath, fname))
+        smpaths.append(path)
+        big = strided and os.path.getsize(path) > BIG_FILE
+        for stride in ([(k, STRIDE) for k in range(STRIDE)] if big
+                       else [None]):
+            allargs.append((path, rows[0]['branch'], converter, applied, ss,
+                            stride))
+    for path in allpaths - set(smpaths):  # geometry models
+        allargs.append((path, '', converter, applied, ss, None))
+    # read the biggest files first, so that they do not end up last
+    allargs.sort(key=lambda args: os.path.getsize(args[0]), reverse=True)
+    smdict = _merge_strides(parallel.Starmap(
+        read_source_model, allargs, h5=dstore if dstore else None).reduce())
+    parallel.Starmap.shutdown()  # save memory
+    smdict = {k: smdict[k] for k in sorted(smdict)}
+    if dstore:
+        save_read_times(dstore, smdict.values())
+    check_duplicates(smdict, strict=oq.disagg_by_src)
+    found = add_bangs(smdict)
+    if found:
+        logging.info('Found different sources with same ID %s',
+                     general.shortlist(found))
+    smlt = oq.inputs.get('source_model_logic_tree', oq.inputs['job_ini'])
+    if oq.strict:
+        check_same_sources(smdict, smlt)
+    if found:
+        check_mfd_variants(smdict, smlt)
+
+    # checking ps_grid_spacing
+    pointlike_sources = 0
+    for sm in smdict.values():
+        for sg in sm.src_groups:
+            for src in sg:
+                if src.code in b'PAM':
+                    pointlike_sources += 1
+                    break
+    if (oq.strict and oq.mosaic_model and pointlike_sources and
+        'classical' in oq.calculation_mode and oq.ps_grid_spacing == 0
+        and not oq.auto_grid and not oq.sites and not oq.disagg_by_src):
+        raise InvalidFile(f'{oq.inputs["job_ini"]}: '
+                          'missing ps_grid_spacing')
+
+    return build_csm(oq, full_lt, smdict, dstore)
+
+
+def get_bset_values(full_lt, sources):
+    """
+    :param full_lt: a FullLogicTree instance
+    :param sources: a SourceGroup or a list of sources of the same group
+    :returns: the dictionary of uncertainties to apply expected by
+        modified_groups, i.e. one entry for each set of realizations
+        with the same uncertainties; the uncertainties of a set are the
+        ones of its first realization
+
+    NB: only the uncertainties relevant for the given sources are
+        returned, i.e. the ones of their realizations, without the
+        branchsets applied to other sources, since the logic tree can be
+        huge and the dictionary is sent to the workers
+    """
+    ordinals = {trt_smrs[0] % TWO24 for src in sources
+                for trt_smrs in src.get_ts_sets()}
+    ids = source_ids(sources)
+    return {ordinal: [(bset, value) for bset, value in
+                      full_lt.get_bset_values(ordinal)
+                      if _may_apply(bset, value, ids)]
+            for ordinal in sorted(ordinals)}
+
+
+def prepare_bset_values(full_lt, sources):
+    """Build bset_values without links to the logic tree."""
+    programs = get_bset_values(full_lt, sources)
+    compiled = {}
+    out = {}
+    for ordinal, values in programs.items():
+        out[ordinal] = []
+        for bset, value in values:
+            key = id(bset)
+            if key not in compiled:
+                new = BranchSet(bset.uncertainty_type, bset.filters,
+                                bset.ordinal, bset.collapsed)
+                # Ordinary instructions already contain their selected
+                # value. Collapsed sets need all alternatives and their
+                # weights, but never the downstream branchsets.
+                if bset.collapsed:
+                    new.branches = [Branch(br.branch_id, br.value,
+                                           br.weight, br.bs_id)
+                                    for br in bset.branches]
+                compiled[key] = new
+            out[ordinal].append((compiled[key], value))
+    return out
+
+
+def _may_apply(bset, value, ids):
+    # False if the branchset certainly does not apply to the sources with
+    # the given IDs and basenames (see source_ids and get_bset_value)
+    if bset.correlated:
+        return not ids.isdisjoint(value)
+    ats = bset.filters.get('applyToSources')
+    return not ats or not ids.isdisjoint(ats)
+
+
+def modified_groups(sources, bset_values):
+    """
+    Apply the uncertainties to a group of sources built *without* them,
+    as needed by the workers computing the rates or the ruptures: this
+    is done one set of realizations at a time, i.e. one set with the
+    same uncertainties at a time (see build_groups).
+
+    :param sources: a SourceGroup or a list of sources of the same group
+    :param bset_values:
+        the uncertainties to apply, as returned by get_bset_values; it
+        can be empty, if there are no uncertainties at all
+    :returns:
+        a generator of (trt_smrs, group) pairs, one for each set of
+        realizations with the same uncertainties, with the uncertainties
+        applied and the ts_samples restricted to the set of realizations
+    """
+    for trt_smrs, srcs in _subsets_by_unc(sources).items():
+        grp = _restricted_group(sources, srcs, trt_smrs)
+        # NB: the trt_smrs are trti * TWO24 + ordinal, see gen_groups
+        bvals = bset_values[trt_smrs[0] % TWO24] if bset_values else []
+        # NB: check=False since the group is a fragment of the original
+        # one (split by weight in the preclassical), so the correlated
+        # branchsets were already checked at build time, see build_groups
+        grp = apply_uncertainties(bvals, grp, check=False)
+        yield trt_smrs, grp
+
+
+def _subsets_by_unc(sources):
+    """
+    :returns: a dictionary trt_smrs -> sources, i.e. the sources grouped
+        by set of realizations with the same uncertainties
+    """
+    if getattr(sources, 'atomic', False):
+        # the sources of an atomic group are mutually exclusive (or belong
+        # to a cluster), so they must be kept together, see sample_cluster
+        # and groups_gkeys; the sets of realizations are the same for
+        # all of them, since they belong to the same source model
+        return {trt_smrs: list(sources)
+                for trt_smrs in sources[0].get_ts_sets()}
+    subsets = {}
+    for src in sources:
+        for trt_smrs in src.get_ts_sets():
+            subsets.setdefault(trt_smrs, []).append(src)
+    return subsets
+
+
+def _restricted_group(sources, srcs, trt_smrs):
+    """
+    :returns: a group with the given sources, i.e. copies of the sources
+        of `sources` with the ts_samples restricted to trt_smrs
+    """
+    restricted = [restrict_ts_samples(src, trt_smrs) for src in srcs]
+    if hasattr(sources, 'sources'):  # keep the attributes of the group
+        grp = copy.copy(sources)
+        grp.sources = restricted
+    else:  # a plain list of sources, e.g. a block of sources
+        grp = SourceGroup(sources[0].tectonic_region_type, restricted)
+    return grp
+
+
+def unc_signature(bset_values, src):
+    """
+    :returns: a tuple identifying the uncertainties applied to src
+    """
+    sig = []
+    for bset, value in bset_values:
+        ok, val = get_bset_value(bset, value, src)
+        if ok:
+            sig.append((bset.id, str(val)))
+    return tuple(sig)
+
+
+def collect_sources(full_lt, rlz_groups):
+    """
+    :param full_lt: a FullLogicTree instance
+    :param rlz_groups: an iterator of (sm_rlz, source group) pairs
+    :returns: a dictionary id(grp) -> [grp, {id(src): (src, pairs)}], where
+        pairs is a list of (trt_smr, samples, signature) tuples, one per
+        realization of the source
+    """
+    dic = {}
+    correlated = {}  # ordinal -> (bset_values, source IDs of the rlz)
+    for rlz, grp in rlz_groups:
+        trti = full_lt.trti.get(grp.trt, 0)
+        trt_smr = trti * TWO24 + rlz.ordinal
+        bset_values = full_lt.get_bset_values(rlz.ordinal)
+        # NB: the uncertainties are applied later, in the workers, on
+        # groups split by weight, so the correlated branchsets are checked
+        # here, where the groups are still whole; the sources of a
+        # correlated branchset can be in different groups of the
+        # realization, so they are checked at the end
+        if any(bset.correlated for bset, _ in bset_values):
+            srcids = correlated.setdefault(
+                rlz.ordinal, (bset_values, set()))[1]
+            srcids.update(source_ids(grp))
+        # NB: the sources are collected by id(grp), since the group objects
+        # are shared by all the realizations selecting the same source model
+        # file (see gen_groups); the groups built from them are then merged
+        # by trt_smrs below. The dicts preserve the order of first
+        # appearance, making the groups and the sources inside them
+        # reproducible.
+        srcs = dic.setdefault(id(grp), [grp, {}])[1]
+        for src in grp:
+            sig = unc_signature(bset_values, src)
+            pairs = srcs.setdefault(id(src), (src, []))[1]
+            pairs.append((trt_smr, rlz.samples, sig))
+    for bset_values, srcids in correlated.values():
+        check_correlated(bset_values, srcids)
+    return dic
+
+
+def source_with_ts_sets(src, pairs, sigrows):
+    """
+    :param src: a source
+    :param pairs: a list of (trt_smr, samples, signature) tuples, one per
+        realization of the source
+    :param sigrows: a list of rows describing the uncertainty signatures,
+        extended with the signatures of the source
+    :returns: a copy of the source with the attributes ts_samples
+        and bysrc_unc set, i.e. the sets of realizations
+        with the same uncertainties are stored in the field ts
+    """
+    sigdict = {}
+    for trt_smr, samples, sig in pairs:
+        sigdict.setdefault(sig, []).append(trt_smr)
+    # NB: the field ts is the smallest trt_smr of the set of realizations
+    # with the same uncertainties; it is 0 for all the realizations if
+    # the uncertainties are the same everywhere (or there are none), so
+    # the sources without uncertainties keep their ts_samples as it is
+    tsdict = {sig: min(t) for sig, t in sigdict.items()}
+    multi = len(sigdict) > 1
+    arrays = [(trt_smr, samples, tsdict[sig] if multi else 0)
+              for trt_smr, samples, sig in pairs]
+    new_src = copy.copy(src)
+    new_src.ts_samples = numpy.array(
+        sorted(arrays), ts_samples_dt)  # sorted by trt_smr
+    # sigts maps each value of the field ts to a pair (signature, smallest
+    # trt_smr of the realizations with that signature); it is needed to
+    # merge the identical copies of the source, see reduce_sources and
+    # _merge_ts_samples
+    new_src.sigts = {(tsdict[sig] if multi else 0): (sig, tsdict[sig])
+                     for sig in sigdict}
+    # flag the sources which will be modified in the workers: they must
+    # not be split in the preclassical, since the splitting destroys the
+    # geometry (and the MFD of the fault sources)
+    new_src.bysrc_unc = any(sigdict)  # NB: () means no uncertainty
+    # the uncertainty signatures of the source, i.e. the sets of
+    # realizations with the same uncertainties, which are the indices of
+    # rate attribution for its rates (see get_ts_sets)
+    for sig, trt_smrs in sigdict.items():
+        sigrows.append(dict(source_id=src.source_id, realizations=len(arrays),
+                            signature=dict(sig), count=len(trt_smrs)))
+    return new_src
+
+
+def build_groups(full_lt, rlz_groups, oq, dstore=None):
+    """
+    Build the source groups without applying the uncertainties, as
+    needed by the workers.  The uncertainties to be applied in each
+    realization are not known until the workers, so the realizations
+    with different uncertainties are stored in the field ts of the
+    ts_samples of each source (see get_ts_sets).
+    """
+    # NB: the uncertainty signatures are stored in the datastore, so that
+    # `oq check_input` can print them, see store_unc_signatures
+    # NB: the same source_id can be used by different sources, i.e. in
+    # different source models, so the sources are keyed by id(src) and not
+    # by source_id; the ids are disambiguated at the end, by adding a
+    # semicolon, see add_semicolons
+    sigrows = []  # dicts with keys source_id, realizations, signature, count
+    dic = collect_sources(full_lt, rlz_groups)
+
+    out, atomic, acc = [], [], general.AccumDict(accum=[])
+    for grp, srcs in dic.values():
+        new_srcs = [source_with_ts_sets(src, pairs, sigrows)
+                    for src, pairs in srcs.values()]
+        if grp.atomic:
+            # the atomic groups are never merged with the other groups,
+            # since their sources must be computed together
+            new = copy.copy(grp)
+            new.sources = new_srcs
+            atomic.append(new)
+        else:
+            acc[grp.trt].extend(new_srcs)
+    if atomic:
+        logging.info('Found %d atomic groups', len(atomic))
+    # NB: the sources are grouped by trt_smrs and TOM, so that there is
+    # one cmaker for each set of realizations, see get_cmakers; the groups
+    # are sorted by TRT index, trt_smrs and TOM, so that their order does
+    # not depend on the order of the sources in the files
+    red_sources = 0
+    for trt in sorted(acc, key=lambda trt: (full_lt.trti.get(trt, 0), trt)):
+        grps, red = _group_sources(trt, acc[trt])
+        out.extend(grps)
+        red_sources += red
+    if red_sources:
+        logging.info('reduce_sources was called %d times', red_sources)
+    out.extend(atomic)
+    for grp in out:
+        for src in grp:  # sigts is not needed after the reduction
+            vars(src).pop('sigts', None)
+        splitMF(grp.sources, oq.disagg_by_src)
+    add_semicolons(out)  # else sources with the same id are lost
+    store_unc_signatures(out, sigrows, full_lt, oq, dstore)
+    return out
+
+
+def store_unc_signatures(groups, sigrows, full_lt, oq, dstore=None):
+    """
+    Store the uncertainty signatures of the sources in the datastore, so
+    that they can be printed by `oq check_input` (see the check_input
+    command) and read back with `oq show unc_signatures`. NB: the
+    signatures are stored as JSON objects, so that the unc_signatures view
+    can display a column for each branchset.
+
+    :param groups: a list of SourceGroups built without the uncertainties
+    :param sigrows: a list of dicts with keys source_id, realizations,
+        signature (a dictionary branchset_id -> value) and count
+    :param full_lt: a FullLogicTree instance
+    :param oq: an OqParam instance
+    :param dstore: a DataStore instance or None
+    """
+    if dstore is not None and any(row['signature'] for row in sigrows):
+        # NB: the signatures are stored only if there are uncertainties,
+        # i.e. only if the rates must be split in indices of rate
+        # attribution
+        dt = [('source_id', hdf5.vstr), ('realizations', int),
+              ('signature', hdf5.vstr), ('count', int)]
+        data = [(row['source_id'], row['realizations'], json.dumps(
+            row['signature']), row['count']) for row in sigrows]
+        dstore.create_df('unc_signatures', numpy.array(data, dt))
+    if oq.calculation_mode not in CLASSICAL_MODES:
+        # the event based calculators attribute the rates to the
+        # realizations of the group, not to the subsets
+        return
+    unc_ts_sets = get_unc_ts_sets(groups)
+    if dstore is not None:
+        dstore.hdf5.save_vlen('unc_ts_sets', unc_ts_sets)
+    Gt = get_unc_ts_set_size(unc_ts_sets, full_lt)
+    if Gt >= TWO32:
+        # NB: the gids are stored as uint32 in the _rates dataset, so
+        # there cannot be more than 2**32 columns in the RateMap
+        raise ValueError(
+            'The core size Gt=%d is too large (the maximum is %d), '
+            'you must reduce the logic tree' % (Gt, TWO32))
+    # NB: Gt is a sum over the TRTs while R is a product, so Gt can be
+    # larger than R, for instance Gt=5 and R=1 in JPA with 5 TRTs
+    logging.warning('Core size Gt=%d for R=%d realizations',
+                    Gt, full_lt.get_num_paths())
+    if dstore is not None and 'sitecol' in dstore:
+        # NB: the sites are read after the sources, so the size in bytes
+        # is logged only if they are already in the datastore
+        N = len(dstore['sitecol'])
+        imtls = oq.imtls
+        L = imtls.size if hasattr(imtls, 'size') else len(imtls)
+        logging.warning('Global RateMap of %s for %d sites and %d levels',
+                        general.humansize(4 * N * L * Gt), N, L)
+
+
+def get_unc_ts_sets(groups):
+    """
+    :param groups: a list of SourceGroups built without applying the
+        uncertainties (i.e. the src_groups of a CompositeSourceModel)
+    :returns: a sorted list of trt_smrs (to be stored as hdf5.vuint32)
+
+    The uncertainties are applied in the workers, so the realizations
+    with different uncertainties are not separated at build time (see
+    build_groups). The rates are nevertheless computed separately for each
+    set of uncertainties and must be attributed to the right
+    realizations, hence this extra list; a rate is attributed to the unit
+    containing its trt_smrs.
+    """
+    all_trt_smrs = [trt_smrs for sg in groups for src in sg
+                    for trt_smrs in src.get_ts_sets()]
+    unique, _inverse = get_unique_inverse(all_trt_smrs)
+    return [numpy.array(trt_smrs, numpy.uint32) for trt_smrs in unique]
+
+
+def get_unc_ts_set_size(unc_ts_sets, full_lt):
+    """
+    :param unc_ts_sets: the sets of realizations with the same
+        uncertainties, as returned by get_unc_ts_sets
+    :param full_lt: a FullLogicTree instance
+    :returns: the core size Gt = Σ_i G(trt_i) of the logic tree, i.e. the
+        number of distinct rate components, i.e. of gids (see
+        FullLogicTree.get_gids), which is >= len(unc_ts_sets) since
+        each unit contributes G(trt_i) >= 1 gids
+    """
+    return sum(len(full_lt.gsim_lt.values[full_lt.trts[t[0] // TWO24]])
+               for t in unc_ts_sets)
+
+
+def build_csm(oq, full_lt, smdict, dstore):
+    """
+    :param oq: OqParam instance
+    :param full_lt: FullLogicTree instance
+    :param smdict: dictionary source_model_path -> SourceModel instance
+    :param dstore: DataStore instance
+    :returns: a CompositeSourceModel instance
+    """
+    with performance.Monitor('_build_groups', measuremem=True) as mon:
+        rlz_groups = []
+        for rlz in full_lt.sm_rlzs:
+            rlz_groups.extend((rlz, grp) for grp in
+                              gen_groups(full_lt, smdict, rlz))
+    logging.info(mon)
+
+    logging.info('Building CompositeSourceModel')
+    groups = build_groups(full_lt, rlz_groups, oq, dstore)
+    csm = CompositeSourceModel(oq, full_lt, groups)
+    store_data(oq, smdict, csm, dstore)
+    return csm
+
+
+def store_data(oq, smdict, csm, dstore):
+    """
+    Store source mutex metadata and multifault geometry in the datastore.
+    """
+    out = []
+    probs = []
+    for sg in csm.src_groups:
+        if sg.src_interdep == 'mutex' and 'src_mutex' not in dstore:
+            segments = []
+            for src in sg:
+                segments.append(src.source_id.split(':')[1])
+                t = (src.source_id, src.grp_id,
+                     src.num_ruptures, src.mutex_weight,
+                     sg.rup_interdep == 'mutex')
+                out.append(t)
+            probs.append((src.grp_id, sg.grp_probability))
+            assert len(segments) == len(set(segments)), segments
+    if out:
+        dtlist = [('src_id', hdf5.vstr), ('grp_id', int),
+                  ('num_ruptures', int), ('mutex_weight', float),
+                  ('rup_mutex', bool)]
+        dstore.create_dset('src_mutex', numpy.array(out, dtlist))
+        lst = [('grp_id', int), ('probability', float)]
+        dstore.create_dset('grp_probability', numpy.array(probs, lst))
+
+    # add rupids_by_tag to multifault sources if there is a single site
+    try:
+        sitecol = dstore['sitecol']
+    except (KeyError, TypeError):  # 'NoneType' object is not subscriptable
+        sitecol = None
+    else:
+        # NB: in AELO we can have multiple vs30 on the same location
+        lonlats = set(zip(sitecol.lons, sitecol.lats))
+        if len(lonlats) > 1:
+            sitecol = None
+    # must be called *after* add_semicolons
+    t0 = time.time()
+    secparams = fix_geometry_sections(
+        smdict, csm.src_groups, dstore.hdf5 if dstore else '',
+        sitecol if oq.disagg_by_src and oq.use_rates else None,
+        split=not oq.calculation_mode.startswith('event_based'))
+    if secparams is not None and len(secparams):
+        logging.info('Spent %.1f seconds in fix_geometry_sections',
+                     time.time()-t0)
+
+
+# attributes which are not part of the content of a source
+NOT_CONTENT = {'source_id', 'name', 'ts_samples', 'branch',
+               'width_of_mfd_bin', 'checksum', 'sigts', 'bysrc_unc'}
+
+
+def content_hash(src, exclude=NOT_CONTENT):
+    """
+    :param src: a source object
+    :param exclude: the attributes to ignore
+    :returns: the md5 hex digest of the other attributes of the source
+
+    NB: by default the ID and the name are ignored, i.e. two copies of the
+    same source with different IDs or names have the same hash
+    """
+    dic = {k: v for k, v in vars(src).items() if k not in exclude}
+    return hashlib.md5(pickle.dumps(dic, protocol=4)).hexdigest()
+
+
+# called by reduce_sources
+def add_checksums(srcs):
+    """
+    Build and attach a checksum to each source
+    """
+    # width_of_mfd_bin is set by modify_set_recurrow; the name is not part
+    # of the checksum, i.e. sources with the same content are reduced even
+    # if they have different names
+    for src in srcs:
+        src.checksum = content_hash(src)
+
+
+# called before add_semicolons
+def add_bangs(smdict):
+    """
+    Discriminate different sources with same ID (false duplicates)
+    and put an exclamation mark in their source ID
+    """
+    acc = general.AccumDict(accum=[])
+    atomic = set()
+    for smodel in smdict.values():
+        for sgroup in smodel.src_groups:
+            for src in sgroup:
+                src.branch = smodel.branch
+                srcid = (src.source_id if sgroup.atomic
+                         else basename(src))
+                acc[srcid].append(src)
+                if sgroup.atomic:
+                    atomic.add(src.source_id)
+    found = []
+    for srcid, srcs in acc.items():
+        if len(srcs) > 1:  # duplicated ID
+            if any(src.source_id in atomic for src in srcs):
+                raise RuntimeError('Sources in atomic groups cannot be '
+                                   'duplicated: %s', srcid)
+            if any(getattr(src, 'mutex_weight', 0) for src in srcs):
+                raise RuntimeError('Mutually exclusive sources cannot be '
+                                   'duplicated: %s', srcid)
+            gb = general.AccumDict(accum=[])
+            for src in srcs:
+                gb[checksum(src)].append(src)
+            if len(gb) > 1:
+                for same_checksum in gb.values():
+                    for src in same_checksum:
+                        check_branchID(src.branch)
+                        src.source_id += '!%s' % src.branch
+                found.append(srcid)
+    return found
+
+
+def _mfd_variants_ids(pairs):
+    # the sources in pairs [(smfile, src)] with the same geometry,
+    # different IDs and MFDs and a single copy in each file, as lists of
+    # IDs[file]; the original IDs are used, without the bangs
+    bygeom = general.AccumDict(accum=[])
+    for smfile, src in pairs:
+        bygeom[content_hash(src, NOT_CONTENT | {'mfd'})].append(
+            (smfile, src))
+    out = []
+    for same in bygeom.values():
+        ids = {basename(src).split('!')[0] for _, src in same}
+        # NB: with more copies in the same file the sources are different
+        # (they cannot get the same ID), only their rates would add up
+        if (len({smfile for smfile, _ in same}) == len(same) > 1 and
+                len(ids) > 1 and
+                len({checksum(src) for _, src in same}) > 1):
+            out.append(sorted({'%s[%s]' % (
+                basename(src).split('!')[0], os.path.basename(smfile))
+                for smfile, src in same}))
+    return out
+
+
+def check_same_sources(smdict, fname):
+    """
+    Log a warning if the same source (i.e. a source with the same content)
+    appears in different source models with different IDs: then the engine
+    cannot recognize the copies as the same source, i.e. it cannot reduce
+    them (see reduce_sources), and the source is computed once per source
+    model. It is an error in `oq check_input`. A different warning is
+    logged if the sources have the same geometry but different MFDs and
+    different IDs: they could be computed together if they had the same
+    ID and the MFDs were uncertainties of the logic tree, see
+    check_mfd_variants.
+
+    :param smdict: a dictionary source model file -> SourceModel
+    :param fname: the source model logic tree file, used in the warning
+    """
+    # NB: the atomic groups are skipped, since their sources cannot be
+    # duplicated anyway (see add_bangs); the sources are compared only if
+    # their code and TRT appear in more than one source model file, to
+    # save time
+    bykey = general.AccumDict(accum=[])  # (code, trt) -> [(smfile, src)]
+    for smfile, smodel in smdict.items():
+        for sgroup in smodel.src_groups:
+            if sgroup.atomic:
+                continue
+            for src in sgroup:
+                bykey[src.code, src.tectonic_region_type].append(
+                    (smfile, src))
+    errors, variants = [], []
+    for pairs in bykey.values():
+        if len({smfile for smfile, _ in pairs}) < 2:
+            continue
+        variants.extend(_mfd_variants_ids(pairs))
+        byhash = general.AccumDict(accum=[])
+        for smfile, src in pairs:
+            byhash[checksum(src)].append((smfile, src))
+        for same in byhash.values():
+            smfiles = {smfile for smfile, _ in same}
+            # NB: the original IDs, without the bangs added by add_bangs
+            # for sources with the same ID and a different content
+            ids = {basename(src).split('!')[0] for _, src in same}
+            if len(smfiles) > 1 and len(ids) > 1:
+                errors.append(sorted({'%s[%s]' % (
+                    basename(src).split('!')[0], os.path.basename(smfile))
+                    for smfile, src in same}))
+    if variants:
+        shown = ['  ' + general.shortlist(v) for v in variants[:3]]
+        logging.warning(
+            '%s:\n%d sources appear in different source models with '
+            'different IDs, the same geometry and different MFDs, so each '
+            'copy is computed separately. They are likely variants of a '
+            'base source: if so, give them the same ID and move the MFDs '
+            'in the logic tree (see the warning about MFD variants; '
+            '`oq check_input --optimize` does not change sources with '
+            'different IDs):\n%s%s', fname, len(variants), '\n'.join(shown),
+            '\n  ...' if len(variants) > 3 else '')
+    if errors:
+        lines = ['  ' + general.shortlist(err) for err in errors]
+        msg = ('%s:\n%d sources appear in different source models with '
+               'different IDs, use the same ID for each of them:\n%s' % (
+                   fname, len(errors), '\n'.join(lines)))
+        # NB: in oq check_input the models must be fixed, so it is an error
+        if os.environ.get('OQ_CHECK_INPUT'):
+            raise InvalidFile(msg)
+        # Keep normal calculation logs readable when many sources are found.
+        shown = lines[:3] + ['  ...'] if len(lines) > 3 else lines
+        logging.warning(
+            '%s:\n%d sources appear in different source models with '
+            'different IDs, use the same ID for each of them:\n%s',
+            fname, len(errors), '\n'.join(shown))
+
+
+# uncertainty types for the MFD variants, by NRML tag: suggested by
+# check_mfd_variants and used by commonlib.optimize_smlt to convert them
+MFD_UNCERTAINTY = {
+    'incrementalMFD': 'incrementalMFDAbsolute',
+    'multiMFD': 'multiMFDAbsolute',
+    'truncGutenbergRichterMFD': 'abMaxMagAbsolute'}
+# NRML tags of the MFD classes
+MFD_TAG = {'EvenlyDiscretizedMFD': 'incrementalMFD',
+           'MultiMFD': 'multiMFD',
+           'TruncatedGRMFD': 'truncGutenbergRichterMFD'}
+
+
+def check_mfd_variants(smdict, fname):
+    """
+    Log a warning if a source appears in different source model files
+    with the same ID and the same content except the MFD: then the
+    copies are computed separately, once per file, while they could be
+    computed together, sharing the contexts, if the MFDs were given as
+    uncertainties in the source model logic tree (see make_results).
+    For instance in the IND model the HimalayanThrust source is defined in
+    3 files (himalaya_cut, himalaya_area, himalaya_m55) with different
+    incrementalMFDs and it takes 64% of the time of the calculation.
+
+    :param smdict: a dictionary source model file -> SourceModel
+    :param fname: the source model logic tree file, used in the warning
+    :returns: the list of the IDs of the sources with MFD variants
+
+    NB: must be called after add_bangs, which adds the branch to the
+    sources and a bang to the IDs of the sources with the same ID and a
+    different content
+    """
+    byid = general.AccumDict(accum=[])  # source ID -> [(smfile, src)]
+    for smfile, smodel in smdict.items():
+        for sgroup in smodel.src_groups:
+            for src in sgroup:
+                if '!' in src.source_id and hasattr(src, 'mfd'):
+                    # NB: the fragments 'ID:1', 'ID:2', ... of a split
+                    # source are different sources, not MFD variants
+                    byid[src.source_id.split('!')[0]].append((smfile, src))
+    lines = []
+    for srcid, pairs in byid.items():
+        # group the copies by content without the MFD, i.e. by geometry
+        bygeom = general.AccumDict(accum=[])
+        for smfile, src in pairs:
+            bygeom[content_hash(src, NOT_CONTENT | {'mfd'})].append(
+                (smfile, src))
+        for same in bygeom.values():
+            # the copies must be in different files: the fragments of a
+            # source split in the same file are not MFD variants
+            if len({smfile for smfile, _ in same}) < 2:
+                continue
+            # the copies with the same MFD were already reduced
+            mfds = {checksum(src) for _, src in same}
+            if len(mfds) < 2:
+                continue
+            mfd = type(same[0][1].mfd).__name__
+            # NB: the branches are not listed, since a file can be shared
+            # by several branches but src.branch contains only one of them
+            files = sorted({os.path.basename(smfile) for smfile, _ in same})
+            utype = MFD_UNCERTAINTY.get(MFD_TAG.get(mfd),
+                                        'an MFD uncertainty')
+            lines.append('  %s: %d %s variants in %s, use %s' % (
+                srcid, len(mfds), mfd, ' '.join(files), utype))
+    if lines:
+        # log only the first 3 sources, then an ellipsis marker
+        shown = lines[:3] + ['  ...'] if len(lines) > 3 else lines
+        logging.warning(
+            '%s:\n%d source(s) appear multiple times with '
+            'the same geometry and different MFDs,\nso each copy is '
+            'computed separately. Keep a single copy in one file and move '
+            'the MFDs in the logic tree,\nwith a branchSet with '
+            'applyToSources="<source ID>" (and applyToBranches if needed) '
+            'containing one branch\nper MFD; then the contexts are computed '
+            'once for all the MFDs, which can be much faster. You can '
+            'do it automatically with\n`oq check_input job.ini '
+            '--optimize`\nThe sources are:\n%s',
+            fname, len(lines), '\n'.join(shown))
+    return [line.split(':')[0].strip() for line in lines]
+
+
+def fix_geometry_sections(smdict, src_groups, hdf5path='', site1=None,
+                          split=True):
+    """
+    If there are MultiFaultSources, fix the sections according to the
+    GeometryModels (if any).
+    """
+    gmodels = []
+    gfiles = []
+    for fname, mod in smdict.items():
+        if isinstance(mod, nrml.GeometryModel):
+            gmodels.append(mod)
+            gfiles.append(fname)
+
+    # merge and reorder the sections
+    sec_ids = []
+    sections = {}
+    for gmod in gmodels:
+        sec_ids.extend(gmod.sections)
+        sections.update(gmod.sections)
+    check_unique(sec_ids, 'section ID in files ' + ' '.join(gfiles))
+
+    if sections:
+        # save the shared sections and each segment's rupture indices
+        assert hdf5path, ('You forgot to pass the dstore to '
+                          'get_composite_source_model')
+        mfsources = []
+        for sg in src_groups:
+            for src in sg:
+                if src.code == b'F':
+                    mfsources.append(src)
+        if mfsources:
+            split_dic, secparams = save_and_split(
+                mfsources, sections, hdf5path, site1, split=split)
+            for sg in src_groups:
+                new = []
+                for src in sg.sources:
+                    tag = src.source_id
+                    if tag in split_dic:
+                        new.extend(split_dic[tag])
+                    else:
+                        new.append(src)
+                sg.sources[:] = new
+            return secparams
+    return None
+
+
+def _groups_ids(smlt_dir, smdict, fnames):
+    # extract the source groups and ids from a sequence of source files
+    groups = []
+    for fname in fnames:
+        fullname = os.path.abspath(os.path.join(smlt_dir, fname))
+        groups.extend(smdict[fullname].src_groups)
+    return groups, set(src.source_id for grp in groups for src in grp)
+
+
+def _add_ts_samples(src, rlz, trti):
+    # associate the source to the ts_samples parameters of the realization;
+    # the same source can appear in multiple realizations, hence the list.
+    # NB: & and it enters
+    # the classical calculations too, via SourceGroup.fix_src_offset and
+    # the source_info rows, so the ts_samples must be always set
+    sampl = ts_samples(rlz.samples, trti * TWO24 + rlz.ordinal)
+    if src.ts_samples is None:
+        # the first time
+        src.ts_samples = [sampl]
+    else:
+        # if the same source belongs to multiple realizations
+        src.ts_samples.append(sampl)
+
+
+def gen_groups(full_lt, smdict, rlz):
+    # yield all the possible source groups from the given rlz
+    smlt_file = full_lt.source_model_lt.filename
+    smlt_dir = os.path.dirname(smlt_file)
+    src_groups, source_ids = _groups_ids(
+        smlt_dir, smdict, rlz.value[0].split())
+    bset_values = full_lt.source_model_lt.bset_values(rlz.lt_path)
+    if rlz.ordinal % 100 == 0:
+        logging.info('Building source groups for rlz'
+                     f'#{rlz.ordinal}: {"_".join(rlz.lt_path)}')
+    # NB: the extendModel branchsets are added wherever they are in the
+    # path, since the modifications (e.g. MFD chains) can precede them
+    for _bset, value in bset_values:
+        if _bset.uncertainty_type != 'extendModel':
+            continue
+        extra, extra_ids = _groups_ids(smlt_dir, smdict, value.split())
+        common = source_ids & extra_ids
+        if common:
+            raise InvalidFile(
+                '%s contains source(s) %s already present in %s' %
+                (value, common, rlz.value))
+        src_groups.extend(extra)
+    # NB: the uncertainties are not applied here, but in the workers,
+    # one set of realizations at a time, see modified_groups; the
+    # ts_samples info is set anyway, since it determines the multiplicity
+    for src_group in src_groups:
+        trti = full_lt.trti.get(src_group.trt, 0)
+        for src in src_group:  # tested in case_83_eb
+            _add_ts_samples(src, rlz, trti)
+        yield src_group
+
+    # check applyToSources, ignoring the branch added by add_bangs to the
+    # sources with the same ID and a different content, like filter_source
+    sm_branch = rlz.lt_path[0]
+    src_id = full_lt.source_model_lt.info.applytosources[sm_branch]
+    core_ids = {valid.corename(srcid, '!') for srcid in source_ids}
+    for srcid in src_id:
+        if srcid not in core_ids:
+            if full_lt.source_model_lt.branchID:
+                continue
+            raise ValueError(
+                "The source %s is not in the source model,"
+                " please fix applyToSources in %s or the "
+                "source model(s) %s" % (srcid, smlt_file,
+                                        rlz.value[0].split()))
+
+
+def reduce_sources(sources_with_same_id):
+    """
+    :param sources_with_same_id: a list of sources with the same source_id
+    :returns: a list of truly unique sources
+    """
+    # first reduce identical sources having the same id(src)
+    # tested in LogictreeTestCase.test_case_08, where <PoinstSource 2>
+    # appears 3 times
+    unique = get_unique(sources_with_same_id)
+    out = []
+    add_checksums(unique)
+    # in LogicTreeCase2ClassicalPSHA there 81 unique sources
+    # grouped in 9 groups of 9 sources each with the same checksum
+    # NB: merging copies of a source can change the order of the sources
+    # and so the numbers of the fragments (see add_semicolons), hence the
+    # random seeds: the event based results can change even if the MFDs
+    # are the same, while the distribution converges to the same MFD
+    for srcs in general.groupby(unique, checksum).values():
+        # NB: the simplest test featuring the same source in two
+        # different source models is logictree/case_01
+        src = srcs[0]
+        if len(srcs) > 1:
+            # NB: each copy can have many realizations, since they are
+            # collected before the reduction (see collect_sources), so
+            # the realizations of all the copies must be kept
+            src.ts_samples = numpy.sort(
+                _merge_ts_samples(srcs), order='trt_smr')
+            # the merged source is modified if any copy is modified
+            if any(getattr(s, 'bysrc_unc', False) for s in srcs):
+                src.bysrc_unc = True
+        out.append(src)
+    return out
+
+
+def _merge_ts_samples(srcs):
+    # concatenate the ts_samples of identical copies of a source in
+    # different files, recomputing the field ts as if the copies were a
+    # single source (see source_with_ts_sets): a copy with a single
+    # signature has ts=0, so copies with different signatures (i.e. with
+    # uncertainties depending on the branch, like the MFD chains) would
+    # be merged in a single set of realizations otherwise
+    if not all(hasattr(src, 'sigts') for src in srcs):  # in hazardlib
+        return numpy.concatenate([src.ts_samples for src in srcs])
+    minimum = {}  # signature -> smallest trt_smr
+    for src in srcs:
+        for sig, mint in src.sigts.values():
+            minimum[sig] = min(minimum.get(sig, mint), mint)
+    multi = len(minimum) > 1
+    arrays = []
+    for src in srcs:
+        arr = src.ts_samples.copy()
+        arr['ts'] = [minimum[src.sigts[ts][0]] if multi else 0
+                     for ts in arr['ts']]
+        arrays.append(arr)
+    return numpy.concatenate(arrays)
+
+
+def split_by_tom(sources):
+    """
+    Groups together sources with the same TOM and collect multifault sources
+    """
+    def key(src):
+        tom = getattr(src, 'temporal_occurrence_model', None)
+        return (tom.__class__.__name__, src.code == b'F')
+    return [srcs for _, srcs in sorted(
+        general.groupby(sources, key).items())]
+
+
+def _group_sources(trt, sources):
+    """
+    Reduce identical sources, regroup by trt_smrs and TOM,
+    then return (source_groups, reduction_count).
+    """
+    key = operator.attrgetter('source_id', 'code')
+    lst = []
+    red = 0
+    for srcs in general.groupby(sources, key).values():
+        if len(srcs) > 1:
+            srcs = reduce_sources(srcs)
+            red += 1
+        lst.extend(srcs)
+    src_groups = []
+    for _, sources in sorted(general.groupby(lst, trt_smrs).items()):
+        for grp in split_by_tom(sources):
+            src_groups.append(sourceconverter.SourceGroup(trt, grp))
+    return src_groups, red

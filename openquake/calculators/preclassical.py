@@ -1,0 +1,638 @@
+# -*- coding: utf-8 -*-
+# vim: tabstop=4 shiftwidth=4 softtabstop=4
+#
+# Copyright (C) 2014-2026 GEM Foundation
+#
+# OpenQuake is free software: you can redistribute it and/or modify it
+# under the terms of the GNU Affero General Public License as published
+# by the Free Software Foundation, either version 3 of the License, or
+# (at your option) any later version.
+#
+# OpenQuake is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU Affero General Public License for more details.
+#
+# You should have received a copy of the GNU Affero General Public License
+# along with OpenQuake. If not, see <http://www.gnu.org/licenses/>.
+
+import sys
+import logging
+import operator
+import psutil
+import numpy
+from openquake.baselib import general, parallel, hdf5
+from openquake.hazardlib import pmf, geo, valid
+from openquake.baselib.general import AccumDict, groupby
+from openquake.hazardlib.rmap_maker import get_cmakers, read_unc_ts_sets
+from openquake.hazardlib.contexts import estimate_nctxs
+from openquake.hazardlib.source.point import grid_point_sources
+from openquake.hazardlib.source.base import get_code2cls
+from openquake.hazardlib.source_group import (
+    SourceGroup, _grp_id, NUM_RUPTURES)
+from openquake.hazardlib.source_reader import get_unc_ts_sets
+from openquake.hazardlib.calc.filters import (
+    getdefault, split_source, SourceFilter)
+from openquake.hazardlib.scalerel.point import PointMSR
+from openquake.commonlib import readinput
+from openquake.calculators import base, autogrid
+
+MAX_NUM_RUPTURES = 52_000  # to support HimalayanThrust in CHN
+U16 = numpy.uint16
+U32 = numpy.uint32
+F32 = numpy.float32
+F64 = numpy.float64
+GB = 2 ** 30
+TWO24 = 2 ** 24
+TWO32 = 2 ** 32
+PSD_EXACT = 1000  # km, pointsource_distance considered exact (see autogrid)
+# context estimates stored in the datastore as dataset 'nctxs'
+# NB: 'exact' is the number of contexts with PSD_EXACT (when gridding,
+# of the point sources without gridding, see contexts._count_nogrid),
+# 'psd100' the number of contexts with the pointsource_distance of the
+# user, when not gridding (see count_psdist), 'gridded' is the number of
+# contexts of the gridded point sources before collapse_precision,
+# 'collapsed' the number of contexts after collapse_precision and
+# 'separate' the number of contexts without the variant sources
+# optimization, i.e. if the variants of the sources were computed separately
+CTX_EST = numpy.dtype([('exact', numpy.int64), ('psd100', numpy.int64),
+                       ('gridded', numpy.int64), ('collapsed', numpy.int64),
+                       ('separate', numpy.int64)])
+
+
+# one real site per H3 cell of resolution `res`, as a complete collection;
+# NB: using the cell centers returned by lower_res would move the sites
+# by up to ~25 km for res=4, so that the estimated contexts of the point
+# sources near the pointsource_distance would be way off
+def _lowres_sites(sites, res):
+    _centers, orig_sids = sites.lower_res(res)
+    first = U32([sids[0] for sids in orig_sids])
+    lowres = object.__new__(sites.__class__)
+    lowres.array = sites.array[numpy.isin(sites.sids, first)]
+    lowres.make_complete()
+    return lowres
+
+
+# SourceFilter used to estimate the weights and contexts of the sources,
+# possibly on a reduced set of sites, with a multiplier compensating
+# for the discarded sites
+def _get_srcfilter(sites, few_sites, maxdist):
+    if not sites:
+        return SourceFilter(None)
+    if not few_sites:
+        # in SAM from 539,831 -> 11,430 sites
+        lowres = _lowres_sites(sites, res=4)  # res=4 ~39 km
+        # if the reduction is not worth it use all the sites, since
+        # the discarded sites make the estimated contexts less accurate
+        if len(lowres) <= len(sites) / 2:
+            sf = SourceFilter(lowres, maxdist)
+            sf.multiplier = len(sites) / len(lowres)
+            logging.debug('Reducing %d->%d sites', len(sites), len(lowres))
+            return sf
+    return SourceFilter(sites, maxdist)
+
+
+def source_data(sources):
+    """
+    Set the source .id attribute to the index in the source_info table.
+    :param sources:
+        a list of source objects
+    :returns:
+        a dictionary of lists with keys src_id, nsites, nruptrs, weight, ctimes
+    """
+    data = AccumDict(accum=[])
+    for src in sources:
+        data['src_id'].append(src.source_id)
+        data['nctxs'].append(src.nctxs)
+        data['nrupts'].append(src.num_ruptures)
+        data['weight'].append(src.weight)
+        data['ctimes'].append(src.dt)
+    return data
+
+
+def check_maxmag(pointlike):
+    """
+    Check for pointlike sources with high magnitudes
+    """
+    logged = False
+    for src in pointlike:
+        maxmag = src.get_annual_occurrence_rates()[-1][0]
+        if maxmag >= 9. and not logged:
+            logging.info('%s %s has maximum magnitude %s',
+                         src.__class__.__name__, src.source_id, maxmag)
+            logged = True  # avoid logging thousands of messages
+
+
+def collapse_nphc(src):
+    """
+    Collapse the nodal_plane_distribution and hypocenter_distribution.
+    """
+    if (hasattr(src, 'nodal_plane_distribution') and
+            hasattr(src, 'hypocenter_distribution')):
+        if len(src.nodal_plane_distribution.data) > 1:
+            ws, nps = zip(*src.nodal_plane_distribution.data)
+            strike = numpy.average([np.strike for np in nps], weights=ws)
+            dip = numpy.average([np.dip for np in nps], weights=ws)
+            rake = numpy.average([np.rake for np in nps], weights=ws)
+            val = geo.NodalPlane(strike, dip, rake)
+            src.nodal_plane_distribution = pmf.PMF([(1., val)])
+        if len(src.hypocenter_distribution.data) > 1:
+            ws, vals = zip(*src.hypocenter_distribution.data)
+            val = numpy.average(vals, weights=ws)
+            src.hypocenter_distribution = pmf.PMF([(1., val)])
+        src.magnitude_scaling_relationship = PointMSR()
+
+
+def filter_mag(srcs, min_mag, strict, bysrc=False):
+    """
+    Filter by magnitude and count the ruptures.
+
+    NB: if bysrc is True the sources modified by the uncertainties are not
+    filtered, since the filtering depends on the occurrence rates, which
+    are modified in the workers, where the filtering is performed anyway.
+    """
+    if not srcs:
+        return []
+    mmag = getdefault(min_mag, srcs[0].tectonic_region_type)
+    out = [src for src in srcs
+           if src.get_mags()[-1] >= mmag or (bysrc and src.bysrc_unc)]
+    for ss in out:
+        if (ss.nsites and ss.num_ruptures > MAX_NUM_RUPTURES and strict and
+            ss.code in b'FSCNXK'):  # only for fault sources
+            raise RuntimeError('%s has too many ruptures' % ss)
+    return out
+
+
+def max_psdist(psd):
+    """
+    :param psd: a pointsource_distance, i.e. a number, a dictionary
+        TRT -> pointsource_distance, or a list of (mag, distance) pairs
+    :returns: the largest distance of the pointsource_distance
+    """
+    if isinstance(psd, dict):
+        return max(max_psdist(val) for val in psd.values())
+    if isinstance(psd, list):  # magnitude-dependent distances
+        return max(dist for _mag, dist in psd)
+    return psd
+
+
+def filter_weight(srcs, sf, cmaker, secparams, monitor):
+    """
+    Filter and weight the sources. Also split them, except for
+    pointlike and multifault sources, which have been split already.
+
+    NB: the sources modified by the uncertainties (i.e. the ones with
+    bysrc_unc, see build_groups) are neither split nor filtered here: the
+    splitting would destroy the geometry (and the MFD of the fault
+    sources) and the filtering depends on the occurrence rates, which are
+    modified in the workers; there they are split (see groups_gkeys
+    in classical.py) and filtered (see filter_mag).
+    """
+    oq = cmaker.oq
+    mon1 = monitor('building top of ruptures', measuremem=True)
+    mon2 = monitor('setting msparams', measuremem=False)
+    ry0 = 'ry0' in cmaker.REQUIRES_DISTANCES
+    sf.integration_distance = cmaker.maximum_distance
+    maxdist = cmaker.maximum_distance.y[-1]
+    N = len(sf.sitecol) if sf.sitecol else 0
+    splits = []
+    for src in srcs:
+        if src.code == b'F':
+            if N and N <= oq.max_sites_disagg:
+                mask = sf.get_close(secparams) > 0  # shape S
+            else:
+                mask = None
+            src.set_msparams(secparams, mask, ry0, mon1, mon2)
+        elif src.code in b'pP' and sf.sitecol:
+            # special case, compute distances
+            distances = sf.sitecol.get_cdist(src.location)
+            radius = src._get_rupture_projection_radii()[-1]
+            src.nsites = (distances <= maxdist + radius).sum()
+        elif sf.sitecol:
+            # NB: this is approximate, since the sites are sampled
+            src.nsites = len(sf.close_sids(src))  # can be 0
+            # print(f'{src.source_id=}, {src.nsites=}')
+        else:
+            src.nsites = 1
+        # NB: it is crucial to split only the close sources, for
+        # performance reasons (think of Ecuador in SAM)
+        if oq.split_sources and src.nsites and src.code != b'F' and \
+                not src.bysrc_unc:
+            # multifault source have been already split in save_and_split
+            splits.extend(split_source(src))
+        else:
+            splits.append(src)
+
+    # filter by magnitude and count ruptures
+    splits = filter_mag(splits, oq.minimum_magnitude, oq.strict, bysrc=True)
+    if not splits:
+        return {}
+
+    cmaker.set_weight(splits, sf)
+    dic = {splits[0].grp_id: splits}
+    psd = max_psdist(cmaker.pointsource_distance)
+    if not cmaker.ps_grid_spacing and psd < PSD_EXACT:
+        # estimate the reduction due to the pointsource_distance approximation
+        # on the split sources, the ones used in classical
+        pts = [src for src in splits if hasattr(src, 'location')]
+        if pts:
+            dic.update(count_psdist(pts, sf, cmaker, monitor))
+    return dic
+
+
+def _warn_ungridded(src_groups, ps_grid_spacing):
+    # the area and multipoint sources modified by the uncertainties are
+    # split in the workers (see classical.groups_gkeys) and never gridded
+    if not ps_grid_spacing:
+        return
+    ids = sorted({valid.corename(src) for sg in src_groups for src in sg
+                  if src.code in b'AM' and src.bysrc_unc})
+    if ids:
+        logging.warning(
+            'ps_grid_spacing is not used for %d source(s) modified by the '
+            'uncertainties: %s', len(ids), ' '.join(ids[:10]) +
+            (' ...' if len(ids) > 10 else ''))
+
+
+def count_psdist(srcs, sf, cmaker, monitor):
+    """
+    Estimate the contexts that the point sources would generate with the
+    pointsource_distance of the user and with PSD_EXACT, see
+    contexts.estimate_nctxs
+
+    :returns: a dictionary with the two estimates
+    """
+    psdist = estimate_nctxs(cmaker, srcs, sf.sitecol)
+    exact = estimate_nctxs(cmaker.copy(pointsource_distance=PSD_EXACT),
+                           srcs, sf.sitecol)
+    return {'psdist_ctxs': int(psdist * sf.multiplier),
+            'exact_ctxs': int(exact * sf.multiplier)}
+
+
+# split by magnitude the simple, complex and kite faults with many
+# ruptures, so that their magnitudes are weighted in different
+# filter_weight subtasks; in CHN the weighting of HimalayanThrust
+# (870_149 ruptures) took 383 s in a single subtask, while the other
+# subtasks took 30 s
+def _split_big_faults(srcs):
+    out = []
+    for src in srcs:
+        if (src.code in b'SCK' and not src.bysrc_unc and
+                src.num_ruptures > MAX_NUM_RUPTURES):
+            out.extend(split_source(src))
+        else:
+            out.append(src)
+    return out
+
+
+def preclassical(sources, sf, cmaker, secparams, num_tasks, monitor=None):
+    """
+    Split the sources if split_sources is true. If
+    ps_grid_spacing is set, grid the point sources.
+    """
+    # possibly grid the pointlike sources
+    if cmaker.ps_grid_spacing and cmaker.split_sources:
+        srcs = []
+        for src in sources:
+            # NB: the sources modified by the uncertainties are not split
+            # here, see filter_weight; they are weighted there instead
+            if src.code in b'AM' and not src.bysrc_unc:
+                srcs.extend(split_source(src))
+            else:
+                srcs.append(src)
+        srcs = grid_point_sources(srcs, cmaker.ps_grid_spacing)
+        # the contexts of the gridded point sources are counted in
+        # classical, together with an estimate of the contexts without
+        # gridding, to log the reduction (see contexts._count_nogrid)
+        for src in srcs:
+            if hasattr(src, 'location'):
+                src.count_nogrid = True
+    else:
+        srcs = sources
+    if cmaker.split_sources:
+        srcs = _split_big_faults(srcs)
+
+    Ns = cmaker.oq.concurrent_tasks // num_tasks + 2
+    # produce subtasks of kind set_weight
+    for i in range(Ns):
+        lst = srcs[i::Ns]
+        if lst:
+            yield filter_weight, lst, sf, cmaker, secparams
+
+
+def get_req_gb(data, N, oq):
+    """
+    :returns: an array with the required GB for the RateMaps
+    """
+    out = numpy.zeros(len(data))
+    L = oq.imtls.size if oq.imtls else 1
+    for rec in data:
+        if oq.disagg_by_src or rec['blocks'] > 1:
+            # NB: the float(rec['gsims']) is necessary for case_lisa
+            out[rec['grp_id']] = N * L * float(rec['gsims']) * 4 / GB
+    return out
+
+
+# executed at the end of preclassical
+def store_csm(dstore, csm, sitecol, cmakers):
+    """
+    Store the _csm datagroup.
+
+    :returns: max_weight
+    """
+    if sitecol is None:
+        # when called from hamlet
+        csm.save(dstore)
+        return 1
+    N = len(sitecol)
+    oq = csm.oq
+    if len(oq.imtls) == 0:  # in test_from_ses
+        mb_per_gsim = N * 4 / 1024**2
+    else:
+        mb_per_gsim = oq.imtls.size * N * 4 / 1024**2
+    max_weight = csm.get_max_weight()
+
+    # build source_groups and store _csm
+    quartets = []
+    for sg, cmaker in zip(csm.src_groups, cmakers.to_array()):
+        quartet = csm.split_sg(
+            cmaker, sg, sitecol, max_weight, mb_per_gsim)
+        quartets.append(quartet)
+    # storing _csm
+    csm.save(dstore, [q[2] for q in quartets])
+
+    data = numpy.array(
+        [(_grp_id(blocks[0]), len(cm.gsims), len(tgets), len(blocks),
+          len(cm.gsims) * mb_per_gsim, extra['weight'], extra['codes'], cm.trt)
+         for cm, tgets, blocks, extra in quartets],
+        [('grp_id', U16), ('gsims', U16), ('tiles', U16), ('blocks', U16),
+         ('max_mb', F32), ('weight', F32), ('codes', '<S8'), ('trt', '<S32')])
+    req_gb = get_req_gb(data, N, oq)
+
+    # sanity checks
+    required_gb = req_gb.sum()
+    avail_gb = psutil.virtual_memory().available / 1024**3
+    if required_gb > avail_gb:
+        raise MemoryError(f'{required_gb:.1f=}, {avail_gb:.1f=}')
+    if 'classical' in oq.calculation_mode:
+        logging.info(f'Requiring {required_gb:.1f} GB for the RateMaps')
+
+    # store source groups
+    dstore.create_dset('source_groups', data,
+                       attrs=dict(req_gb=req_gb, mem_gb=req_gb.sum()))
+    return max_weight
+
+
+def warn_use_rates(oq, num_rlzs):
+    """
+    Recommend setting use_rates and full enumeration when only the means
+    are to be computed
+    """
+    if oq.use_rates:
+        ns = oq.number_of_logic_tree_samples
+        if ns and ns <= 1_000_000:
+            logging.warning('You should set number_of_logic_tree_samples=0')
+        elif num_rlzs > 1_000_000:
+            logging.warning('You should set number_of_logic_tree_samples')
+    else:
+        logging.warning('You should set use_rates=true')
+    
+
+@base.calculators.add('preclassical')
+class PreClassicalCalculator(base.HazardCalculator):
+    """
+    PreClassical PSHA calculator
+    """
+    core_task = preclassical
+    accept_precalc = []
+
+    def init(self):
+        if self.oqparam.hazard_calculation_id:
+            self.full_lt = self.datastore.parent['full_lt'].init()
+        else:
+            super().init()
+            self.full_lt = self.csm.full_lt
+        if self.oqparam.hazard_stats() == ['mean']:
+            warn_use_rates(self.oqparam, self.full_lt.get_num_paths())
+
+    def store(self):
+        # store full_lt, toms
+        self.datastore['full_lt'] = self.csm.full_lt
+        self.datastore['toms'] = numpy.array(
+            [sg.get_tom_toml(self.oqparam.investigation_time)
+             for sg in self.csm.src_groups], hdf5.vstr)
+
+    def populate_csm(self):
+        """
+        Update the CompositeSourceModel by splitting and weighting the
+        sources; save the source_info table.
+        """
+        oq = self.oqparam
+        csm = self.csm
+        self.store()
+        logging.info('Building cmakers')
+        trt_smrs = csm.get_trt_smrs()
+        # NB: unc_ts_sets is stored by source_reader.build_groups, before
+        # preclassical; the reader also looks in the parent calculation.
+        unc_ts_sets = read_unc_ts_sets(self.datastore)
+        if unc_ts_sets is None:
+            unc_ts_sets = get_unc_ts_sets(csm.src_groups)
+        self.cmakers = get_cmakers(trt_smrs, csm.full_lt, oq)
+        self.datastore.hdf5.save_vlen('trt_smrs', trt_smrs)
+        sites = csm.sitecol if csm.sitecol else None
+        if sites is None:
+            logging.warning('No sites??')
+        elif oq.auto_grid or (oq.ps_grid_spacing and not oq.psd_given):
+            # with a fixed ps_grid_spacing only pointsource_distance
+            # is calibrated, see autogrid.calibrate; with few sites
+            # the calibration is skipped and the defaults are kept
+            if self.few_sites:
+                logging.info('Few sites: skipping the calibration of '
+                             'ps_grid_spacing and pointsource_distance')
+            else:
+                self.calibrate_grid(sites)
+
+        if oq.calibration_only:  # stop here, the calibration is stored
+            logging.info('Stopping after the calibration')
+            return
+
+        # the core size Gt, i.e. the number of columns of the global
+        # RateMap, is known already at build time (see
+        # source_reader.store_unc_signatures)
+        if 'unc_ts_sets' not in self.datastore:
+            # this happens if the groups were read from the parent
+            # calculation, so the units are taken from the parent
+            self.datastore.hdf5.save_vlen('unc_ts_sets', unc_ts_sets)
+
+        sf = _get_srcfilter(sites, self.few_sites, oq.maximum_distance)
+        atomic_sources = []
+        normal_sources = []
+        reqv = 'reqv' in oq.inputs
+        if reqv:
+            logging.warning(
+                'Using equivalent distance approximation and '
+                'collapsing hypocenters and nodal planes')
+        _warn_ungridded(csm.src_groups, oq.ps_grid_spacing)
+        multifaults = []
+        cmakers = self.cmakers.to_array()
+        for sg in csm.src_groups:
+            for src in sg:
+                if src.code == b'F':
+                    multifaults.append(src)
+                if reqv and sg.trt in oq.inputs['reqv']:
+                    if src.source_id not in oq.reqv_ignore_sources:
+                        collapse_nphc(src)
+            grp_id = sg.sources[0].grp_id
+            # do nothing for atomic sources except counting the ruptures
+            if sg.atomic:
+                # compute weight sequentially
+                cmakers[grp_id].set_weight(sg, sf)
+                atomic_sources.extend(sg)
+            else:
+                normal_sources.extend(sg)
+        if multifaults:
+            secparams = multifaults[0].get_secparams()
+            logging.warning(
+                'There are %d multiFaultSources (secparams=%s)',
+                len(multifaults), general.humansize(secparams.nbytes))
+        else:
+            secparams = ()
+        self._process(atomic_sources, normal_sources, sf, secparams)
+        allsources = csm.get_sources()
+        self.store_source_info(source_data(allsources))
+
+    def calibrate_grid(self, sites):
+        """
+        Determine ps_grid_spacing and pointsource_distance on a sample
+        of sites, since the user set ps_grid_spacing=auto or a fixed
+        ps_grid_spacing without pointsource_distance (only the latter
+        is then calibrated)
+        """
+        oq = self.oqparam
+        cmakers = self.cmakers.to_array()
+        best = autogrid.calibrate(
+            self.csm, cmakers, sites, oq, self.datastore.hdf5)
+        if best is None:  # no point sources
+            return
+        psgs, psd = best
+        logging.warning('Using ps_grid_spacing=%s, pointsource_distance=%s',
+                        psgs, psd)
+        oq.ps_grid_spacing = psgs
+        for cmaker in cmakers:
+            cmaker.ps_grid_spacing = psgs
+        if not oq.psd_given:  # keep the pointsource_distance of the user
+            oq.pointsource_distance = {'default': psd}
+            for cmaker in cmakers:
+                cmaker.pointsource_distance = psd
+        # store the calibrated parameters, used when starting from --hc
+        del self.datastore['oqparam']
+        self.datastore['oqparam'] = oq
+
+    def _process(self, atomic_sources, normal_sources, sf, secparams):
+        # run preclassical in parallel for non-atomic sources
+        if normal_sources:
+            sources_by_key = groupby(
+                normal_sources, operator.attrgetter('grp_id'))
+            if sys.platform != 'darwin' or len(secparams):
+                # Multifault workers read the datastore. Otherwise skip
+                # SWMR on macOS to avoid a segfault.
+                self.datastore.swmr_on()
+            smap = parallel.Starmap(preclassical, h5=self.datastore.hdf5)
+            cmakers = self.cmakers.to_array()
+            num_tasks = len(sources_by_key)
+            for grp_id, srcs in sources_by_key.items():
+                cmaker = cmakers[grp_id]
+                cmaker.gsims = list(cmaker.gsims)  # reducing data transfer
+                pointlike = [src for src in srcs
+                             if hasattr(src, 'nodal_plane_distribution')]
+                check_maxmag(pointlike)
+                smap.submit((srcs, sf, cmaker, secparams, num_tasks))
+            res = smap.reduce()
+        else:
+            res = {}
+        psdist_ctxs = res.pop('psdist_ctxs', 0)
+        exact_ctxs = res.pop('exact_ctxs', 0)
+        if exact_ctxs:  # used in classical.log_cfactor
+            self.datastore['nctxs'] = numpy.array(
+                [(exact_ctxs, psdist_ctxs, 0, 0, 0)], CTX_EST)
+        atomic = set(src.grp_id for src in atomic_sources)
+        if atomic:  # case_35
+            for grp_id, srcs in groupby(
+                    atomic_sources, lambda src: src.grp_id).items():
+                res[grp_id] = srcs
+        acc = AccumDict(accum=0)
+        code2cls = get_code2cls()
+        for grp_id, srcs in res.items():
+            # NB: grp_id can be the string "before" or "after"
+            if not isinstance(grp_id, str):
+                srcs.sort(key=operator.attrgetter('source_id'))
+            # srcs can be empty if the minimum_magnitude filter is on
+            if srcs and not isinstance(grp_id, str) and grp_id not in atomic:
+                newsg = SourceGroup(srcs[0].tectonic_region_type)
+                newsg.sources = srcs
+                self.csm.src_groups[grp_id] = newsg
+                for src in srcs:
+                    if src.code not in b'pP':
+                        assert src.weight, src
+                    acc[src.code] += int(src.num_ruptures)
+        self.csm.fix_src_offset()
+        for val, key in sorted((val, key) for key, val in acc.items()):
+            cls = code2cls[key].__name__
+            logging.info('{} ruptures: {:_d}'.format(cls, val))
+
+    def execute(self):
+        """
+        Run `preclassical(srcs, srcfilter, params, monitor)` by
+        parallelizing on the sources according to their weight and
+        tectonic region type.
+        """
+        if not hasattr(self, 'csm'):  # used only for post_process
+            return
+        # the garbage collector is disabled while receiving, gridding and
+        # weighting the sources, since there can be millions of them: in
+        # Melbourne it was wasting ~50 seconds in the reduce
+        with general.gc_disabled():
+            self.populate_csm()
+        if self.oqparam.calibration_only:
+            return  # nothing else to do, see populate_csm
+        return self.csm
+
+    def post_execute(self, csm):
+        """
+        Raise an error if the sources were all discarded
+        """
+        self.datastore.create_dset(
+            'weights',
+            F32([rlz.weight[-1] for rlz in self.full_lt.get_realizations()]))
+        tot = self.datastore['source_info']['est_ctxs'].sum()
+        if tot == 0:
+            if self.N == 1:
+                logging.error('There are no sources close to the site!')
+            else:
+                raise RuntimeError(
+                    'There are no sources close to the site(s)! '
+                    'Use oq plot sources? to debug')
+
+        fname = self.oqparam.inputs.get('delta_rates')
+        if fname:
+            idx_nr = {row[0]: (idx, row[NUM_RUPTURES])
+                      for idx, row in enumerate(self.csm.source_info.values())}
+            deltas = readinput.read_delta_rates(fname, idx_nr)
+            self.datastore.hdf5.save_vlen('delta_rates', deltas)
+
+        # save 'source_groups'
+        with general.gc_disabled():
+            self.max_weight = store_csm(
+                self.datastore, self.csm, self.sitecol, self.cmakers)
+
+        # save gsims
+        toml = []
+        for cmaker in self.cmakers:
+            for gsim in cmaker.gsims:
+                toml.append(gsim._toml)
+        self.datastore['gsims'] = numpy.array(toml)
+
+    def post_process(self):
+        if self.oqparam.calculation_mode == 'preclassical':
+            super().post_process()
+        # else do nothing, post_process will be called later on

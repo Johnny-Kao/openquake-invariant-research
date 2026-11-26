@@ -1,0 +1,59 @@
+<?xml version="1.0" encoding="utf-8"?>
+<nrml
+xmlns="http://openquake.org/xmlns/nrml/0.4"
+xmlns:gml="http://www.opengis.net/gml"
+>
+    <sourceModel
+    name="SSHARA - Smoothed Seismicity"
+    >
+        <multiPointSource
+        id="1500"
+        name="Eastern Rift"
+        tectonicRegion="Tectonic_Type_C"
+        >
+            <multiPointGeometry>
+                <gml:posList>3.63113E+01 -6.61406E+00 3.61482E+01 -6.58646E+00 3.62490E+01 -6.54180E+00 3.63498E+01 -6.49715E+00 3.61867E+01 -6.46956E+00 3.62875E+01 -6.42492E+00 3.61244E+01 -6.39733E+00 3.62252E+01 -6.35269E+00</gml:posList>
+                <upperSeismoDepth>
+                    0.00000E+00
+                </upperSeismoDepth>
+                <lowerSeismoDepth>
+                    4.00000E+01
+                </lowerSeismoDepth>
+            </multiPointGeometry>
+            <magScaleRel>
+                WC1994
+            </magScaleRel>
+            <ruptAspectRatio>
+                2.00000E+00
+            </ruptAspectRatio>
+            <multiMFD
+            kind="truncGutenbergRichterMFD"
+            size="8"
+            >
+                <a_val>1.91525E+00 1.96094E+00 1.94360E+00 1.92952E+00 1.98020E+00 1.96265E+00 2.03055E+00 2.01194E+00</a_val>
+                <b_val>
+                    1.15853E+00
+                </b_val>
+                <bin_width>
+                    1.00000E-01
+                </bin_width>
+                <max_mag>
+                    7.40000E+00
+                </max_mag>
+                <min_mag>
+                    4.50000E+00
+                </min_mag>
+            </multiMFD>
+            <nodalPlaneDist>
+                <nodalPlane dip="6.00000E+01" probability="5.00000E-01" rake="-9.00000E+01" strike="1.00000E+01"/>
+                <nodalPlane dip="6.00000E+01" probability="5.00000E-01" rake="-9.00000E+01" strike="1.90000E+02"/>
+            </nodalPlaneDist>
+            <hypoDepthDist>
+                <hypoDepth depth="5.00000E+00" probability="1.73913E-01"/>
+                <hypoDepth depth="1.50000E+01" probability="4.34783E-01"/>
+                <hypoDepth depth="2.50000E+01" probability="2.31884E-01"/>
+                <hypoDepth depth="3.50000E+01" probability="1.59420E-01"/>
+            </hypoDepthDist>
+        </multiPointSource>
+    </sourceModel>
+</nrml>

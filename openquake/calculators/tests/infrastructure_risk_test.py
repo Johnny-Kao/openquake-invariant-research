@@ -1,0 +1,216 @@
+# -*- coding: utf-8 -*-
+# vim: tabstop=4 shiftwidth=4 softtabstop=4
+#
+# Copyright (C) 2015-2026 GEM Foundation
+#
+# OpenQuake is free software: you can redistribute it and/or modify it
+# under the terms of the GNU Affero General Public License as published
+# by the Free Software Foundation, either version 3 of the License, or
+# (at your option) any later version.
+#
+# OpenQuake is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU Affero General Public License for more details.
+#
+# You should have received a copy of the GNU Affero General Public License
+# along with OpenQuake. If not, see <http://www.gnu.org/licenses/>.
+
+import tempfile
+
+import numpy
+from openquake.baselib import InvalidFile
+from openquake.commonlib import datastore, logs
+from openquake.qa_tests_data.infrastructure_risk import (
+    case_1, case_2, case_3, five_nodes_demsup_directed,
+    five_nodes_demsup_directedunweighted,
+    five_nodes_demsup_multidirected,
+    demand_supply, directed, eff_loss_random,
+    multidirected, multigraph, undirected, interdependencies)
+from openquake.calculators.export import export
+from openquake.calculators.tests import CalculatorTestCase
+
+aac = numpy.testing.assert_allclose
+
+
+class InfrastructureRiskTestCase(CalculatorTestCase):
+
+    # TODO: we need tests also for event-based
+
+    def _check_csv_outputs(self, outputs_list, datastore, testcase):
+        # export in a temporary directory, not in the current one
+        if self.edir is None:  # not set by run_calc, see tearDown
+            self.edir = tempfile.mkdtemp()
+        datastore.export_dir = self.edir
+        for output in outputs_list:
+            expected_fname = 'expected/infra-' + output + '.csv'
+            [got_path] = export(('infra-' + output, 'csv'), datastore)
+            self.assertEqualFiles(expected_fname, got_path)
+
+    def test_case_1(self):
+        self.run_calc(case_1.__file__, 'job.ini')
+        outputs_list = (
+            'node_el avg_loss event_ccl event_efl event_pcl event_wcl'
+            ' dem_cl').split()
+        self._check_csv_outputs(outputs_list, self.calc.datastore, case_1)
+
+    def test_case_2(self):
+        # infrastructure risk for structural, liquefaction and landslides
+        with self.assertRaises(ValueError):
+            # DispProb is not in the secondary IMTs 
+            self.run_calc(case_2.__file__, 'job_err.ini', exports='csv')
+        out = self.run_calc(case_2.__file__, 'job.ini', exports='csv')
+        [agg_csv, aggparent_csv] = out[('aggrisk', 'csv')]
+        self.assertEqualFiles('expected/aggrisk.csv', agg_csv)
+        self.assertEqualFiles('expected/aggrisk-parent.csv', aggparent_csv)
+
+    def test_case_3(self):
+        # test that the TodorovichSilva model runs
+        # TODO: look at the warning covariance is not symmetric
+        # positive-semidefinite
+        self.run_calc(case_3.__file__, 'job_scenario.ini')
+
+    def test_demand_supply(self):
+        self.run_calc(demand_supply.__file__, 'job.ini')
+        outputs_list = (
+            'avg_loss event_ccl event_efl event_pcl event_wcl node_el'
+            ' dem_cl').split()
+        self._check_csv_outputs(
+            outputs_list, self.calc.datastore, demand_supply)
+
+    def test_directed(self):
+        self.run_calc(directed.__file__, 'job.ini')
+        outs = 'avg_loss event_efl event_pcl event_wcl node_el taz_cl'.split()
+        self._check_csv_outputs(outs, self.calc.datastore, directed)
+
+    def test_eff_loss_random(self):
+        self.run_calc(eff_loss_random.__file__, 'job.ini')
+        outs = 'avg_loss event_efl node_el'.split()
+
+        self._check_csv_outputs(outs, self.calc.datastore, eff_loss_random)
+
+    def test_five_nodes_demsup_directed(self):
+        self.run_calc(five_nodes_demsup_directed.__file__, 'job.ini')
+        outs = ('avg_loss event_ccl event_efl event_pcl event_wcl node_el'
+                ' dem_cl').split()
+        self._check_csv_outputs(outs, self.calc.datastore,
+                                five_nodes_demsup_directed)
+
+    def test_five_nodes_demsup_directedunweighted(self):
+        self.run_calc(five_nodes_demsup_directedunweighted.__file__, 'job.ini')
+        outs = ('avg_loss event_ccl event_efl event_pcl event_wcl '
+                'node_el dem_cl').split()
+        self._check_csv_outputs(
+            outs, self.calc.datastore, five_nodes_demsup_directedunweighted)
+
+    def test_five_nodes_demsup_multidirected(self):
+        self.run_calc(five_nodes_demsup_multidirected.__file__, 'job.ini')
+        outs = ('avg_loss event_ccl event_efl event_pcl event_wcl node_el'
+                ' dem_cl').split()
+        self._check_csv_outputs(
+            outs, self.calc.datastore, five_nodes_demsup_multidirected)
+
+    def test_multidirected(self):
+        self.run_calc(multidirected.__file__, 'job.ini')
+        outs = 'avg_loss event_efl event_pcl event_wcl node_el taz_cl'.split()
+        self._check_csv_outputs(outs, self.calc.datastore, multidirected)
+
+    def test_multigraph(self):
+        self.run_calc(multigraph.__file__, 'job.ini')
+        outs = 'avg_loss event_efl event_pcl event_wcl node_el taz_cl'.split()
+        self._check_csv_outputs(outs, self.calc.datastore, multigraph)
+
+    def test_undirected(self):
+        self.run_calc(undirected.__file__, 'job.ini')
+        outs = 'avg_loss event_efl event_pcl event_wcl node_el taz_cl'.split()
+        self._check_csv_outputs(outs, self.calc.datastore, undirected)
+
+    def test_missing_mandatory_column(self):
+        with self.assertRaises(InvalidFile) as exc:
+            self.run_calc(undirected.__file__,
+                          'job_missing_mandatory_column.ini')
+        exc_msg = exc.exception.args[0]
+        got_msg_head = (
+            'The following mandatory columns are missing in the exposure')
+        got_msg_tail = (
+            'exposure_demo_nodes_missing_mandatory_column.csv": [\'purpose\']')
+        self.assertIn(got_msg_head, exc_msg)
+        self.assertIn(got_msg_tail, exc_msg)
+
+    def test_incompatible_purposes(self):
+        with self.assertRaises(InvalidFile) as exc:
+            self.run_calc(demand_supply.__file__,
+                          'job_incompatible_purposes.ini')
+        exc_msg = exc.exception.args[0]
+        got_msg_head = 'Column "purpose" of'
+        got_msg_tail = (
+            'exposure_demo_nodes_incompatible_purposes.csv can not contain'
+            ' at the same time the value "TAZ" and either "source"'
+            ' or "demand".')
+        self.assertIn(got_msg_head, exc_msg)
+        self.assertIn(got_msg_tail, exc_msg)
+
+    def test_multiple_graphtypes(self):
+        with self.assertRaises(InvalidFile) as exc:
+            self.run_calc(multigraph.__file__, 'job_multiple_graphtypes.ini')
+        exc_msg = exc.exception.args[0]
+        got_msg_head = 'The column "graphtype" of'
+        got_msg_tail = (
+            'exposure_demo_nodes_multiple_graphtypes.csv" must contain'
+            ' all equal values.')
+        self.assertIn(got_msg_head, exc_msg)
+        self.assertIn(got_msg_tail, exc_msg)
+
+    def test_weighted_nodes(self):
+        with self.assertLogs(level='WARNING') as log:
+            expected_log_head = 'Node weights different from 1 present in'
+            expected_log_tail = (
+                'exposure_demo_weighted_nodes.csv will be ignored.'
+                ' Handling node weights is not implemented yet.')
+            self.run_calc(eff_loss_random.__file__, 'job_weighted_nodes.ini')
+            warning_was_found = False
+            for record in log.records:
+                if record.msg.startswith(expected_log_head):
+                    self.assertIn(expected_log_tail, record.msg)
+                    warning_was_found = True
+            self.assertTrue(
+                warning_was_found,
+                'If there are node weights != 1, a warning should be raised')
+
+    def test_interdependencies_aggregate_by(self):
+        # the interdependencies require aggregate_by = id
+        self.run_calc(interdependencies.__file__, 'job.ini')
+        hc_id = str(self.calc.datastore.calc_id)
+        with self.assertRaisesRegex(InvalidFile, 'aggregate_by = id'):
+            self.get_calc(interdependencies.__file__, 'job.ini',
+                          hazard_calculation_id=hc_id,
+                          interdependencies_file='interdependencies.csv',
+                          aggregate_by='taz')
+
+    def test_interdependencies_parent_aggregate_by(self):
+        # the parent must aggregate by asset too; running it without
+        # postrisk_func avoids building the child from the parent settings
+        self.calc = self.get_calc(interdependencies.__file__, 'job.ini',
+                                  aggregate_by='taxonomy')
+        self.calc.pre_execute()
+        self.calc.execute()
+        hc_id = str(self.calc.datastore.calc_id)
+        with self.assertRaisesRegex(InvalidFile, 'in the parent calculation'):
+            self.get_calc(interdependencies.__file__, 'job.ini',
+                          hazard_calculation_id=hc_id,
+                          interdependencies_file='interdependencies.csv')
+
+    def test_interdependencies(self):
+        # Run the calculation without closing the datastore
+        self.calc = self.get_calc(interdependencies.__file__, 'job.ini')
+        self.calc.pre_execute()
+        result = self.calc.execute()
+        self.calc.post_execute(result)
+        with datastore.read(self.calc.child_id) as child_dstore:
+            outs = 'avg_loss event_efl event_pcl event_wcl node_el'.split()
+            self._check_csv_outputs(outs, child_dstore, interdependencies)
+        # the outputs of the child must be exposed in the database
+        child_outs = logs.dbcmd('get_outputs', self.calc.child_id)
+        keys = {out.ds_key for out in child_outs}
+        for out in outs:
+            self.assertIn('infra-' + out, keys)

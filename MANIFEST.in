@@ -1,0 +1,28 @@
+# README and related stuff
+include README.md LICENSE CONTRIBUTORS.txt
+# OpenQuake config file
+include openquake/engine/openquake.cfg
+# demos folder
+graft demos
+
+# OpenQuake server config examples
+include openquake/server/local_settings.py.pam
+include openquake/server/local_settings.py.server
+# OpenQuake server email notification templates
+recursive-include openquake/server/templates/registration *.default.tmpl
+# OpenQuake server data
+recursive-include openquake/server/db *.sql
+recursive-include openquake/server *.html *.css *.png *.js *.map
+recursive-include openquake/server/static/font *.ttf
+# Hazardlib data
+recursive-include openquake/hazardlib/gsim *.csv *.hdf5 *.onnx *.onnx.gz
+recursive-include openquake/hazardlib/correlation_models *.csv *.hdf5
+# PFD (probabilistic fault displacement) data
+recursive-include openquake/pfd *.csv
+# Secondary perils data
+recursive-include openquake/sep *.onnx.gz
+# NRML sample data
+recursive-include openquake/commonlib/nrml_examples *.xml *.csv *.geojson
+# QA tests data
+recursive-include openquake/qa_tests_data *.* README
+recursive-exclude openquake/qa_tests_data *.pyc

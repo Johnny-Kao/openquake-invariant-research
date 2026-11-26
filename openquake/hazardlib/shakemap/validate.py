@@ -1,0 +1,641 @@
+# -*- coding: utf-8 -*-
+# vim: tabstop=4 shiftwidth=4 softtabstop=4
+#
+# Copyright (C) 2024-2025, GEM Foundation
+#
+# OpenQuake is free software: you can redistribute it and/or modify it
+# under the terms of the GNU Affero General Public License as published
+# by the Free Software Foundation, either version 3 of the License, or
+# (at your option) any later version.
+#
+# OpenQuake is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU Affero General Public License for more details.
+#
+# You should have received a copy of the GNU Affero General Public License
+# along with OpenQuake.  If not, see <http://www.gnu.org/licenses/>.
+
+import os
+import sys
+import logging
+from dataclasses import dataclass
+import numpy
+
+from openquake.baselib import config, general, hdf5, performance
+from openquake.hazardlib import valid, imt
+from openquake.commonlib import readinput
+from openquake.commonlib.oqvalidation import CORRELATION_STRATEGIES
+from openquake.commonlib.readinput import get_close_mosaic_models
+from openquake.hazardlib.shakemap.parsers import (
+    get_nodal_planes_and_product, get_rup_dic)
+from openquake.qa_tests_data import mosaic
+from openquake.hazardlib.geo.utils import SiteAssociationError
+from openquake.hazardlib.scalerel import get_available_magnitude_scalerel
+from openquake.hazardlib.nrml import validators as nrml_validators
+from openquake.hazardlib.correlation_models.base import ResidualComponent
+from openquake.hazardlib.correlation_models.registry import (
+    get_model, get_model_specs)
+
+MOSAIC_DIR = config.directory.mosaic_dir or os.path.dirname(mosaic.__file__)
+
+
+# the test mode keeps the impact grids small, see base.py get_aelo_changelog
+TEST_MODE = 'pytest' in sys.argv[0] or bool(os.environ.get('OQ_TEST'))
+
+
+@dataclass
+class ImpactParam:
+    rupture_dict: dict
+    time_event: str
+    maximum_distance: float
+    truncation_level: float
+    number_of_ground_motion_fields: int
+    asset_hazard_distance: float
+    ses_seed: int
+    local_timestamp: str = None
+    rupture_file: str = None
+    station_data_file: str = None
+    mmi_file: str = None
+    maximum_distance_stations: float = None
+    mosaic_model: str = None
+    trt: str = None
+    description: str = None
+    notes: str = None
+    make_impact_reports: bool = False
+    region_grid_spacing: float = 10 if TEST_MODE else 1  # km, mandatory
+    within_event_correlation_model: str = None
+    correlation_strategy: str = 'circulant_embedding'
+    calculation_mode: str = 'scenario_risk'  # hidden from the form
+    within_event_correlation_params: dict = None
+    between_event_correlation_model: str = None
+
+    def get_oqparams(self, usgs_id, mosaic_models, trts, use_shakemap):
+        """
+        :returns: job_ini dictionary
+        """
+        if not hasattr(self, 'exposure_hdf5'):
+            self.exposure_hdf5 = os.path.join(MOSAIC_DIR, 'exposure.hdf5')
+        inputs = {'exposure': [self.exposure_hdf5], 'job_ini': '<in-memory>'}
+        rupdic = self.rupture_dict
+        if (not self.rupture_file and 'rupture_file' in rupdic
+                and rupdic['rupture_was_loaded']):
+            self.rupture_file = rupdic['rupture_file']
+        if self.rupture_file:
+            inputs['rupture_model'] = self.rupture_file
+        if self.station_data_file:
+            inputs['station_data'] = self.station_data_file
+        if self.mmi_file:
+            inputs['mmi'] = self.mmi_file
+        if not self.mosaic_model:
+            self.mosaic_model = mosaic_models[0]
+            if len(mosaic_models) > 1:
+                logging.info('Using the "%s" model' % self.mosaic_model)
+
+        if not self.trt:
+            self.trt = _first_trt(trts, self.mosaic_model)
+        shakemap_array = rupdic.pop('shakemap_array', ())
+        params = dict(
+            base_path='',  # no .ini file
+            description=self.description,
+            notes=self.notes,
+            calculation_mode=self.calculation_mode,
+            rupture_dict=str(rupdic),
+            # time_event is not set, so the occupants losses are computed
+            # for day, night and transit; the selected time is used only
+            # in the country reports
+            report_time_event=self.time_event,
+            maximum_distance=str(self.maximum_distance),
+            region_grid_spacing=str(self.region_grid_spacing),
+            mosaic_model=self.mosaic_model,
+            tectonic_region_type=self.trt,
+            truncation_level=str(self.truncation_level),
+            number_of_ground_motion_fields=str(
+                self.number_of_ground_motion_fields),
+            asset_hazard_distance=str(self.asset_hazard_distance),
+            ses_seed=str(self.ses_seed),
+            correlation_strategy=self.correlation_strategy,
+            make_impact_reports=bool(self.make_impact_reports),
+            inputs=inputs)
+        if use_shakemap:
+            fname = general.gettemp(suffix='.npy')
+            numpy.save(fname, shakemap_array)
+            params['shakemap_uri'] = str(dict(kind='file_npy', fname=fname))
+            params['gsim'] = '[FromFile]'
+        if self.local_timestamp is not None:
+            params['local_timestamp'] = self.local_timestamp
+        for field in ('within_event_correlation_model',
+                      'within_event_correlation_params',
+                      'between_event_correlation_model'):
+            if getattr(self, field) is not None:
+                params[field] = str(getattr(self, field))
+        if self.maximum_distance_stations is not None:
+            params['maximum_distance_stations'] = str(
+                self.maximum_distance_stations)
+        if not params['description']:
+            if 'title' in rupdic:
+                params['description'] = (
+                    f'{rupdic["usgs_id"]}: {rupdic["title"]}')
+            else:
+                params['description'] = (
+                    f'{rupdic["usgs_id"]}: M {rupdic["mag"]}'
+                    f' ({rupdic["lat"]}, {rupdic["lon"]})')
+        oq = readinput.get_oqparam(params)
+        # NB: fake h5 to cache `get_site_model` and avoid multiple associations
+        _sitecol, assetcol, _discarded, _exp = readinput.get_sitecol_assetcol(
+            oq, h5=hdf5.FakeH5())
+        id0s = numpy.unique(assetcol['ID_0'])
+        countries = set(assetcol.tagcol.ID_0[i] for i in id0s)
+        tmap_keys = get_tmap_keys(self.exposure_hdf5, countries)
+        if not tmap_keys:
+            raise LookupError(f'No taxonomy mapping was found for {countries}')
+        logging.root.handlers = []  # avoid breaking the logs
+        return params
+
+
+IMPACT_FORM_LABELS = {
+    'usgs_id': 'Rupture identifier',
+    'rupture_from_usgs': 'Rupture from USGS',
+    'rupture_file': 'Rupture model XML',
+    'use_shakemap': 'Use the ShakeMap',
+    'shakemap_version': 'ShakeMap version',
+    'shakemap_desc': 'ShakeMap description',
+    'lon': 'Longitude (degrees)',
+    'lat': 'Latitude (degrees)',
+    'dep': 'Depth (km)',
+    'mag': 'Magnitude (Mw)',
+    'aspect_ratio': 'Aspect ratio',
+    'rake': 'Rake (degrees)',
+    'local_timestamp': 'Local timestamp of the event',
+    'time_event': 'Time of the event',
+    'dip': 'Dip (degrees)',
+    'strike': 'Strike (degrees)',
+    'maximum_distance': 'Maximum source-to-site distance (km)',
+    'mosaic_model': 'Mosaic model',
+    'trt': 'Tectonic region type',
+    'truncation_level': 'Level of truncation',
+    'number_of_ground_motion_fields': 'Number of ground motion fields',
+    'asset_hazard_distance': 'Asset hazard distance (km)',
+    'region_grid_spacing': 'Region grid spacing (km)',
+    'ses_seed': 'Random seed (ses_seed)',
+    'station_data_file_from_usgs': 'Station data from USGS',
+    'station_data_file': 'Station data CSV',
+    'maximum_distance_stations': 'Maximum distance of stations (km)',
+    'nodal_plane': 'Nodal plane',
+    'msr': 'Magnitude scaling relationship',
+    'description': 'Description',
+    'notes': 'Notes',
+    'no_uncertainty': 'No uncertainty',
+    'make_impact_reports': 'Make two-page country reports',
+    'calculation_mode': 'Calculation mode',
+    'within_event_correlation_model': 'Within-event correlation model',
+    'within_event_correlation_params': 'Within-event correlation params',
+    'between_event_correlation_model': 'Between-event correlation model',
+    'correlation_strategy': 'Spatial correlation strategy',
+}
+
+IMPACT_FORM_PLACEHOLDERS = {
+    'usgs_id': 'USGS ID or custom',
+    'rupture_from_usgs': '',
+    'rupture_file': 'Rupture model XML',
+    'lon': '-180 ≤ float ≤ 180',
+    'lat': '-90 ≤ float ≤ 90',
+    'dep': 'float ≥ 0',
+    'mag': 'float ≥ 0',
+    'aspect_ratio': 'float ≥ 0',
+    'rake': '-180 ≤ float ≤ 180',
+    'local_timestamp': '',
+    'time_event': 'day|night|transit',
+    'dip': '0 ≤ float ≤ 90',
+    'strike': '0 ≤ float ≤ 360',
+    'maximum_distance': 'float ≥ 0',
+    'mosaic_model': 'Mosaic model',
+    'trt': 'Tectonic region type',
+    'truncation_level': 'float ≥ 0',
+    'number_of_ground_motion_fields': 'float ≥ 1',
+    'asset_hazard_distance': 'float ≥ 0',
+    'region_grid_spacing': 'float > 0',
+    'ses_seed': 'int ≥ 0',
+    'station_data_file_from_usgs': '',
+    'station_data_file': 'Station data CSV',
+    'maximum_distance_stations': 'float ≥ 0',
+    'nodal_plane': '',
+    'msr': '',
+    'description': 'Leave blank to set automatically',
+    'notes': '',
+}
+
+# IMTs of the impact calculations: the ShakeMap jobs compute all of them
+# (see create_impact_job in server/services.py and main_cmd in
+# engine/impact.py), the other jobs the ones of the
+# global vulnerability models
+IMPACT_IMTS = {
+    'shakemap': 'PGA, PGV, SA(0.3), SA(0.6), SA(1.0)',
+    'rupture': 'PGA, SA(0.3), SA(0.6), SA(1.0)'}
+
+DEFAULT_CORRELATION_MODELS = {
+    'within_event_correlation_model': 'LothBaker2013',
+    'between_event_correlation_model': 'AbrahamsonEtAl2014BetweenEvent'}
+
+
+# True if the model class accepts all the given IMTs
+def _accepts(cls, imts):
+    try:
+        cls().validate_imts([imt.from_string(im) for im in imts.split(', ')])
+    except ValueError:
+        return False
+    return True
+
+
+# The correlation models offered to the level 2 users, by kind of job:
+# the joint within-event models enabled for circulant embedding, since a
+# dense factorization of the impact grids could exhaust the memory, and
+# the between-event models, accepting the IMTs of the job. For the ShakeMap
+# jobs they impose the spatial and cross-IMT dependence on the conditional
+# means and standard deviations of the ShakeMap
+def _impact_correlation_models():
+    within = {name: spec.cls for name, spec in get_model_specs(
+        'spatial_cross_imt').items()
+        if spec.cls.SUPPORTS_CIRCULANT_EMBEDDING}
+    between = {name: spec.cls for name, spec in get_model_specs(
+        'cross_imt').items()
+        if spec.residual_component == ResidualComponent.BETWEEN_EVENT}
+    models = {}
+    for scope, imts in IMPACT_IMTS.items():
+        for field, classes in (
+                ('within_event_correlation_model', within),
+                ('between_event_correlation_model', between)):
+            default = DEFAULT_CORRELATION_MODELS[field]
+            # the default model first, then in alphabetical order
+            models[field, scope] = sorted(
+                (name for name, cls in classes.items()
+                 if _accepts(cls, imts)),
+                key=lambda name: (name != default, name))
+    return models
+
+
+IMPACT_CORRELATION_MODELS = _impact_correlation_models()
+
+# maximum value of maximum_distance (in km) allowed to level 1 users
+MAX_DISTANCE_LEVEL1 = 500
+
+# upper magnitude bounds and corresponding default maximum distances (km);
+# for magnitudes above the last bound the last distance is used
+MAG_BOUNDS = numpy.array([5.5, 6., 6.5, 7., 7.5])
+MAG_DISTANCES = numpy.array([50, 100, 150, 200, 250, 300])
+
+
+def get_default_maximum_distance(mag):
+    """
+    :param mag: magnitude of the rupture
+    :returns: the default maximum distance in km for the given magnitude
+
+    >>> [get_default_maximum_distance(mag) for mag in [5.5, 5.6, 6., 6.5]]
+    [50, 100, 100, 150]
+    >>> [get_default_maximum_distance(mag) for mag in [7., 7.5, 7.6, 9.]]
+    [200, 250, 300, 300]
+    """
+    return int(MAG_DISTANCES[numpy.searchsorted(MAG_BOUNDS, mag)])
+
+
+# upper magnitude bounds and corresponding default truncation levels;
+# for magnitudes above the last bound the last level is used
+TRUNC_MAG_BOUNDS = numpy.array([5.5, 6.5, 7.5])
+TRUNC_LEVELS = numpy.array([0, 1, 2, 3])
+
+
+def get_default_truncation_level(mag):
+    """
+    :param mag: magnitude of the rupture
+    :returns: the default truncation level for the given magnitude
+
+    >>> [get_default_truncation_level(mag) for mag in [5.5, 5.6, 6.5, 6.6]]
+    [0, 1, 1, 2]
+    >>> [get_default_truncation_level(mag) for mag in [7.5, 7.6, 9.]]
+    [2, 3, 3]
+    """
+    return int(TRUNC_LEVELS[numpy.searchsorted(TRUNC_MAG_BOUNDS, mag)])
+
+
+# form fields whose default depends on the magnitude of the rupture
+MAG_DEPENDENT_DEFAULTS = {
+    'maximum_distance': get_default_maximum_distance,
+    'truncation_level': get_default_truncation_level}
+
+
+IMPACT_FORM_DEFAULTS = {
+    'usgs_id': '',
+    'rupture_from_usgs': '',
+    'rupture_file': '',
+    'lon': '',
+    'lat': '',
+    'dep': '',
+    'mag': '',
+    'aspect_ratio': '2',
+    'rake': '',
+    'local_timestamp': '',
+    'time_event': 'day',
+    'dip': '90',
+    'strike': '0',
+    'maximum_distance': '',  # depends on the magnitude
+    'truncation_level': '',  # depends on the magnitude
+    'number_of_ground_motion_fields': '100',
+    'asset_hazard_distance': '15',
+    'region_grid_spacing': '10' if TEST_MODE else '1',
+    'ses_seed': '42',
+    'station_data_file_from_usgs': '',
+    'station_data_file': '',
+    'maximum_distance_stations': '',
+    'msr': 'WC1994',
+    'rupture_was_loaded': '',
+    'rupture_file_input': '',
+    'station_data_file_input': '',
+    'station_data_file_loaded': '',
+    'description': '',
+    **DEFAULT_CORRELATION_MODELS,
+}
+
+IMPACT_APPROACHES = {
+    'use_shakemap_from_usgs': 'Use ShakeMap from the USGS',
+    'use_pnt_rup_from_usgs': 'Use point rupture from the USGS',
+    'build_rup_from_usgs': 'Build rupture from USGS nodal plane solutions',
+    'use_shakemap_fault_rup_from_usgs': (
+        'Use ShakeMap fault rupture from the USGS'),
+    'use_finite_fault_model_from_usgs': 'Use finite fault model from the USGS',
+    'provide_rup': 'Provide earthquake rupture in OpenQuake NRML format',
+    'provide_rup_params': 'Provide earthquake rupture parameters',
+}
+
+
+msr_choices = [msr.__class__.__name__
+               for msr in get_available_magnitude_scalerel()]
+
+validators = {
+    'approach': valid.Choice(*IMPACT_APPROACHES),
+    'nodal_plane': valid.Choice('NP1', 'NP2'),
+    'usgs_id': valid.simple_id,
+    'lon': nrml_validators['lon'],
+    'lat': nrml_validators['lat'],
+    'dep': nrml_validators['depth'],
+    'mag': nrml_validators['magnitude'],
+    'msr': valid.Choice(*msr_choices),
+    'aspect_ratio': nrml_validators['ruptAspectRatio'],
+    'rake': nrml_validators['rake'],
+    'dip': nrml_validators['dip'],
+    'strike': nrml_validators['strike'],
+    'local_timestamp': valid.local_timestamp,
+    # NOTE: 'avg' is used for probabilistic seismic risk, not for scenarios
+    'time_event': valid.Choice('day', 'night', 'transit'),
+    'maximum_distance': valid.positivefloat,
+    'mosaic_model': valid.utf8,
+    'trt': valid.utf8,
+    'truncation_level': valid.positivefloat,
+    'number_of_ground_motion_fields': valid.positiveint,
+    'asset_hazard_distance': valid.positivefloat,
+    # zero would be taken as unset by the engine, so it is rejected here
+    'region_grid_spacing': lambda v: valid.positivefloat(valid.nonzero(v)),
+    'ses_seed': valid.positiveint,
+    'maximum_distance_stations': valid.positivefloat,
+    'description': valid.utf8,  # if empty, it will be set automatically
+    'notes': valid.utf8,
+    'make_impact_reports': valid.boolean,
+    'within_event_correlation_model': valid.NoneOr(valid.utf8_not_empty),
+    'between_event_correlation_model': valid.NoneOr(valid.utf8_not_empty),
+    'correlation_strategy': valid.Choice(*CORRELATION_STRATEGIES),
+    'calculation_mode': valid.Choice('scenario', 'scenario_risk'),
+    'within_event_correlation_params': valid.dictionary,
+}
+
+
+def _validate(POST):
+    validation_errs = {}
+    invalid_inputs = []
+    params = {}
+    inputdic = dict(
+        approach=None, nodal_plane=None, usgs_id=None, lon=None, lat=None,
+        dep=None, mag=None, msr=None, aspect_ratio=None, rake=None, dip=None,
+        strike=None, description=None)
+    for field, validation_func in validators.items():
+        if field not in POST:
+            continue
+        try:
+            value = validation_func(POST.get(field))
+        except Exception as exc:
+            blankable = ['dip', 'strike', 'maximum_distance_stations',
+                         'local_timestamp', 'notes', 'maximum_distance',
+                         'truncation_level']
+            if field in blankable and POST.get(field) == '':
+                if field in inputdic:
+                    inputdic[field] = None
+                else:
+                    params[field] = None
+                continue
+            validation_errs[IMPACT_FORM_LABELS[field]] = str(exc)
+            invalid_inputs.append(field)
+            continue
+        if field in inputdic:
+            inputdic[field] = value
+        else:
+            params[field] = value
+
+    if validation_errs:
+        err_msg = 'Invalid input value'
+        err_msg += 's\n' if len(validation_errs) > 1 else '\n'
+        err_msg += '\n'.join(
+            [f'{field.split(" (")[0]}: "{validation_errs[field]}"'
+             for field in validation_errs])
+        err = {"status": "failed", "error_msg": err_msg,
+               "invalid_inputs": invalid_inputs}
+    else:
+        err = {}
+    return inputdic, params, err
+
+
+def get_trts_around(mosaic_model, exposure_hdf5):
+    """
+    :returns: list of TRTs for the given mosaic model
+    """
+    with hdf5.File(exposure_hdf5) as f:
+        df = f.read_df('model_trt_gsim_weight',
+                       sel={'model': mosaic_model.encode()})
+    trts = [trt.decode('utf8') for trt in df.trt.unique()]
+    return trts
+
+
+def get_tmap_keys(exposure_hdf5, countries):
+    """
+    :returns: list of taxonomy mappings as keys in the the "tmap" data group
+    """
+    keys = []
+    with hdf5.File(exposure_hdf5, 'r') as exp:
+        for key in exp['tmap']:
+            if set(key.split('_')) & countries:
+                keys.append(key)
+    return keys
+
+
+def _apply_nodal_plane(inputdic, user, monitor):
+    """Add selected USGS plane geometry and product provenance."""
+    nodal_plane = inputdic.get('nodal_plane')
+    if not nodal_plane:
+        return {}
+    if inputdic['approach'] != 'build_rup_from_usgs':
+        return {'status': 'failed', 'error_msg':
+                'A nodal plane requires approach=build_rup_from_usgs'}
+    planes, info, product, err = get_nodal_planes_and_product(
+        inputdic['usgs_id'], user, monitor)
+    if err:
+        return err
+    if nodal_plane not in planes:
+        return {'status': 'failed', 'error_msg':
+                f'{nodal_plane} is not available for {inputdic["usgs_id"]}'}
+    for key, value in info.items():
+        if inputdic.get(key) is None:
+            inputdic[key] = float(value)
+    inputdic.update(planes[nodal_plane])
+    inputdic['aspect_ratio'] = inputdic.get('aspect_ratio') or 2.0
+    inputdic['mechanism_product'] = product
+    return {}
+
+
+# level 1 users cannot exceed MAX_DISTANCE_LEVEL1
+def _check_maximum_distance(params, user):
+    maxdist = params.get('maximum_distance')
+    if (user.level < 2 and maxdist is not None
+            and maxdist > MAX_DISTANCE_LEVEL1):
+        return {"status": "failed",
+                "error_msg": (f'{IMPACT_FORM_LABELS["maximum_distance"]}'
+                              f' cannot exceed {MAX_DISTANCE_LEVEL1} km'),
+                "invalid_inputs": ['maximum_distance']}
+    return {}
+
+
+# Level 1 users always get the default correlation models, level 2 users
+# choose among the models of their kind of job, see IMPACT_CORRELATION_MODELS
+def _check_correlation_models(params, user, use_shakemap):
+    scope = 'shakemap' if use_shakemap else 'rupture'
+    for field, default in DEFAULT_CORRELATION_MODELS.items():
+        if user.level < 2 or not params.get(field):
+            params[field] = default
+        allowed = IMPACT_CORRELATION_MODELS[field, scope]
+        if params[field] not in allowed:
+            kind = 'ShakeMap' if use_shakemap else 'rupture-based'
+            return {'status': 'failed', 'invalid_inputs': [field],
+                    'error_msg': (
+                        f'{IMPACT_FORM_LABELS[field]}: {params[field]} is '
+                        f'not available for {kind} jobs; choose among '
+                        f'{", ".join(allowed)}')}
+    if user.level < 2:  # the default model takes no parameters
+        params['within_event_correlation_params'] = {}
+    params.setdefault('within_event_correlation_params', {})
+    # build the model once, so that wrong parameters are reported here
+    # rather than when the job starts
+    model = params['within_event_correlation_model']
+    try:
+        get_model(model, **params['within_event_correlation_params'])
+    except (TypeError, ValueError) as exc:
+        field = 'within_event_correlation_params'
+        return {'status': 'failed', 'invalid_inputs': [field],
+                'error_msg': f'{IMPACT_FORM_LABELS[field]}: invalid for '
+                f'{model}: {exc}'}
+    return {}
+
+
+# first tectonic region type of the mosaic model, from the exposure
+def _first_trt(trts, mosaic_model):
+    mtrts = trts.get(mosaic_model, [])
+    if not mtrts:  # the exposure has no TRTs for this model
+        raise SiteAssociationError(
+            'No tectonic region types for the mosaic model %s'
+            % mosaic_model)
+    return next(iter(mtrts))  # NOTE: using the first TRT
+
+
+def impact_validate(POST, user, rupture_file=None, station_data_file=None,
+                    monitor=performance.Monitor()):
+    """
+    This is called by `impact_get_rupture_data` and `impact_run`.
+    In the first case the form contains only usgs_id and rupture_file and
+    returns (rup, rupdic, [station_file], error).
+    In the second case the form contains all fields and returns
+    (rup, rupdic, params, error).
+    """
+    err = {}
+    inputdic, params, err = _validate(POST)
+    if err:
+        return None, inputdic, params, err
+    run = len(params) > 1  # called by impact_run
+    err = _check_maximum_distance(params, user)
+    if err:
+        return None, inputdic, params, err
+
+    # NOTE: in level 1 interface the ShakeMap has to be used.
+    #       in level 2 interface it depends from the selected approach
+    if user.level == 1:
+        inputdic['approach'] = 'use_shakemap_from_usgs'
+    else:
+        inputdic['approach'] = POST['approach']
+    err = _apply_nodal_plane(inputdic, user, monitor)
+    if err:
+        return None, inputdic, params, err
+    use_shakemap = user.level == 1
+    if 'use_shakemap' in POST:
+        use_shakemap = POST['use_shakemap'] == 'true'
+    if run:
+        err = _check_correlation_models(params, user, use_shakemap)
+        if err:
+            return None, inputdic, params, err
+    shakemap_version = POST.get('shakemap_version') or 'usgs_preferred'
+
+    rup, rupdic, err = get_rup_dic(
+        inputdic, user, use_shakemap, shakemap_version, rupture_file, monitor)
+    if err:
+        return None, None, None, err
+    # round floats
+    for k, v in rupdic.items():
+        if isinstance(v, float):  # lon, lat, dep, strike, dip
+            rupdic[k] = round(v, 5)
+
+    trts = {}
+    expo = getattr(ImpactParam, 'exposure_hdf5',
+                   os.path.join(MOSAIC_DIR, 'exposure.hdf5'))
+    with monitor('get_close_mosaic_models'):
+        try:
+            mosaic_models = get_close_mosaic_models(
+                rupdic['lon'], rupdic['lat'], 5)
+        except ValueError as exc:
+            # e.g.:
+            # '(-139.0, 35.0) is farther than 5 deg from any mosaic model!'
+            err = {"status": "failed", "error_msg": str(exc)}
+            return rup, rupdic, params, err
+    for mosaic_model in mosaic_models:
+        trts[mosaic_model] = get_trts_around(mosaic_model, expo)
+    rupdic['trts'] = trts
+    rupdic['mosaic_models'] = mosaic_models
+    rupdic['rupture_from_usgs'] = rupture_file
+    rupdic['rupture_was_loaded'] = rup is not None
+    if 'description' in inputdic and inputdic['description']:
+        params['description'] = inputdic['description']
+    if 'notes' in inputdic:
+        params['notes'] = inputdic['notes']
+    for field, get_default in MAG_DEPENDENT_DEFAULTS.items():
+        if params.get(field, 0) is None:
+            params[field] = get_default(rupdic['mag'])
+    if run:
+        params['rupture_dict'] = rupdic
+        params['station_data_file'] = station_data_file
+        params['mmi_file'] = rupdic.get('mmi_file')
+        with monitor('get_oqparams'):
+            ap = ImpactParam(**params)
+            try:
+                oqparams = ap.get_oqparams(
+                    inputdic['usgs_id'], mosaic_models, trts, use_shakemap)
+            except SiteAssociationError as exc:
+                oqparams = None
+                err = {"status": "failed", "error_msg": str(exc)}
+        return rup, rupdic, oqparams, err
+    else:  # called by impact_get_rupture_data
+        # used by the UI to prefill the fields depending on the magnitude
+        for field, get_default in MAG_DEPENDENT_DEFAULTS.items():
+            rupdic[field] = get_default(rupdic['mag'])
+        return rup, rupdic, params, err

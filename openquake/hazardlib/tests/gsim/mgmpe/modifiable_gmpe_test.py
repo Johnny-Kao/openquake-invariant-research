@@ -1,0 +1,244 @@
+# -*- coding: utf-8 -*-
+# vim: tabstop=4 shiftwidth=4 softtabstop=4
+#
+# Copyright (C) 2020, GEM Foundation
+#
+# OpenQuake is free software: you can redistribute it and/or modify it
+# under the terms of the GNU Affero General Public License as published
+# by the Free Software Foundation, either version 3 of the License, or
+# (at your option) any later version.
+#
+# OpenQuake is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU Affero General Public License for more details.
+#
+# You should have received a copy of the GNU Affero General Public License
+# along with OpenQuake.  If not, see <http://www.gnu.org/licenses/>.
+import unittest
+import numpy as np
+
+from openquake.hazardlib import valid
+from openquake.hazardlib.imt import PGA, SA
+from openquake.hazardlib.gsim.base import CoeffsTable
+from openquake.hazardlib.contexts import simple_cmaker
+from openquake.hazardlib.gsim.mgmpe.modifiable_gmpe import (
+    ModifiableGMPE, _dict_to_coeffs_table)
+
+aae = np.testing.assert_array_almost_equal
+ORIG, MODI = 0, 1  # original vs modified GMPE
+
+
+class ModifiableGMPETest(unittest.TestCase):
+
+    def test_AlAtik2015Sigma(self):
+        """
+        Test application of the Al Atik (2015) sigma model
+        within ModifiableGMPE.
+        """
+        gmpe = valid.gsim('YenierAtkinson2015BSSA')
+        params1 = {"tau_model": "global", "ergodic": False}
+        params2 = {"tau_model": "cena", "ergodic": True}
+        params3 = {}
+        gsims = [valid.modified_gsim(gmpe, sigma_model_alatik2015=params)
+                 for params in [params1, params2, params3]]
+        cmaker = simple_cmaker(gsims, ['PGA'])
+        ctx = cmaker.new_ctx(4)
+        ctx.mag = 6.
+        ctx.rake = 0.
+        ctx.hypo_depth = 10.
+        ctx.occurrence_rate = .001
+        ctx.vs30 = 760.
+        ctx.rrup = np.array([1., 10., 30., 70.])
+        _mea, _sig, tau, phi = cmaker.get_mean_stds([ctx])  # (G,M,N)
+
+        # Expected results hand computed
+        aae(phi[0], 0.41623333)
+        aae(phi[1], 0.67626858)
+        aae(phi[2], 0.67626858)
+        aae(tau[0], 0.36855)
+        aae(tau[1], 0.32195)
+        aae(tau[2], 0.36855)
+
+        # now test with_betw_ratio
+        gsims[0] = ModifiableGMPE(
+            gmpe={'Campbell2003': {}},
+            add_between_within_stds={'with_betw_ratio': 0.6})
+        cmaker = simple_cmaker(gsims, ['PGA'])
+        _mea, _sig, tau, phi = cmaker.get_mean_stds([ctx])  # (G,M,N)
+        aae(tau[0], 0.44075136)
+        aae(phi[0], 0.26445082)
+
+        # check error is raised for GMPEs with only total std
+        with self.assertRaises(ValueError):
+            ModifiableGMPE(gmpe={'Campbell2003': {}},
+                           set_between_epsilon={'epsilon_tau': 0.5})
+
+    def test_AkkarEtAlRjb2014(self):
+        """
+        Test specification of the epsilon used to constrain the
+        between-event variability.
+        """
+        # check mean and stds
+        gmm = valid.gsim('AkkarEtAlRjb2014')
+        gsims = [valid.modified_gsim(
+            gmm, set_between_epsilon={'epsilon_tau': 0.5}), gmm]
+        cmaker = simple_cmaker(gsims, ['PGA'])
+        ctx = cmaker.new_ctx(4)
+        ctx.mag = 6.
+        ctx.rake = 0.
+        ctx.hypo_depth = 10.
+        ctx.occurrence_rate = .001
+        ctx.vs30 = 760.
+        ctx.rrup = np.array([1., 10., 30., 70.])
+        ctx.rjb = np.array([1., 10., 30., 70.])
+        mea, sig, tau, phi = cmaker.get_mean_stds([ctx])  # (G,M,N)
+
+        # check the computed mean + between event variability
+        exp_mean = mea[1] + tau[1] * 0.5
+        aae(exp_mean, mea[0])
+
+        # check the total std corresponds to the within event stddev
+        aae(sig[0], phi[1])
+
+    def test_coefficients_as_dictionary(self):
+        """
+        Check the parsing of the coefficients to a dictionary
+        """
+        input_coeffs = {"PGA": 1.0, "SA(0.2)": 2.0, "SA(3.0)": 3.0}
+        output_coeffs = _dict_to_coeffs_table(input_coeffs, "XYZ")
+        self.assertListEqual(list(output_coeffs), ["XYZ"])
+        self.assertIsInstance(output_coeffs["XYZ"], CoeffsTable)
+        self.assertAlmostEqual(output_coeffs["XYZ"][PGA()]["XYZ"], 1.0)
+        self.assertAlmostEqual(output_coeffs["XYZ"][SA(0.2)]["XYZ"], 2.0)
+        self.assertAlmostEqual(output_coeffs["XYZ"][SA(3.0)]["XYZ"], 3.0)
+
+    def get_mean_stds(self, **kw):
+        gmm = valid.gsim('AkkarEtAlRjb2014')
+        gmm1 = valid.modified_gsim(gmm)
+        gmm2 = valid.modified_gsim(gmm, **kw)
+        cmaker = simple_cmaker([gmm1, gmm2], ['PGA', 'SA(0.2)'])
+        ctx = cmaker.new_ctx(4)
+        ctx.mag = 6.
+        ctx.rake = 0.
+        ctx.hypo_depth = 10.
+        ctx. vs30 = 760.
+        ctx.rrup = np.array([1., 10., 30., 70.])
+        ctx.rjb = np.array([1., 10., 30., 70.])
+        return cmaker.get_mean_stds([ctx])
+
+    def test_mgmpe_general(self):
+        """
+        Test general capabilities of ModifiableGMPE
+        """
+        # Check the scaling of the median ground motion - IMT-independent
+        mea, sig, _tau, phi = self.get_mean_stds(
+            set_scale_median_scalar={'scaling_factor': 1.2})
+        aae(np.exp(mea[MODI]) / np.exp(mea[ORIG]), 1.2)
+
+        # Check the scaling of the median ground motion - IMT-dependent
+        mea, sig, _tau, phi = self.get_mean_stds(
+            set_scale_median_vector={
+                'scaling_factor': {"PGA": 0.9, "SA(0.2)": 1.1}})
+        for m, s in enumerate([0.9, 1.1]):
+            aae(np.exp(mea[MODI, m]) / np.exp(mea[ORIG, m]), s)
+
+        # Check the scaling of the total stddev - scalar
+        mea, sig, _tau, phi = self.get_mean_stds(
+            set_scale_total_sigma_scalar={'scaling_factor': 1.2})
+        aae(sig[MODI] / sig[ORIG], 1.2)
+
+        # Check the scaling of the total stddev - vector
+        mea, sig, _tau, phi = self.get_mean_stds(
+            set_scale_total_sigma_vector={
+                'scaling_factor': {"PGA": 0.9, "SA(0.2)": 1.1}})
+        for m, s in enumerate([0.9, 1.1]):
+            aae(sig[MODI, m] / sig[ORIG, m], s)
+
+        # Check the assignment of total sigma to a fixed value
+        mea, sig, _tau, phi = self.get_mean_stds(
+            set_fixed_total_sigma={"total_sigma": {"PGA": 0.6,
+                                                   "SA(0.2)": 0.75}})
+        for m, s in enumerate([0.6, 0.75]):
+            aae(sig[MODI, m], s)
+
+        # Check set total std as between plus phi SS
+        mea, sig, tau, phi = self.get_mean_stds(
+            set_total_std_as_tau_plus_delta={"delta": 0.45})
+        aae(phi[ORIG, 0], 0.6201)
+        aae(sig[MODI, 0], 0.5701491121)
+
+    def test_gmm_sigma_deltas(self):
+        """
+        Test capabilities for applying a delta to a component
+        of a GMM's sigma (total, tau or phi)
+        """
+        # Check adding/removing a delta std to the total std
+        mea, sig, tau, phi = self.get_mean_stds(
+            add_delta_to_total_std_scalar={"delta": -0.20})
+        aae(sig[ORIG, 0], 0.712105)   # PGA - original gmm
+        aae(sig[MODI, 0], 0.68344277) # PGA - modified gmm
+
+        # Check adding/removing a delta std to tau
+        mea, sig, tau, phi = self.get_mean_stds(
+            add_delta_to_tau_std_scalar={"delta": -0.10})
+        aae(tau[ORIG, 0], 0.3501)     # PGA - original gmm
+        aae(tau[MODI, 0], 0.33551455) # PGA - modified gmm
+        aae(sig[ORIG, 0], 0.71210534) # Also check total sigma because it's
+        aae(sig[MODI, 0], 0.70504895) # readjusted based on tau delta
+
+        # Check adding/removing a delta std to phi
+        mea, sig, tau, phi = self.get_mean_stds(
+            add_delta_to_phi_std_scalar={"delta": -0.10})
+        aae(phi[ORIG, 0], 0.6201)     # PGA - original gmm
+        aae(phi[MODI, 0], 0.61198367) # PGA - modified gmm
+        aae(sig[ORIG, 0], 0.71210534) # Also check total sigma because it's
+        aae(sig[MODI, 0], 0.70504895) # readjusted based phi delta
+
+        # Check adding/removing a vector of delta std to the total std
+        mea, sig, tau, phi = self.get_mean_stds(
+            add_delta_to_total_std_vector={"delta": {
+                "PGA": -0.25, "SA(0.2)": 0.20
+                }})
+        aae(sig[ORIG, 0], 0.71210534) # PGA - original gmm
+        aae(sig[MODI, 0], 0.66677884) # PGA - modified gmm
+        aae(sig[ORIG, 1], 0.76757403) # SA(0.2) - original gmm
+        aae(sig[MODI, 1], 0.7932023)  # SA(0.2) - modified gmm
+
+        # Check adding/removing a vector of delta std to tau
+        mea, sig, tau, phi = self.get_mean_stds(
+            add_delta_to_tau_std_vector={"delta": {
+                "PGA": -0.05, "SA(0.2)": 0.1
+                }})
+        aae(tau[ORIG, 0], 0.3501)      # PGA - original gmm
+        aae(tau[MODI, 0], 0.3465112)   # PGA - modified gmm
+        aae(tau[ORIG, 1], 0.3842)      # SA(0.2) - original gmm
+        aae(tau[MODI, 1], 0.39700081)  # SA(0.2) - modified gmm
+        aae(sig[ORIG, 1], 0.7675740)   # Test total sigma for SA(0.2)
+        aae(sig[MODI, 1], 0.77406065)  # given recomputed after tau adj
+
+        # Check adding/removing a vector of delta std to phi
+        mea, sig, tau, phi = self.get_mean_stds(
+            add_delta_to_phi_std_vector={"delta": {
+                "PGA": -0.2, "SA(0.2)": 0.05
+                }})
+        aae(phi[ORIG, 0], 0.6201)     # PGA - original gmm
+        aae(phi[MODI, 0], 0.58696168) # PGA - modified gmm
+        aae(phi[ORIG, 1], 0.6645)     # SA(0.2) - original gmm
+        aae(phi[MODI, 1], 0.66637846) # SA(0.2) - modified gmm
+        aae(sig[ORIG, 1], 0.76757403) # Test total sigma for SA(0.2)
+        aae(sig[MODI, 1], 0.76920081) # given recomputed after phi adj
+
+    def test_avg_gmpe_mgmpe(self):
+        """
+        Test instantiation of a ModifiableGMPE when spec in AvgGMPE
+        """
+        gmm_toml =\
+        """
+        [AvgGMPE]
+        b1.ModifiableGMPE.gmpe.AtkinsonBoore2006Modified2011 = {}
+        b1.ModifiableGMPE.add_between_within_stds.with_betw_ratio = 1.7
+        b1.ModifiableGMPE.weight = 0.6
+        b2.PezeshkEtAl2011NEHRPBC.weight = 0.4
+        """
+        valid.gsim(gmm_toml) # Instantiate using valid.gsim from a toml

@@ -1,0 +1,341 @@
+<?xml version="1.0" encoding="utf-8"?>
+<nrml
+xmlns="http://openquake.org/xmlns/nrml/0.5"
+xmlns:gml="http://www.opengis.net/gml"
+>
+    <sourceModel
+    name="Model %s"
+    >
+        <sourceGroup
+        rup_interdep="indep"
+        src_interdep="indep"
+        tectonicRegion="Active Shallow Crust"
+        >
+
+
+
+
+
+
+
+
+            <pointSource
+            id="ds_4_15201"
+            name=""
+            tectonicRegion="Active Shallow Crust"
+            >
+                <pointGeometry>
+                    <gml:Point>
+                        <gml:pos>
+                            1.7985907E+02 -2.6184290E+01
+                        </gml:pos>
+                    </gml:Point>
+                    <upperSeismoDepth>
+                        0.0000000E+00
+                    </upperSeismoDepth>
+                    <lowerSeismoDepth>
+                        6.0000000E+01
+                    </lowerSeismoDepth>
+                </pointGeometry>
+                <magScaleRel>
+                    WC1994
+                </magScaleRel>
+                <ruptAspectRatio>
+                    2.0000000E+00
+                </ruptAspectRatio>
+                <incrementalMFD
+                binWidth="1.0000000E-01"
+                minMag="5.0500000E+00"
+                >
+                    <occurRates>
+                        9.7342763E-06 7.3833916E-06 5.6002593E-06 4.2477639E-06 3.2219041E-06 2.4437954E-06 1.8536045E-06 1.4059482E-06 1.0664035E-06 8.0886078E-07 6.1351617E-07 4.6534842E-07 3.5296406E-07 2.6772117E-07 2.0306494E-07 1.5402357E-07 1.1682598E-07 8.8611820E-08 6.7211547E-08 5.0979565E-08 3.8667702E-08 2.9329225E-08 2.2246046E-08 1.6873496E-08 1.2798448E-08
+                    </occurRates>
+                </incrementalMFD>
+                <nodalPlaneDist>
+                    <nodalPlane dip="9.0000000E+01" probability="1.0000000E+00" rake="0.0000000E+00" strike="2.7000000E+02"/>
+                </nodalPlaneDist>
+                <hypoDepthDist>
+                    <hypoDepth depth="5.0000000E+00" probability="7.0000000E-02"/>
+                    <hypoDepth depth="1.5000000E+01" probability="2.4000000E-01"/>
+                    <hypoDepth depth="2.5000000E+01" probability="1.2000000E-01"/>
+                    <hypoDepth depth="3.5000000E+01" probability="5.7000000E-01"/>
+                </hypoDepthDist>
+            </pointSource>
+
+            <pointSource
+            id="ds_4_18232"
+            name=""
+            tectonicRegion="Active Shallow Crust"
+            >
+                <pointGeometry>
+                    <gml:Point>
+                        <gml:pos>
+                            1.7700355E+02 -2.5105110E+01
+                        </gml:pos>
+                    </gml:Point>
+                    <upperSeismoDepth>
+                        0.0000000E+00
+                    </upperSeismoDepth>
+                    <lowerSeismoDepth>
+                        6.0000000E+01
+                    </lowerSeismoDepth>
+                </pointGeometry>
+                <magScaleRel>
+                    WC1994
+                </magScaleRel>
+                <ruptAspectRatio>
+                    2.0000000E+00
+                </ruptAspectRatio>
+                <incrementalMFD
+                binWidth="1.0000000E-01"
+                minMag="5.0500000E+00"
+                >
+                    <occurRates>
+                        1.3663516E-04 1.0363697E-04 7.8608034E-05 5.9623734E-05 4.5224253E-05 3.4302331E-05 2.6018118E-05 1.9734590E-05 1.4968571E-05 1.1353574E-05 8.6116191E-06 6.5318627E-06 4.9543796E-06 3.7578679E-06 2.8503208E-06 2.1619517E-06 1.6398277E-06 1.2437997E-06 9.4341481E-07 7.1557461E-07 5.4275915E-07 4.1167964E-07 3.1225660E-07 2.3684480E-07 1.7964540E-07
+                    </occurRates>
+                </incrementalMFD>
+                <nodalPlaneDist>
+                    <nodalPlane dip="9.0000000E+01" probability="1.0000000E+00" rake="0.0000000E+00" strike="2.7000000E+02"/>
+                </nodalPlaneDist>
+                <hypoDepthDist>
+                    <hypoDepth depth="5.0000000E+00" probability="7.0000000E-02"/>
+                    <hypoDepth depth="1.5000000E+01" probability="2.4000000E-01"/>
+                    <hypoDepth depth="2.5000000E+01" probability="1.2000000E-01"/>
+                    <hypoDepth depth="3.5000000E+01" probability="5.7000000E-01"/>
+                </hypoDepthDist>
+            </pointSource>
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+            <pointSource
+            id="ds_4_482"
+            name=""
+            tectonicRegion="Active Shallow Crust"
+            >
+                <pointGeometry>
+                    <gml:Point>
+                        <gml:pos>
+                            1.7916000E+02 -3.2569480E+01
+                        </gml:pos>
+                    </gml:Point>
+                    <upperSeismoDepth>
+                        0.0000000E+00
+                    </upperSeismoDepth>
+                    <lowerSeismoDepth>
+                        6.0000000E+01
+                    </lowerSeismoDepth>
+                </pointGeometry>
+                <magScaleRel>
+                    WC1994
+                </magScaleRel>
+                <ruptAspectRatio>
+                    2.0000000E+00
+                </ruptAspectRatio>
+                <incrementalMFD
+                binWidth="1.0000000E-01"
+                minMag="5.0500000E+00"
+                >
+                    <occurRates>
+                        7.5076083E-05 5.6944770E-05 4.3192275E-05 3.2761087E-05 2.4849093E-05 1.8847892E-05 1.4296016E-05 1.0843444E-05 8.2246890E-06 6.2383784E-06 4.7317735E-06 3.5890225E-06 2.7222526E-06 2.0648127E-06 1.5661483E-06 1.1879143E-06 9.0102607E-07 6.8342301E-07 5.1837235E-07 3.9318239E-07 2.9822655E-07 2.2620309E-07 1.7157372E-07 1.3013766E-07 9.8708655E-08
+                    </occurRates>
+                </incrementalMFD>
+                <nodalPlaneDist>
+                    <nodalPlane dip="9.0000000E+01" probability="1.0000000E+00" rake="0.0000000E+00" strike="2.7000000E+02"/>
+                </nodalPlaneDist>
+                <hypoDepthDist>
+                    <hypoDepth depth="5.0000000E+00" probability="7.0000000E-02"/>
+                    <hypoDepth depth="1.5000000E+01" probability="2.4000000E-01"/>
+                    <hypoDepth depth="2.5000000E+01" probability="1.2000000E-01"/>
+                    <hypoDepth depth="3.5000000E+01" probability="5.7000000E-01"/>
+                </hypoDepthDist>
+            </pointSource>
+            <pointSource
+            id="ds_4_5043"
+            name=""
+            tectonicRegion="Active Shallow Crust"
+            >
+                <pointGeometry>
+                    <gml:Point>
+                        <gml:pos>
+                            1.7710212E+02 -3.0321170E+01
+                        </gml:pos>
+                    </gml:Point>
+                    <upperSeismoDepth>
+                        0.0000000E+00
+                    </upperSeismoDepth>
+                    <lowerSeismoDepth>
+                        6.0000000E+01
+                    </lowerSeismoDepth>
+                </pointGeometry>
+                <magScaleRel>
+                    WC1994
+                </magScaleRel>
+                <ruptAspectRatio>
+                    2.0000000E+00
+                </ruptAspectRatio>
+                <incrementalMFD
+                binWidth="1.0000000E-01"
+                minMag="5.0500000E+00"
+                >
+                    <occurRates>
+                        1.0285083E-05 7.8011756E-06 5.9171460E-06 4.4881206E-06 3.4042132E-06 2.5820758E-06 1.9584894E-06 1.4855027E-06 1.1267451E-06 8.5462960E-07 6.4823155E-07 4.9167984E-07 3.7293628E-07 2.8286998E-07 2.1455523E-07 1.6273889E-07 1.2343649E-07 9.3625857E-08 7.1014665E-08 5.3864207E-08 4.0855686E-08 3.0988799E-08 2.3504823E-08 1.7828270E-08 1.3522639E-08
+                    </occurRates>
+                </incrementalMFD>
+                <nodalPlaneDist>
+                    <nodalPlane dip="9.0000000E+01" probability="1.0000000E+00" rake="0.0000000E+00" strike="2.7000000E+02"/>
+                </nodalPlaneDist>
+                <hypoDepthDist>
+                    <hypoDepth depth="5.0000000E+00" probability="7.0000000E-02"/>
+                    <hypoDepth depth="1.5000000E+01" probability="2.4000000E-01"/>
+                    <hypoDepth depth="2.5000000E+01" probability="1.2000000E-01"/>
+                    <hypoDepth depth="3.5000000E+01" probability="5.7000000E-01"/>
+                </hypoDepthDist>
+            </pointSource>
+            <pointSource
+            id="ds_4_6534"
+            name=""
+            tectonicRegion="Active Shallow Crust"
+            >
+                <pointGeometry>
+                    <gml:Point>
+                        <gml:pos>
+                            1.7999942E+02 -3.0590970E+01
+                        </gml:pos>
+                    </gml:Point>
+                    <upperSeismoDepth>
+                        0.0000000E+00
+                    </upperSeismoDepth>
+                    <lowerSeismoDepth>
+                        6.0000000E+01
+                    </lowerSeismoDepth>
+                </pointGeometry>
+                <magScaleRel>
+                    WC1994
+                </magScaleRel>
+                <ruptAspectRatio>
+                    2.0000000E+00
+                </ruptAspectRatio>
+                <incrementalMFD
+                binWidth="1.0000000E-01"
+                minMag="5.0500000E+00"
+                >
+                    <occurRates>
+                        7.1611734E-05 5.4317081E-05 4.1199188E-05 3.1249343E-05 2.3702444E-05 1.7978165E-05 1.3636333E-05 1.0343079E-05 7.8451647E-06 5.9505115E-06 4.5134282E-06 3.4234089E-06 2.5966356E-06 1.9695329E-06 1.4938792E-06 1.1330986E-06 8.5944867E-07 6.5188679E-07 4.9445231E-07 3.7503919E-07 2.8446503E-07 2.1576506E-07 1.6365653E-07 1.2413252E-07 9.4153793E-08
+                    </occurRates>
+                </incrementalMFD>
+                <nodalPlaneDist>
+                    <nodalPlane dip="9.0000000E+01" probability="1.0000000E+00" rake="0.0000000E+00" strike="2.7000000E+02"/>
+                </nodalPlaneDist>
+                <hypoDepthDist>
+                    <hypoDepth depth="5.0000000E+00" probability="7.0000000E-02"/>
+                    <hypoDepth depth="1.5000000E+01" probability="2.4000000E-01"/>
+                    <hypoDepth depth="2.5000000E+01" probability="1.2000000E-01"/>
+                    <hypoDepth depth="3.5000000E+01" probability="5.7000000E-01"/>
+                </hypoDepthDist>
+            </pointSource>
+
+            <pointSource
+            id="ds_4_8499"
+            name=""
+            tectonicRegion="Active Shallow Crust"
+            >
+                <pointGeometry>
+                    <gml:Point>
+                        <gml:pos>
+                            1.7956252E+02 -2.9152060E+01
+                        </gml:pos>
+                    </gml:Point>
+                    <upperSeismoDepth>
+                        0.0000000E+00
+                    </upperSeismoDepth>
+                    <lowerSeismoDepth>
+                        6.0000000E+01
+                    </lowerSeismoDepth>
+                </pointGeometry>
+                <magScaleRel>
+                    WC1994
+                </magScaleRel>
+                <ruptAspectRatio>
+                    2.0000000E+00
+                </ruptAspectRatio>
+                <incrementalMFD
+                binWidth="1.0000000E-01"
+                minMag="5.0500000E+00"
+                >
+                    <occurRates>
+                        6.5174061E-05 4.9434144E-05 3.7495509E-05 2.8440124E-05 2.1571668E-05 1.6361984E-05 1.2410469E-05 9.4132681E-06 7.1399087E-06 5.4155790E-06 4.1076850E-06 3.1156550E-06 2.3632061E-06 1.7924780E-06 1.3595841E-06 1.0312366E-06 7.8218690E-07 5.9328419E-07 4.5000258E-07 3.4132433E-07 2.5889250E-07 1.9636845E-07 1.4894432E-07 1.1297339E-07 8.5689659E-08
+                    </occurRates>
+                </incrementalMFD>
+                <nodalPlaneDist>
+                    <nodalPlane dip="9.0000000E+01" probability="1.0000000E+00" rake="0.0000000E+00" strike="2.7000000E+02"/>
+                </nodalPlaneDist>
+                <hypoDepthDist>
+                    <hypoDepth depth="5.0000000E+00" probability="7.0000000E-02"/>
+                    <hypoDepth depth="1.5000000E+01" probability="2.4000000E-01"/>
+                    <hypoDepth depth="2.5000000E+01" probability="1.2000000E-01"/>
+                    <hypoDepth depth="3.5000000E+01" probability="5.7000000E-01"/>
+                </hypoDepthDist>
+            </pointSource>
+            <pointSource
+            id="ds_4_8502"
+            name=""
+            tectonicRegion="Active Shallow Crust"
+            >
+                <pointGeometry>
+                    <gml:Point>
+                        <gml:pos>
+                            1.7987145E+02 -2.9152060E+01
+                        </gml:pos>
+                    </gml:Point>
+                    <upperSeismoDepth>
+                        0.0000000E+00
+                    </upperSeismoDepth>
+                    <lowerSeismoDepth>
+                        6.0000000E+01
+                    </lowerSeismoDepth>
+                </pointGeometry>
+                <magScaleRel>
+                    WC1994
+                </magScaleRel>
+                <ruptAspectRatio>
+                    2.0000000E+00
+                </ruptAspectRatio>
+                <incrementalMFD
+                binWidth="1.0000000E-01"
+                minMag="5.0500000E+00"
+                >
+                    <occurRates>
+                        2.8906642E-05 2.1925519E-05 1.6630378E-05 1.2614044E-05 9.5676787E-06 7.2570283E-06 5.5044135E-06 4.1750654E-06 3.1667627E-06 2.4019710E-06 1.8218809E-06 1.3818860E-06 1.0481525E-06 7.9501751E-07 6.0301613E-07 4.5738420E-07 3.4692324E-07 2.6313925E-07 1.9958958E-07 1.5138753E-07 1.1482655E-07 8.7095270E-08 6.6061252E-08 5.0107073E-08 3.8005922E-08
+                    </occurRates>
+                </incrementalMFD>
+                <nodalPlaneDist>
+                    <nodalPlane dip="9.0000000E+01" probability="1.0000000E+00" rake="0.0000000E+00" strike="2.7000000E+02"/>
+                </nodalPlaneDist>
+                <hypoDepthDist>
+                    <hypoDepth depth="5.0000000E+00" probability="7.0000000E-02"/>
+                    <hypoDepth depth="1.5000000E+01" probability="2.4000000E-01"/>
+                    <hypoDepth depth="2.5000000E+01" probability="1.2000000E-01"/>
+                    <hypoDepth depth="3.5000000E+01" probability="5.7000000E-01"/>
+                </hypoDepthDist>
+            </pointSource>
+
+
+        </sourceGroup>
+    </sourceModel>
+</nrml>

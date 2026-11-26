@@ -1,0 +1,947 @@
+# -*- coding: utf-8 -*-
+# vim: tabstop=4 shiftwidth=4 softtabstop=4
+#
+# Copyright (C) 2014-2026 GEM Foundation
+#
+# OpenQuake is free software: you can redistribute it and/or modify it
+# under the terms of the GNU Affero General Public License as published
+# by the Free Software Foundation, either version 3 of the License, or
+# (at your option) any later version.
+#
+# OpenQuake is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU Affero General Public License for more details.
+#
+# You should have received a copy of the GNU Affero General Public License
+# along with OpenQuake. If not, see <http://www.gnu.org/licenses/>.
+
+import os
+import tempfile
+import unittest.mock as mock
+from types import SimpleNamespace
+import unittest
+import numpy
+import pandas
+from io import BytesIO
+
+from openquake.baselib import general, hdf5
+from openquake.hazardlib import (
+    InvalidFile, site_amplification, gsim_lt, source_reader)
+from openquake.hazardlib.lt import LogicTreeError
+from openquake.hazardlib.calc.filters import MINMAG, MAXMAG
+from openquake.hazardlib.source.rupture import BaseRupture
+from openquake.risklib import asset
+from openquake.commonlib import readinput, datastore
+from openquake.commonlib.readinput import (
+    get_close_mosaic_models, get_close_countries, get_country_or_model)
+from openquake.qa_tests_data.logictree import (
+    case_02, case_15, case_21, case_25)
+from openquake.qa_tests_data.classical import case_34, case_36, case_65
+from openquake.qa_tests_data.event_based import case_16
+from openquake.qa_tests_data.event_based_risk import (
+    case_02 as ebr2, case_caracas)
+
+
+TMP = tempfile.gettempdir()
+DATADIR = os.path.join(os.path.dirname(__file__), 'data')
+aac = numpy.testing.assert_allclose
+
+
+def getparams(oq):
+    return {k: v for k, v in vars(oq).items() if not k.startswith('_')}
+
+
+# inputs for test_duplicated_id_uncertainty and test_same_source_two_models
+SOURCE_MODEL = '''\
+<?xml version="1.0" encoding="utf-8"?>
+<nrml xmlns="http://openquake.org/xmlns/nrml/0.5"
+      xmlns:gml="http://www.opengis.net/gml">
+<sourceModel name="sm">
+<sourceGroup tectonicRegion="Active Shallow Crust">
+%s
+</sourceGroup>
+</sourceModel>
+</nrml>
+'''
+
+POINT_SOURCE = '''\
+<pointSource id="{id}" name="{id}">
+  <pointGeometry>
+    <gml:Point><gml:pos>{lon} 0.0</gml:pos></gml:Point>
+    <upperSeismoDepth>0.0</upperSeismoDepth>
+    <lowerSeismoDepth>20.0</lowerSeismoDepth>
+  </pointGeometry>
+  <magScaleRel>WC1994</magScaleRel>
+  <ruptAspectRatio>1.5</ruptAspectRatio>
+  <truncGutenbergRichterMFD aValue="{a}" bValue="1.0"
+                            maxMag="6.5" minMag="5.0"/>
+  <nodalPlaneDist>
+    <nodalPlane dip="90.0" probability="1.0" rake="0.0" strike="0.0"/>
+  </nodalPlaneDist>
+  <hypoDepthDist>
+    <hypoDepth depth="10.0" probability="1.0"/>
+  </hypoDepthDist>
+</pointSource>'''
+
+
+def source_model(*point_sources):
+    # build a source model with the given (id, lon, a_value) point sources
+    return SOURCE_MODEL % '\n'.join(
+        POINT_SOURCE.format(id=i, lon=lon, a=a) for i, lon, a in point_sources)
+
+DUPLICATED_ID_SMLT = '''\
+<?xml version="1.0" encoding="UTF-8"?>
+<nrml xmlns:gml="http://www.opengis.net/gml"
+      xmlns="http://openquake.org/xmlns/nrml/0.4">
+<logicTree logicTreeID="lt1">
+  <logicTreeBranchSet uncertaintyType="sourceModel" branchSetID="sm">
+    <logicTreeBranch branchID="b1">
+      <uncertaintyModel>sm1.xml</uncertaintyModel>
+      <uncertaintyWeight>0.5</uncertaintyWeight>
+    </logicTreeBranch>
+    <logicTreeBranch branchID="b2">
+      <uncertaintyModel>sm2.xml</uncertaintyModel>
+      <uncertaintyWeight>0.5</uncertaintyWeight>
+    </logicTreeBranch>
+  </logicTreeBranchSet>
+  <logicTreeBranchSet uncertaintyType="maxMagGRRelative"
+                      branchSetID="mmax" applyToBranches="b1 b2"
+                      applyToSources="src">
+    <logicTreeBranch branchID="m1">
+      <uncertaintyModel>+0.2</uncertaintyModel>
+      <uncertaintyWeight>0.5</uncertaintyWeight>
+    </logicTreeBranch>
+    <logicTreeBranch branchID="m2">
+      <uncertaintyModel>-0.2</uncertaintyModel>
+      <uncertaintyWeight>0.5</uncertaintyWeight>
+    </logicTreeBranch>
+  </logicTreeBranchSet>
+</logicTree>
+</nrml>
+'''
+
+# b1 has 2 source model realizations, b2 has 1
+SAME_SOURCE_SMLT = '''\
+<?xml version="1.0" encoding="UTF-8"?>
+<nrml xmlns:gml="http://www.opengis.net/gml"
+      xmlns="http://openquake.org/xmlns/nrml/0.4">
+<logicTree logicTreeID="lt1">
+  <logicTreeBranchSet uncertaintyType="sourceModel" branchSetID="sm">
+    <logicTreeBranch branchID="b1">
+      <uncertaintyModel>sm1.xml</uncertaintyModel>
+      <uncertaintyWeight>0.5</uncertaintyWeight>
+    </logicTreeBranch>
+    <logicTreeBranch branchID="b2">
+      <uncertaintyModel>sm2.xml</uncertaintyModel>
+      <uncertaintyWeight>0.5</uncertaintyWeight>
+    </logicTreeBranch>
+  </logicTreeBranchSet>
+  <logicTreeBranchSet uncertaintyType="maxMagGRRelative"
+                      branchSetID="mmax" applyToBranches="b1"
+                      applyToSources="other">
+    <logicTreeBranch branchID="m1">
+      <uncertaintyModel>+0.2</uncertaintyModel>
+      <uncertaintyWeight>0.5</uncertaintyWeight>
+    </logicTreeBranch>
+    <logicTreeBranch branchID="m2">
+      <uncertaintyModel>-0.2</uncertaintyModel>
+      <uncertaintyWeight>0.5</uncertaintyWeight>
+    </logicTreeBranch>
+  </logicTreeBranchSet>
+</logicTree>
+</nrml>
+'''
+
+GSIM_LT = '''\
+<?xml version="1.0" encoding="UTF-8"?>
+<nrml xmlns:gml="http://www.opengis.net/gml"
+      xmlns="http://openquake.org/xmlns/nrml/0.4">
+<logicTree logicTreeID="lt1">
+  <logicTreeBranchSet uncertaintyType="gmpeModel" branchSetID="bs1"
+                      applyToTectonicRegionType="Active Shallow Crust">
+    <logicTreeBranch branchID="g1">
+      <uncertaintyModel>[BooreAtkinson2008]</uncertaintyModel>
+      <uncertaintyWeight>1.0</uncertaintyWeight>
+    </logicTreeBranch>
+  </logicTreeBranchSet>
+</logicTree>
+</nrml>
+'''
+
+JOB_INI = '''\
+[general]
+calculation_mode = classical
+sites = 0.1 0.1
+reference_vs30_value = 760.0
+reference_depth_to_1pt0km_per_sec = 100.0
+source_model_logic_tree_file = ssmLT.xml
+gsim_logic_tree_file = gmmLT.xml
+investigation_time = 1.0
+width_of_mfd_bin = 0.1
+rupture_mesh_spacing = 5.0
+area_source_discretization = 10.0
+intensity_measure_types_and_levels = {"PGA": [0.1, 0.2]}
+truncation_level = 3.0
+maximum_distance = 200.0
+number_of_logic_tree_samples = 0
+'''
+
+
+class ParseConfigTestCase(unittest.TestCase):
+
+    def test_get_rupture_from_json(self):
+        rupture_model = general.gettemp("""
+{"type": "FeatureCollection", "metadata": {"reference": "test",
+"lon": 0.5,
+"lat": 0.5, "depth": 7.5, "mag": 6.0, "rake": 0}, "features":
+[{"geometry": {"type": "MultiPolygon", "coordinates": [[[[0, 0, 5],
+[1, 0, 5], [1, 1, 10], [0, 1, 10], [0, 0, 5]]]]}}]}
+""", suffix='.json')
+        oqparam = SimpleNamespace(
+            inputs={'rupture_model': rupture_model},
+            rupture_mesh_spacing=5,
+            dip_spacing='mesh_spacing',
+            rupture_dict=None)
+        rup = readinput.get_rupture(oqparam)
+        self.assertIsInstance(rup, BaseRupture)
+        with open(rupture_model) as f:
+            self.assertEqual(f.read().lstrip()[0], '{')
+
+    def test_no_absolute_path(self):
+        temp_dir = tempfile.mkdtemp()
+        site_model_input = general.gettemp(dir=temp_dir, content="foo")
+        job_config = general.gettemp(dir=temp_dir, content="""
+[general]
+calculation_mode = event_based
+[foo]
+bar = baz
+[site]
+sites = 0 0
+site_model_file = %s
+maximum_distance=1
+truncation_level=0
+random_seed=0
+intensity_measure_types = PGA
+investigation_time = 50
+export_dir = %s
+        """ % (site_model_input, TMP))
+        with self.assertRaises(ValueError) as ctx:
+            readinput.get_params(job_config, {})
+        self.assertIn('is an absolute path', str(ctx.exception))
+
+    def test_get_oqparam_with_sites_csv(self):
+        sites_csv = general.gettemp('1.0,2.1\n3.0,4.1\n5.0,6.1')
+        try:
+            source = general.gettemp("""
+[general]
+calculation_mode = scenario
+[geometry]
+sites_csv = %s
+[misc]
+maximum_distance=1
+truncation_level=3
+random_seed=5
+[site_params]
+reference_vs30_type = measured
+reference_vs30_value = 600.0
+reference_depth_to_2pt5km_per_sec = 5.0
+reference_depth_to_1pt0km_per_sec = 100.0
+intensity_measure_types_and_levels = {'PGA': [0.1, 0.2]}
+export_dir = %s
+            """ % (os.path.basename(sites_csv), TMP))
+            exp_base_path = os.path.dirname(
+                os.path.join(os.path.abspath('.'), source))
+            expected_params = {
+                'all_cost_types': [],
+                'export_dir': TMP,
+                'base_path': exp_base_path,
+                'calculation_mode': 'scenario',
+                'truncation_level': 3.0,
+                'random_seed': 5,
+                'maximum_distance': {'default': [(MINMAG, 1), (MAXMAG, 1)]},
+                'inputs': {'job_ini': source,
+                           'site_model': [sites_csv]},
+                'reference_depth_to_1pt0km_per_sec': 100.0,
+                'reference_depth_to_2pt5km_per_sec': 5.0,
+                'reference_vs30_type': 'measured',
+                'reference_vs30_value': 600.0,
+                'hazard_imtls': {'PGA': [0.1, 0.2]},
+                'minimum_asset_loss': {},
+            }
+            params = getparams(readinput.get_oqparam(source))
+            for key in expected_params:
+                self.assertEqual(expected_params[key], params[key])
+        finally:
+            os.unlink(sites_csv)
+
+    def test_invalid_magnitude_distance_filter(self):
+        source = general.gettemp("""
+[general]
+maximum_distance=[(200, 8)]
+""")
+        with self.assertRaises(ValueError) as ctx:
+            readinput.get_oqparam(source)
+        self.assertIn('Invalid magnitude 200: could not convert to new',
+                      str(ctx.exception))
+
+    def test_duplicated_parameter(self):
+        job_config = general.gettemp("""
+[general]
+aggregate_by = policy
+foo = biz
+[foo]
+bar = baz
+[bar]
+foo = bar
+bar = foo
+aggregate_by = taxonomy, policy
+""")
+        with self.assertRaises(InvalidFile) as ctx:
+            readinput.get_params(job_config, {})
+        msg = "['aggregate_by', 'foo'] is(are) defined in multiple sections"
+        self.assertIn(msg, str(ctx.exception))
+
+
+def sitemodel():
+    return [BytesIO(b'''\
+<?xml version="1.0" encoding="utf-8"?>
+<nrml xmlns:gml="http://www.opengis.net/gml"
+      xmlns="http://openquake.org/xmlns/nrml/0.4">
+    <siteModel>
+        <site lon="0.0" lat="0.0" vs30="1200.0" vs30Type="inferred" z1pt0="100.0" z2pt5="2.0" backarc="False" />
+        <site lon="0.0" lat="0.1" vs30="600.0" vs30Type="inferred" z1pt0="100.0" z2pt5="2.0" backarc="True" />
+        <site lon="0.0" lat="0.2" vs30="200.0" vs30Type="inferred" z1pt0="100.0" z2pt5="2.0" backarc="False" />
+    </siteModel>
+</nrml>''')]
+
+
+class ExposureTestCase(unittest.TestCase):
+    exposure = general.gettemp('''\
+<?xml version='1.0' encoding='UTF-8'?>
+<nrml xmlns="http://openquake.org/xmlns/nrml/0.4">
+  <exposureModel id="ep" category="buildings">
+    <description>Exposure model for buildings</description>
+    <conversions>
+      <costTypes>
+        <costType name="structural" unit="USD" type="per_asset"/>
+      </costTypes>
+    </conversions>
+    <assets>
+      <asset id="a1" taxonomy="RM" number="3000">
+        <location lon="81.2985" lat="29.1098"/>
+        <costs>
+          <cost type="structural" value="1000"/>
+        </costs>
+      </asset>
+      <asset id="a2" taxonomy="RC">
+        <location lon="83.082298" lat="27.9006"/>
+        <costs>
+          <cost type="structural" value="500"/>
+        </costs>
+      </asset>
+      <asset id="a3" taxonomy="W" number="2000">
+        <location lon="85.747703" lat="27.9015"/>
+        <costs>
+          <cost type="structural" value="1000"/>
+        </costs>
+      </asset>
+    </assets>
+  </exposureModel>
+</nrml>''', suffix='.xml')
+
+    exposure0 = general.gettemp('''\
+<?xml version='1.0' encoding='UTF-8'?>
+<nrml xmlns="http://openquake.org/xmlns/nrml/0.4">
+  <exposureModel id="ep" category="buildings">
+    <description>Exposure model for buildings</description>
+    <conversions>
+      <costTypes>
+        <costType name="structural" unit="USD" type="per_asset"/>
+      </costTypes>
+    </conversions>
+    <assets>
+      <asset id="a1" taxonomy="RM" number="3000">
+        <location lon="81.2985" lat="29.1098"/>
+        <costs>
+          <cost type="structural" value="1000"/>
+        </costs>
+      </asset>
+      <asset id="a2" taxonomy="RC" number="0">
+        <location lon="83.082298" lat="27.9006"/>
+        <costs>
+          <cost type="structural" value="500"/>
+        </costs>
+      </asset>
+      <asset id="a3" taxonomy="W" number="2000">
+        <location lon="85.747703" lat="27.9015"/>
+        <costs>
+          <cost type="structural" value="1000"/>
+        </costs>
+      </asset>
+    </assets>
+  </exposureModel>
+</nrml>''', suffix='.xml')
+
+    exposure1 = general.gettemp('''\
+<?xml version='1.0' encoding='UTF-8'?>
+<nrml xmlns="http://openquake.org/xmlns/nrml/0.4">
+  <exposureModel id="ep" category="buildings">
+    <description>Exposure model for buildings</description>
+    <conversions>
+      <costTypes>
+        <costType name="structural" unit="USD" type="per_asset"/>
+      </costTypes>
+    </conversions>
+    <assets>
+      <asset id="a 1" taxonomy="RM" number="3000">
+        <location lon="81.2985" lat="29.1098"/>
+        <costs>
+          <cost type="structural" value="1000"/>
+        </costs>
+      </asset>
+    </assets>
+  </exposureModel>
+</nrml>''', suffix='.xml')
+
+    exposure2 = general.gettemp('''\
+<?xml version='1.0' encoding='UTF-8'?>
+<nrml xmlns="http://openquake.org/xmlns/nrml/0.5">
+  <exposureModel id="ep" category="buildings">
+    <description>Exposure model for buildings</description>
+    <conversions>
+      <costTypes>
+        <costType name="structural" unit="USD" type="aggregate"/>
+      </costTypes>
+    </conversions>
+  </exposureModel>
+</nrml>''', suffix='.xml')  # wrong cost type "aggregate"
+
+    exposure3 = general.gettemp('''\
+<?xml version='1.0' encoding='UTF-8'?>
+<nrml xmlns="http://openquake.org/xmlns/nrml/0.4">
+  <exposureModel id="ep" category="buildings">
+    <description>Exposure model for buildings</description>
+    <conversions>
+      <costTypes>
+        <costType name="structural" unit="USD" type="per_asset"/>
+      </costTypes>
+    </conversions>
+    <assets>
+      <asset id="a1" taxonomy="RM " number="3000">
+        <location lon="81.2985" lat="29.1098"/>
+        <costs>
+          <cost type="structural" value="1000"/>
+        </costs>
+      </asset>
+    </assets>
+  </exposureModel>
+</nrml>''', suffix='.xml')
+
+    def test_get_metadata(self):
+        [exp] = asset.Exposure.read_headers([self.exposure])
+        self.assertEqual(exp.cost_calculator.cost_types,
+                         {'structural': 'per_asset'})
+
+    def test_missing_number(self):
+        raise unittest.SkipTest
+        oqparam = mock.Mock()
+        oqparam.base_path = '/'
+        oqparam.calculation_mode = 'scenario_damage'
+        oqparam.all_cost_types = ['occupants']
+        oqparam.inputs = {'exposure': [self.exposure]}
+        oqparam.region = '''\
+POLYGON((78.0 31.5, 89.5 31.5, 89.5 25.5, 78.0 25.5, 78.0 31.5))'''
+        oqparam.time_event = None
+        oqparam.ignore_missing_costs = []
+        oqparam.aggregate_by = []
+        oqparam.impact = False
+
+        with self.assertRaises(Exception) as ctx:
+            readinput.get_exposure(oqparam)
+        self.assertIn("node asset: 'number', line 17 of", str(ctx.exception))
+
+    def test_zero_number(self):
+        oqparam = mock.Mock()
+        oqparam.rupture_dict = {'lon': 79, 'lat': 30, 'dep': 10,
+                                'mag': 6, 'rake': 0}
+        oqparam.base_path = '/'
+        oqparam.calculation_mode = 'scenario_damage'
+        oqparam.all_cost_types = ['structural']
+        oqparam.insurance_losses = False
+        oqparam.inputs = {'exposure': [self.exposure0]}
+        oqparam.region = '''\
+POLYGON((78.0 31.5, 89.5 31.5, 89.5 25.5, 78.0 25.5, 78.0 31.5))'''
+        oqparam.time_event = None
+        oqparam.ignore_missing_costs = []
+        oqparam.aggregate_by = []
+        oqparam.impact = False
+
+        with self.assertRaises(ValueError) as ctx:
+            readinput.get_exposure(oqparam)
+        self.assertIn("'0.0' is zero, line 17", str(ctx.exception))
+
+    def test_invalid_asset_id(self):
+        oqparam = mock.Mock()
+        oqparam.rupture_dict = {'lon': 79, 'lat': 30, 'dep': 10,
+                                'mag': 6, 'rake': 0}
+        oqparam.base_path = '/'
+        oqparam.calculation_mode = 'scenario_damage'
+        oqparam.all_cost_types = ['structural']
+        oqparam.inputs = {'exposure': [self.exposure1]}
+        oqparam.region = '''\
+POLYGON((78.0 31.5, 89.5 31.5, 89.5 25.5, 78.0 25.5, 78.0 31.5))'''
+        oqparam.time_event = None
+        oqparam.ignore_missing_costs = []
+        oqparam.aggregate_by = []
+        oqparam.impact = False
+        with self.assertRaises(ValueError) as ctx:
+            readinput.get_exposure(oqparam)
+        self.assertIn(r"Invalid ID 'a 1': the only accepted chars are "
+                      r"^[\w_\-:]+$, line 11", str(ctx.exception))
+
+    def test_wrong_cost_type(self):
+        oqparam = mock.Mock()
+        oqparam.rupture_dict = {'lon': 69, 'lat': 30, 'dep': 10,
+                                'mag': 6, 'rake': 0}
+        oqparam.base_path = '/'
+        oqparam.calculation_mode = 'scenario_risk'
+        oqparam.all_cost_types = ['structural']
+        oqparam.ignore_missing_costs = []
+        oqparam.region = '''\
+POLYGON((68.0 31.5, 69.5 31.5, 69.5 25.5, 68.0 25.5, 68.0 31.5))'''
+        oqparam.inputs = {'exposure': [self.exposure2],
+                          'structural_vulnerability': None}
+        oqparam.aggregate_by = []
+        oqparam.impact = False
+        with self.assertRaises(ValueError) as ctx:
+            readinput.get_exposure(oqparam)
+        self.assertIn("Got 'aggregate', expected "
+                      "aggregated|per_area|per_asset, line 7",
+                      str(ctx.exception))
+
+    def test_invalid_taxonomy(self):
+        oqparam = mock.Mock()
+        oqparam.rupture_dict = {'lon': 79, 'lat': 30, 'dep': 10,
+                                'mag': 6, 'rake': 0}
+        oqparam.base_path = '/'
+        oqparam.calculation_mode = 'scenario_damage'
+        oqparam.all_cost_types = ['structural']
+        oqparam.inputs = {'exposure': [self.exposure3]}
+        oqparam.region = '''\
+POLYGON((78.0 31.5, 89.5 31.5, 89.5 25.5, 78.0 25.5, 78.0 31.5))'''
+        oqparam.time_event = None
+        oqparam.insurance_losses = False
+        oqparam.ignore_missing_costs = []
+        oqparam.aggregate_by = []
+        oqparam.impact = False
+        with self.assertRaises(ValueError) as ctx:
+            readinput.get_exposure(oqparam)
+        self.assertIn("'RM ' contains whitespace chars, line 11",
+                      str(ctx.exception))
+
+    def test_Lon_instead_of_lon(self):
+        fname = os.path.join(DATADIR, 'exposure.xml')
+        with self.assertRaises(InvalidFile) as ctx:
+            asset.Exposure.read_all([fname])
+        self.assertIn("missing {'lon'}", str(ctx.exception))
+
+    def test_case_similar(self):
+        fname = os.path.join(DATADIR, 'exposure2.xml')
+        with self.assertRaises(InvalidFile) as ctx:
+            asset.Exposure.read_all([fname])
+        self.assertIn('''\
+Found case-duplicated fields [['ID', 'id']] in ''', str(ctx.exception))
+
+    def test_percent_in_description(self):
+        job_ini = general.gettemp('''\
+[general]
+description = Description containing a % sign''')
+        readinput.get_params(job_ini)
+
+    def test_GEM4ALL(self):
+        raise unittest.SkipTest('Dropped support for GEM4ALL')
+
+        # test a call used in the GEM4ALL importer, pure XML
+        fname = os.path.join(os.path.dirname(case_caracas.__file__),
+                             'exposure_caracas.xml')
+        a0, a1 = asset.Exposure.read_all([fname]).assets
+        self.assertEqual(a0.tags, {'taxonomy': 'MUR+ADO_H1'})
+        self.assertEqual(a1.tags, {'taxonomy': 'S1M_MC'})
+
+        # test a call used in the GEM4ALL importer, XML + CSV
+        fname = os.path.join(os.path.dirname(ebr2.__file__),
+                             'exposure.xml')
+        for ass in asset.Exposure.read_all([fname]).assets:
+            # make sure all the attributes exist
+            ass.asset_id
+            ass.tags['taxonomy']
+            ass.number
+            ass.area
+            ass.lon,
+            ass.lat,
+            ass.tags.get('geometry')
+
+
+class GetCompositeSourceModelTestCase(unittest.TestCase):
+
+    def test_reduce_source_model(self):
+        case2 = os.path.dirname(case_02.__file__)
+        smlt = os.path.join(case2, 'source_model_logic_tree.xml')
+        found, _total = readinput.reduce_source_model(smlt, [], remove=False)
+        self.assertEqual(found, 0)
+        found, _total = readinput.reduce_source_model(smlt, {}, remove=False)
+        self.assertEqual(found, 0)
+
+    def test_wrong_trts(self):
+        # 'active Shallow Crust' is missing, 'Active Shallow Crust' is there
+        oq = readinput.get_oqparam('job.ini', case_16)
+        with self.assertRaises(gsim_lt.InvalidLogicTree) as c:
+            readinput.get_gsim_lt(oq, ['active Shallow Crust'])
+        self.assertIn("is missing the TRT 'active Shallow Crust'",
+                      str(c.exception))
+
+    def test_wrong_trts_in_reqv(self):
+        # unknown TRT in job.ini [reqv]
+        oq = readinput.get_oqparam('job.ini', case_02)
+        fname = oq.inputs['reqv'].pop('active shallow crust')
+        oq.inputs['reqv']['act shallow crust'] = fname
+        with mock.patch('logging.warning') as w:
+            readinput.get_composite_source_model(oq)
+        raise unittest.SkipTest('got "Sent %d %s tasks, %s"')
+        self.assertIn('Unknown TRT=act shallow crust', w.call_args[0][0])
+
+    def test_extra_large_source(self):
+        raise unittest.SkipTest('Removed check on MAX_EXTENT')
+        oq = readinput.get_oqparam('job.ini', case_21)
+        _, h5 = datastore.create_job_dstore()
+        with h5, mock.patch('logging.error') as error:
+            with mock.patch('openquake.hazardlib.geo.utils.MAX_EXTENT', 80):
+                readinput.get_composite_source_model(oq, h5)
+                os.remove(h5.filename)
+        self.assertEqual(
+            error.call_args[0][0], 'source SFLT2: too large: 84 km')
+
+    def test_with_site_model(self):
+        oq = readinput.get_oqparam('job.ini', case_34)
+        ssclt = readinput.get_composite_source_model(oq)
+        self.assertEqual(
+            list(ssclt.source_model_lt.source_data[0]),
+            ['b1', 'Active Shallow Crust', 'source_model.xml', '956'])
+
+    def test_filter_sourcecodes(self):
+        # case_36 has a simple, a complex, a point and an area source
+        oq = readinput.get_oqparam('job.ini', case_36)
+        csm = readinput.get_composite_source_model(oq)
+        self.assertEqual([src.code for src in csm.get_sources()],
+                         [b'S', b'C', b'P', b'A'])
+
+        # keep only the point-like sources
+        oq = readinput.get_oqparam('job.ini', case_36,
+                                   {'filter_sourcecodes': 'pPAM'})
+        csm = readinput.get_composite_source_model(oq)
+        self.assertEqual([src.code for src in csm.get_sources()], [b'P', b'A'])
+
+        # discard everything
+        oq = readinput.get_oqparam('job.ini', case_36,
+                                   {'filter_sourcecodes': 'K'})
+        with self.assertRaises(RuntimeError) as ctx:
+            readinput.get_composite_source_model(oq)
+        self.assertIn(
+            'No sources left after filtering by filter_sourcecodes=K',
+            str(ctx.exception))
+
+    def test_invalid_filter_sourcecodes(self):
+        with self.assertRaises(ValueError) as ctx:
+            readinput.get_oqparam('job.ini', case_36,
+                                  {'filter_sourcecodes': 'PAZ'})
+        self.assertIn("Invalid source code 'Z' in 'PAZ'", str(ctx.exception))
+
+    def test_no_uncertainties(self):
+        # the uncertainties are not applied at build time, but in the
+        # workers, one set of realizations at a time; therefore there is a
+        # group per source group in the source model files, with the trt_smrs
+        # of all the realizations, and not a group per set of uncertainties
+        # (see build_groups)
+        oq = readinput.get_oqparam('job.ini', case_25)
+        csm = readinput.get_composite_source_model(oq)
+        self.assertEqual(len(csm.src_groups), 5)  # one per source group
+        # the source IDs have no ';' suffix, since the sources are not
+        # duplicated by the uncertainties applied in the workers; the
+        # identical sources of different source models have the same ID,
+        # so they are reduced (see reduce_sources)
+        self.assertEqual(len({s.source_id for s in csm.get_sources()}), 8)
+
+    def _get_csm(self, sm1, sm2, smlt):
+        # write the inputs in a temporary directory and build the CSM
+        tmp = tempfile.mkdtemp()
+        files = {'sm1.xml': sm1, 'sm2.xml': sm2, 'ssmLT.xml': smlt,
+                 'gmmLT.xml': GSIM_LT,
+                 'job.ini': JOB_INI}
+        for fname, content in files.items():
+            with open(os.path.join(tmp, fname), 'w') as f:
+                f.write(content)
+        oq = readinput.get_oqparam(os.path.join(tmp, 'job.ini'))
+        return readinput.get_composite_source_model(oq)
+
+    def test_duplicated_id_uncertainty(self):
+        # two source models with a source with the same ID but different
+        # MFDs, as in the ARB model: the source ID gets a branch suffix,
+        # but the maxMagGRRelative uncertainty must still be applied
+        csm = self._get_csm(source_model(('src', 0., 3.3)),
+                            source_model(('src', 0., 3.5)),
+                            DUPLICATED_ID_SMLT)
+        srcs = csm.get_sources()
+        self.assertEqual([src.source_id for src in srcs],
+                         ['src!b1', 'src!b2'])
+        for src in srcs:
+            self.assertTrue(src.bysrc_unc, src.source_id)
+            # apply the uncertainties as done in the workers
+            bvals = source_reader.get_bset_values(csm.full_lt, [src])
+            mags = sorted(s.mfd.max_mag for _, grp in
+                          source_reader.modified_groups([src], bvals)
+                          for s in grp)
+            aac(mags, [6.3, 6.7])  # maxMag=6.5 -/+ 0.2
+
+    def test_same_source_two_models(self):
+        # the same source in two source models, where the first branch has
+        # 2 realizations, as in the ARB model: the reduced source must keep
+        # the realizations of both branches, not only of the first one
+        csm = self._get_csm(source_model(('common', 0., 3.3),
+                                         ('other', 1., 3.0)),
+                            source_model(('common', 0., 3.3)),
+                            SAME_SOURCE_SMLT)
+        self.assertEqual(len(csm.full_lt.sm_rlzs), 3)
+        [common] = [s for s in csm.get_sources() if s.source_id == 'common']
+        self.assertEqual(len(common.trt_smrs), 3)
+
+
+class SitecolAssetcolTestCase(unittest.TestCase):
+
+    def test_grid_site_model_exposure(self):
+        oq = readinput.get_oqparam('job.ini', case_16)
+        oq.region_grid_spacing = 15
+        sitecol, assetcol, discarded, _exp = readinput.get_sitecol_assetcol(oq)
+        self.assertEqual(len(sitecol), 141)  # 10 sites were discarded silently
+        self.assertEqual(len(assetcol), 151)
+        self.assertEqual(len(discarded), 0)  # no assets were discarded
+
+    def test_site_model_exposure(self):
+        oq = readinput.get_oqparam('job.ini', case_16)
+        sitecol, assetcol, discarded, _exp = readinput.get_sitecol_assetcol(oq)
+        self.assertEqual(len(sitecol), 148)
+        self.assertEqual(len(assetcol), 151)
+        self.assertEqual(len(discarded), 0)
+
+    def test_site_amplification(self):
+        oq = readinput.get_oqparam('job.ini', case_16)
+        oq.inputs['amplification'] = os.path.join(
+            oq.base_path, 'invalid_amplification.csv')
+        with self.assertRaises(ValueError) as ctx:
+            df = site_amplification.AmplificationFunction.read_df(
+                oq.inputs['amplification'])
+            site_amplification.Amplifier(oq.imtls, df)
+        self.assertIn("Found duplicates for (b'F',", str(ctx.exception))
+
+
+class LogicTreeTestCase(unittest.TestCase):
+    def test(self):
+        job_ini = os.path.join(os.path.dirname(case_15.__file__), 'job.ini')
+        oq = readinput.get_oqparam(job_ini)
+        lt = readinput.get_logic_tree(oq)
+        # (2+1) x 4 = 12 realizations
+        paths = [rlz.lt_path for rlz in lt.get_realizations()]
+        expected = [('SM1', '.', 'gA0', 'gA1'),
+                    ('SM1', '.', 'gA0', 'gB1'),
+                    ('SM1', '.', 'gB0', 'gA1'),
+                    ('SM1', '.', 'gB0', 'gB1'),
+                    ('SM2', 'a3b1', 'gA0', 'gA1'),
+                    ('SM2', 'a3b1', 'gA0', 'gB1'),
+                    ('SM2', 'a3b1', 'gB0', 'gA1'),
+                    ('SM2', 'a3b1', 'gB0', 'gB1'),
+                    ('SM2', 'a3pt2b0pt8', 'gA0', 'gA1'),
+                    ('SM2', 'a3pt2b0pt8', 'gA0', 'gB1'),
+                    ('SM2', 'a3pt2b0pt8', 'gB0', 'gA1'),
+                    ('SM2', 'a3pt2b0pt8', 'gB0', 'gB1')]
+        self.assertEqual(paths, expected)
+
+
+class ReadRiskTestCase(unittest.TestCase):
+    def test_read_station_data(self):
+        oq = readinput.get_oqparam(os.path.join(DATADIR, 'job.ini'))
+        sitecol = readinput.get_site_collection(oq)
+        with self.assertRaises(InvalidFile) as ctx:
+            readinput.get_station_data(
+                oq, sitecol, duplicates_strategy='error')
+        self.assertIn(
+            "Stations_NIED.csv: has duplicate sites ['GIF001', 'GIF013']",
+            str(ctx.exception))
+        df = readinput.read_df(
+            oq.inputs['station_data'], 'LONGITUDE', 'LATITUDE', 'STATION_ID',
+            duplicates_strategy='keep_first')
+        self.assertTrue('GIF001' in df['STATION_ID'].values
+                        and 'GIF013' not in df['STATION_ID'].values)
+        pga_first = df[df['STATION_ID'] == 'GIF001']['PGA_VALUE'].values[0]
+        df = readinput.read_df(
+            oq.inputs['station_data'], 'LONGITUDE', 'LATITUDE', 'STATION_ID',
+            duplicates_strategy='keep_last')
+        pga_last = df[df['STATION_ID'] == 'GIF013']['PGA_VALUE'].values[0]
+        self.assertTrue('GIF013' in df['STATION_ID'].values
+                        and 'GIF001' not in df['STATION_ID'].values)
+        df = readinput.read_df(
+            oq.inputs['station_data'], 'LONGITUDE', 'LATITUDE', 'STATION_ID',
+            duplicates_strategy='avg')
+        self.assertTrue('GIF001|GIF013' in df['STATION_ID'].values)
+        pga_avg = df[df['STATION_ID'] == 'GIF001|GIF013'][
+            'PGA_VALUE'].values[0]
+        # using the same mean operator used in read_df and expecting the same
+        # approximation
+        data = {'values': [pga_first, pga_last]}
+        df = pandas.DataFrame(data)
+        expected_mean = df['values'].mean()
+        self.assertEqual(pga_avg, expected_mean)
+
+
+class ReadSourceModelsTestCase(unittest.TestCase):
+    def test(self):
+        base = os.path.dirname(case_65.__file__)
+        hdf5path = general.gettemp(suffix='.hdf5')
+        fnames = [os.path.join(base, 'ssm.xml'),
+                  os.path.join(base, 'sections.xml')]
+        smodels = readinput.read_source_models(
+            fnames, hdf5path, investigation_time=1.)
+        nrups = 0
+        for smodel in smodels:
+            for sg in smodel.src_groups:
+                for src in sg:
+                    for rup in src.iter_ruptures():
+                        nrups += 1
+        self.assertEqual(nrups, 3)
+
+
+class GetCloseRegionsTestCase(unittest.TestCase):
+    def test_get_close_mosaic_models(self):
+        lon, lat = 124.0, 8.5
+        mosaic_models = get_close_mosaic_models(lon, lat, buffer_radius=5)
+        self.assertEqual(mosaic_models, ['PHL', 'IDN', 'OPA'])
+        mosaic_models = get_close_mosaic_models(lon, lat, buffer_radius=0.5)
+        self.assertEqual(mosaic_models, ['PHL'])
+
+    def test_get_close_countries(self):
+        lon, lat = 124.0, 8.5
+        countries = get_close_countries(lon, lat, buffer_radius=0.5)
+        self.assertEqual(countries, ['PHL'])
+
+
+class GetCountryOrModelTestCase(unittest.TestCase):
+    def test_mosaic_model_dir(self):
+        self.assertEqual(get_country_or_model('/x/OIN/job.ini'), 'OIN')
+        self.assertEqual(get_country_or_model('mosaic/OIN/a.ini'), 'OIN')
+
+    def test_alias(self):
+        self.assertEqual(get_country_or_model('/x/TWN/job.ini'), 'TEM')
+
+    def test_country_name(self):
+        self.assertEqual(get_country_or_model('/x/Italy/job.ini'), 'ITA')
+        self.assertEqual(
+            get_country_or_model('/x/American_Samoa/job.ini'), 'ASM')
+
+    def test_underscore(self):
+        # the Africa jobs in the global risk model
+        self.assertEqual(get_country_or_model('/x/Jobs/job_NAF.ini'), 'NAF')
+        self.assertEqual(
+            get_country_or_model('/x/Jobs/job_Cabo_Verde.ini'), 'CPV')
+        self.assertEqual(get_country_or_model('/x/job_Congo.ini'), 'COG')
+        self.assertEqual(get_country_or_model(
+            '/x/job_Democratic_Republic_of_the_Congo.ini'), 'COD')
+        self.assertEqual(get_country_or_model('/x/job_Niger.ini'), 'NER')
+        self.assertEqual(get_country_or_model('/x/job_Nigeria.ini'), 'NGA')
+
+    def test_not_a_whole_word(self):
+        # 'OIN' is a substring of 'POINT' but not a whole word
+        self.assertEqual(get_country_or_model('/x/POINT/job.ini'), '')
+
+    def test_no_match(self):
+        self.assertEqual(get_country_or_model('/x/nothing/job.ini'), '')
+
+
+class PotentialPathsTestCase(unittest.TestCase):
+    # a classical case with 2 potential logic tree paths
+    INI = os.path.join(os.path.dirname(case_34.__file__), '..',
+                       'case_07', 'job.ini')
+
+    def get_full_lt(self, **kw):
+        oq = readinput.get_oqparam(self.INI, kw=kw)
+        oq.max_potential_paths = 1
+        return readinput.get_full_lt(oq)
+
+    def test_mean_only_with_use_rates(self):
+        self.get_full_lt(use_rates='true')  # no error
+
+    def test_quantiles_with_use_rates(self):
+        with self.assertRaises(ValueError) as ctx:
+            self.get_full_lt(use_rates='true',
+                             quantile_hazard_curves='0.1,0.9')
+        self.assertIn('use_rates=true is not enough', str(ctx.exception))
+
+    def test_quantiles_without_use_rates(self):
+        with mock.patch.object(readinput.logictree, 'FullLogicTree',
+                               side_effect=AssertionError('enumeration')):
+            with self.assertRaises(ValueError) as ctx:
+                self.get_full_lt(quantile_hazard_curves='0.1,0.9')
+        self.assertIn('or set use_rates=true', str(ctx.exception))
+
+
+class RelaxVs30TestCase(unittest.TestCase):
+    # with strict=false vs30_strict=False must survive the storage of the
+    # logic tree, otherwise the risk calculations reading the ruptures from
+    # a SES file would raise an error in the workers
+    def test_roundtrip(self):
+        glt = gsim_lt.GsimLogicTree.from_('[Allen2022]')
+        readinput._relax_vs30(glt)
+        [gsim] = glt.values['*']
+        self.assertFalse(gsim.vs30_strict)
+        self.assertIs(glt.branches[0].gsim, gsim)
+        fname = general.gettemp(suffix='.hdf5')
+        with hdf5.File(fname, 'w') as f:
+            f['gsim_lt'] = glt
+        with hdf5.File(fname, 'r') as f:
+            [gsim] = f['gsim_lt'].values['*']
+        self.assertFalse(gsim.vs30_strict)
+
+
+PFD_LT = '''<?xml version="1.0" encoding="UTF-8"?>
+<nrml xmlns="http://openquake.org/xmlns/nrml/0.4">
+  <logicTree logicTreeID="lt">
+    <logicTreeBranchSet branchSetID="bs1" uncertaintyType="fdhaPrimarySRModel">
+      <logicTreeBranch branchID="B1">
+        <uncertaintyModel>MossRoss2011PrimarySR</uncertaintyModel>
+        <uncertaintyWeight>1.0</uncertaintyWeight>
+      </logicTreeBranch>
+    </logicTreeBranchSet>
+    <logicTreeBranchSet branchSetID="bs2" uncertaintyType="fdhaCalcRSigma">
+      <logicTreeBranch branchID="SIG">
+        <uncertaintyModel>1</uncertaintyModel>
+        <uncertaintyWeight>1.0</uncertaintyWeight>
+      </logicTreeBranch>
+    </logicTreeBranchSet>
+  </logicTree>
+</nrml>'''
+
+
+class GetPfdLtTestCase(unittest.TestCase):
+    # a scalar r_sigma_km in the job.ini is rejected if the PFD logic tree
+    # has an fdhaCalcRSigma branchset
+    def test_r_sigma_conflict(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            with open(os.path.join(tmp, 'pfd_lt.xml'), 'w') as f:
+                f.write(PFD_LT)
+            oq = SimpleNamespace(
+                inputs={'pfd_logic_tree': 'pfd_lt.xml', 'job_ini': 'job.ini'},
+                base_path=tmp, random_seed=42, number_of_logic_tree_samples=0,
+                sampling_method='early_weights')
+            readinput.get_pfd_lt(oq)  # r_sigma_km is not in the job.ini
+            oq.r_sigma_km = 1.0
+            with self.assertRaises(LogicTreeError) as ctx:
+                readinput.get_pfd_lt(oq)
+            self.assertIn('fdhaCalcRSigma', str(ctx.exception))

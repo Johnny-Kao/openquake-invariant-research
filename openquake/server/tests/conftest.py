@@ -1,0 +1,394 @@
+# -*- coding: utf-8 -*-
+# vim: tabstop=4 shiftwidth=4 softtabstop=4
+#
+# Copyright (C) 2026 GEM Foundation
+#
+# OpenQuake is free software: you can redistribute it and/or modify it
+# under the terms of the GNU Affero General Public License as published
+# by the Free Software Foundation, either version 3 of the License, or
+# (at your option) any later version.
+#
+# OpenQuake is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU Affero General Public License for more details.
+#
+# You should have received a copy of the GNU Affero General Public License
+# along with OpenQuake. If not, see <http://www.gnu.org/licenses/>.
+
+import os
+import sys
+import gc
+import time
+import pytest
+import requests
+import glob
+import shutil
+import pathlib
+import subprocess
+import tempfile
+import zipfile
+from django.contrib.auth import get_user_model
+from openquake.baselib import config
+from openquake.server.tests.views_test import start_webui, stop_webui
+
+# pytest-playwright starts an asyncio event loop at session startup.
+# Django 4+ forbids synchronous ORM/database operations when an event loop
+# is already running and raises SynchronousOnlyOperation during test DB setup.
+# This flag explicitly allows sync Django DB usage in this test environment.
+os.environ.setdefault("DJANGO_ALLOW_ASYNC_UNSAFE", "true")
+
+
+def copy_from_templates_if_needed(tmpldir, ext):
+    fnames = glob.glob(f'{tmpldir}/*{ext}')
+    for fname in fnames:
+        stripped = fname[:-len(ext)]
+        # i.e. email_subject.txt.aelo.templ -> email_subject.txt'
+        if not os.path.exists(stripped):
+            shutil.copy(fname, stripped)
+
+
+def _download_file(url, target):
+    # Download *url* atomically, removing incomplete files on failure.
+    if target.is_file() and target.stat().st_size:
+        return
+    target.unlink(missing_ok=True)
+    fd, temporary = tempfile.mkstemp(
+        prefix=f'.{target.name}.', dir=target.parent)
+    os.close(fd)
+    try:
+        with requests.get(url, stream=True, timeout=60) as response:
+            response.raise_for_status()
+            with open(temporary, 'wb') as stream:
+                for chunk in response.iter_content(chunk_size=1024 * 1024):
+                    if chunk:
+                        stream.write(chunk)
+        if not pathlib.Path(temporary).stat().st_size:
+            raise OSError(f'Empty download from {url}')
+        os.replace(temporary, target)
+    except BaseException:
+        pathlib.Path(temporary).unlink(missing_ok=True)
+        target.unlink(missing_ok=True)
+        raise
+
+
+def _download_server_data(data_dir):
+    # Download the files used by the server integration tests.
+    base_url = 'https://downloads.openquake.org/test_data'
+    files = ('worldcities.csv', 'countries_info.csv',
+             'World_Adm1_simplified.gpkg')
+    for name in files:
+        _download_file(f'{base_url}/{name}', data_dir / name)
+
+    mosaic_dir = pathlib.Path(__file__).parents[2] / 'qa_tests_data' / 'mosaic'
+    mosaic_dir.mkdir(exist_ok=True)
+    exposure = mosaic_dir / 'exposure.hdf5'
+    _download_file(f'{base_url}/exposure.hdf5', exposure)
+    repo_dir = mosaic_dir.parents[2]
+    exposure_link = repo_dir / 'exposure.hdf5'
+    if exposure_link.is_symlink() and not exposure_link.exists():
+        exposure_link.unlink()
+    if (not exposure_link.exists()
+            or exposure_link.stat().st_size == 0):
+        exposure_link.unlink(missing_ok=True)
+        exposure_link.symlink_to(exposure.relative_to(repo_dir))
+
+    fonts_dir = data_dir / 'fonts'
+    if not any(fonts_dir.glob('NotoSans*-Regular.ttf')):
+        archive_path = data_dir / 'fonts.zip'
+        _download_file(f'{base_url}/fonts.zip', archive_path)
+        with zipfile.ZipFile(archive_path) as archive:
+            archive.extractall(data_dir)
+
+
+def _configure_server_data(data_dir, dbfile, basemap_path=None):
+    # Configure the downloaded data and database for this process and children.
+    fd, cfg_path = tempfile.mkstemp(prefix='oq-server-tests-', suffix='.cfg')
+    os.close(fd)
+    paths = {
+        'world_cities_file': data_dir / 'worldcities.csv',
+        'countries_info_file': data_dir / 'countries_info.csv',
+        'admin1_boundaries_file': data_dir / 'World_Adm1_simplified.gpkg',
+        'fonts_dir': data_dir / 'fonts',
+    }
+    if basemap_path is not None:
+        paths['basemap_file'] = basemap_path
+    with open(cfg_path, 'w') as cfg:
+        cfg.write('[directory]\n')
+        for name, path in paths.items():
+            cfg.write(f'{name} = {path}\n')
+        cfg.write(f'[server]\ndbfile = {dbfile}\n')
+    for name, path in paths.items():
+        config.directory[name] = str(path)
+    return cfg_path
+
+
+_server_cfg_path = None
+_server_old_cfg_path = None
+_test_dbfile = None
+_test_datadir = None
+_old_datadir = None
+
+
+def _isolate_database():
+    # Use a scratch DB so tests cannot touch the engine database. Calculations
+    # and server processes get its path from OQ_CONFIG_FILE.
+    global _test_dbfile
+    # Keep these imports local: dbapi creates a global Db using the current
+    # config.server.dbfile, then this function redirects it to the scratch DB.
+    from django.db import connections
+    from openquake.commonlib import dbapi
+    from openquake.server.db import actions
+    fd, dbfile = tempfile.mkstemp(prefix='oq-server-tests-', suffix='.sqlite3')
+    os.close(fd)
+    _test_dbfile = dbfile
+    if hasattr(dbapi.db.local, 'conn'):
+        dbapi.db.close()
+    config.server['dbfile'] = dbfile
+    dbapi.db.args = (dbfile,) + dbapi.db.args[1:]
+    connections.settings['default']['NAME'] = dbfile
+    connections.close_all()
+    # the schema of the engine tables is created in the scratch database
+    actions.upgrade_db(dbapi.db)
+    if dbapi.db.path != dbfile or connections['default'].settings_dict[
+            'NAME'] != dbfile:
+        raise RuntimeError('The tests could not isolate the database')
+    return dbfile
+
+
+def _remove_dbfile(dbfile):
+    # Windows may keep the file locked for a moment after the connections
+    # are closed: retry, collecting garbage in between, then let it fail
+    for _ in range(50):
+        try:
+            pathlib.Path(dbfile).unlink(missing_ok=True)
+            return
+        except PermissionError:
+            gc.collect()
+            time.sleep(0.2)
+    pathlib.Path(dbfile).unlink(missing_ok=True)
+
+
+def _prepare_server_data():
+    global _server_cfg_path, _server_old_cfg_path
+    global _test_datadir, _old_datadir
+    if _server_cfg_path is not None:
+        return
+    data_dir = pathlib.Path(__file__).parent / 'data'
+    data_dir.mkdir(exist_ok=True)
+    _download_server_data(data_dir)
+    basemap_path = None
+    if os.environ.get('OQ_APPLICATION_MODE', '').upper() == 'IMPACT':
+        basemap_path = data_dir / 'basemap.tif'
+    _old_datadir = os.environ.get('OQ_DATADIR')
+    _test_datadir = tempfile.mkdtemp(prefix='oq-server-tests-')
+    os.environ['OQ_DATADIR'] = _test_datadir
+    dbfile = _isolate_database()
+    _server_cfg_path = _configure_server_data(data_dir, dbfile, basemap_path)
+    _server_old_cfg_path = os.environ.get('OQ_CONFIG_FILE')
+    os.environ['OQ_CONFIG_FILE'] = _server_cfg_path
+
+
+def pytest_configure(config):
+    """Prepare paths before unittest classes or worker processes start."""
+    _prepare_server_data()
+
+
+@pytest.fixture(scope="session", autouse=True)
+def server_test_data():
+    """Make server test data available, downloading only missing files."""
+    _prepare_server_data()
+    yield
+    if _server_old_cfg_path is None:
+        os.environ.pop('OQ_CONFIG_FILE', None)
+    else:
+        os.environ['OQ_CONFIG_FILE'] = _server_old_cfg_path
+    if _old_datadir is None:
+        os.environ.pop('OQ_DATADIR', None)
+    else:
+        os.environ['OQ_DATADIR'] = _old_datadir
+    pathlib.Path(_server_cfg_path).unlink(missing_ok=True)
+    from django.db import connections
+    from openquake.commonlib import dbapi
+    connections.close_all()
+    # The engine has a separate SQLite connection, which locks the file on
+    # Windows even after all Django connections have been closed.
+    dbapi.db.close()
+    _remove_dbfile(_test_dbfile)
+    shutil.rmtree(_test_datadir)
+
+
+@pytest.fixture(scope="session", autouse=True)
+def migrate_before_tests(server_test_data):
+    """
+    Generate registration files before running migrations (if needed),
+    then load data fixtures
+    """
+    serverdir = pathlib.Path(__file__).parent.parent
+    appmode = os.environ.get('OQ_APPLICATION_MODE', '').upper()
+    # generate the files needed for user registration and email notifications
+    ext = (f'.{appmode.lower()}.tmpl'
+           if appmode in ('AELO', 'IMPACT')
+           else '.default.tmpl')
+    copy_from_templates_if_needed(serverdir / 'templates/registration', ext)
+    # Django and the engine share the scratch DB; pytest-django does not make
+    # a separate test DB, so migrate it before the server process connects.
+    env = dict(os.environ, OQ_TEST='1')  # the test mode, see settings.py
+    subprocess.run([sys.executable, serverdir / 'manage.py', 'migrate'],
+                   check=True, env=env)
+    if appmode in ['AELO', 'IMPACT']:
+        # load cookie-related fixtures
+        js = (serverdir / 'fixtures/0001_cookie_consent_required_'
+                          'plus_hide_cookie_bar.json')
+        subprocess.run(
+            [sys.executable, serverdir / 'manage.py', 'loaddata', js],
+            check=True, env=env)
+    yield
+
+
+@pytest.fixture(scope="session")
+def django_db_setup():
+    """
+    Use the scratch DB configured for the engine, without a separate
+    pytest-django test DB. The server and test process must share users and
+    sessions.
+    """
+    pass
+
+
+@pytest.fixture
+def application_mode(settings, request):
+    mode = request.param
+    settings.APPLICATION_MODE = mode
+    return mode
+
+
+@pytest.fixture
+def default_usgs_id(settings, request):
+    mode = request.param
+    settings.IMPACT_DEFAULT_USGS_ID = mode
+    return mode
+
+
+@pytest.fixture
+def test_credentials():
+    return {
+        "username": "test_user",
+        "password": "password123",
+        "email": "test@user.com",
+    }
+
+
+@pytest.fixture
+def user(django_db_blocker, application_mode, test_credentials, request):
+    level = request.param
+
+    # use the engine DB directly (no pytest-django test DB) so that the
+    # server process can see the user and the session
+    django_db_blocker.unblock()
+    User = get_user_model()
+    user, _ = User.objects.get_or_create(
+        username=test_credentials["username"],
+        defaults={"email": test_credentials["email"]})
+    user.set_password(test_credentials["password"])
+    user.email = test_credentials["email"]
+    user.save()
+
+    # the profile is created by a signal only on user creation, so an
+    # existing test user may lack it
+    from openquake.server.user_profile.models import UserProfile
+    profile, _ = UserProfile.objects.get_or_create(user=user)
+    profile.level = level
+    profile.save()
+
+    return user
+
+
+@pytest.fixture
+def authenticated_session(django_db_blocker, user):
+    from django.test import Client
+    django_db_blocker.unblock()
+    client = Client()
+    client.force_login(user)
+    session = client.session
+    session.save()
+    return session.session_key
+
+
+@pytest.fixture
+def authenticated_page(page, authenticated_session, application_mode):
+    server, thread, client = start_webui()
+    try:
+        page.context.clear_cookies()
+        page.context.add_cookies([{
+            "name": "sessionid",
+            "value": authenticated_session,
+            "url": client.base_url,
+        }])
+        page.goto(f"{client.base_url}/engine/")
+        yield page
+    finally:
+        stop_webui(server, thread)
+
+
+@pytest.fixture
+def essential_cookie_groups(django_db_blocker):
+    """
+    (Re)load the essential cookie groups, since the live_server fixture
+    flushes the database after each test, removing the data loaded by
+    migrate_before_tests
+    """
+    from django.core.management import call_command
+    from cookie_consent.cache import delete_cache
+    serverdir = pathlib.Path(__file__).parent.parent
+    js = (serverdir / 'fixtures/0001_cookie_consent_required_'
+                      'plus_hide_cookie_bar.json')
+    with django_db_blocker.unblock():
+        call_command('loaddata', js, verbosity=0)
+    # the cookie groups are cached by django-cookie-consent
+    delete_cache()
+
+
+@pytest.fixture
+def ui_logged_in_page(
+        page, live_server, user, test_credentials, application_mode):
+    page.context.clear_cookies()
+    page.goto(f"{live_server.url}/engine/")
+
+    page.get_by_label("Username").fill(test_credentials["username"])
+    page.get_by_label("Password").fill(test_credentials["password"])
+    page.get_by_role("button", name="Log in").click()
+
+    page.wait_for_url(f"{live_server.url}/engine/")
+    return page
+
+
+def pytest_addoption(parser):
+    parser.addoption(
+        "--skip-abort-jobs",
+        action="store_true",
+        default=False,
+        help="Skip aborting jobs after test execution."
+    )
+    parser.addoption(
+        "--skip-remove-jobs",
+        action="store_true",
+        default=False,
+        help="Skip removing jobs after test execution."
+    )
+
+
+@pytest.fixture
+def should_abort_job(request):
+    """
+    Returns True by default, False if --skip-abort-jobs is passed.
+    """
+    return not request.config.getoption("--skip-abort-jobs")
+
+
+@pytest.fixture
+def should_remove_job(request):
+    """
+    Returns True by default, False if --skip-remove-jobs is passed.
+    """
+    return not request.config.getoption("--skip-remove-jobs")
