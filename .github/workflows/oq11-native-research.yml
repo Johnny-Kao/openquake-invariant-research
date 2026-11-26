@@ -23,4 +23,11 @@ jobs:
           oq engine --upgrade-db
       - name: Run native invariant
         run: |
-          python -m pytest -s -v openquake/calculators/tests/test_sparse_realization_research.py
+          python -m pytest -s -v openquake/calculators/tests/test_sparse_realization_research.py openquake/calculators/tests/oq11_research_test.py
+      - name: Existing calculator regression controls
+        run: |
+          python -m pytest -v openquake/calculators/tests/event_based_risk_test.py -k 'test_case_1_ins or test_case_05 or test_case_master'
+      - name: Lint changed Python files
+        run: |
+          python -m pip install ruff
+          ruff check openquake/calculators/post_risk.py openquake/calculators/tests/oq11_research_test.py
