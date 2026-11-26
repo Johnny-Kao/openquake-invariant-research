@@ -1,11 +1,18 @@
 """Research-only regression for sparse realization loss curves."""
+from functools import partial
+from types import SimpleNamespace
+from unittest import mock
+
 import numpy
+import pandas
 
 from openquake.calculators import base
 from openquake.calculators.extract import extract
+from openquake.calculators.post_risk import save_curve_stats
 from openquake.calculators.tests import CalculatorTestCase
 from openquake.qa_tests_data.event_based_risk import case_01
 from openquake.risklib import scientific
+from openquake.hazardlib import stats
 
 
 class SparseRealizationTestCase(CalculatorTestCase):
@@ -64,3 +71,33 @@ class SparseRealizationTestCase(CalculatorTestCase):
                         failures.append((group_id, lt, rp, got, expected))
         assert sparse_nonzero, 'Fixture no longer has nonzero sparse curves'
         assert not failures, f'OQ11 stored mean discrepancies: {failures}'
+
+def test_sparse_curve_statistics():
+    # Missing rows are zeros; explicit NaNs are not missing rows.
+    weights = numpy.array([.25, .75], numpy.float32)
+    funcs = dict(mean=stats.mean_curve, std=stats.std_curve,
+                 median=partial(stats.quantile_curve, .5))
+    lid = scientific.LOSSID['structural']
+    df = pandas.DataFrame(dict(
+        agg_id=[0, 0, 0, 0], loss_id=[lid] * 4,
+        return_period=[10, 20, 20, 30], rlz_id=[1, 0, 1, 1],
+        loss=numpy.array([80, 20, 80, numpy.nan], numpy.float32)))
+    oq = SimpleNamespace(
+        loss_types=['structural'], ext_loss_types=['structural'],
+        number_of_logic_tree_samples=0, hazard_stats=lambda: funcs)
+    ds = mock.MagicMock()
+    datasets = {'oqparam': oq, 'weights': weights,
+                'exposure': mock.Mock()}
+    ds.__getitem__.side_effect = datasets.__getitem__
+    ds.read_df.return_value = df
+
+    def create(name, dtype, shape):
+        datasets[name] = numpy.zeros(shape, dtype)
+
+    ds.create_dset.side_effect = create
+    save_curve_stats(ds)
+    out = datasets['agg_curves-stats/structural'][0, :, :, 0]
+    numpy.testing.assert_allclose(out[:, :2], [
+        [60, 65], [numpy.sqrt(1200), numpy.sqrt(675)], [80 / 3, 40]],
+        rtol=1e-6)
+    assert numpy.isnan(out[:, 2]).all()
